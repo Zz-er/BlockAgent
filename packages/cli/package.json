@@ -1,0 +1,30 @@
+{
+  "name": "@block-agent/cli",
+  "version": "3.0.0",
+  "description": "block-agent interactive CLI: an Ink (React terminal UI) ChannelAdapter (invoker=user) over @block-agent/core. Ink/React deps are isolated here so core stays zero-runtime-dependency.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "block-agent": "dist/main.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "tsx src/main.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*",
+    "ink": "^5.1.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
