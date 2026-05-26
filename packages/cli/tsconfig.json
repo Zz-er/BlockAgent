@@ -1,0 +1,11 @@
+{
+  "$comment": "No TS project 'references' to core: core's package.json exports map points at .ts SOURCE (not built .d.ts), so the cli typechecks against core source via the workspace symlink + NodeNext resolution. tsx runs the same source directly. This keeps dev build-free (no tsc -b step) while staying independently compilable.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "jsx": "react-jsx"
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

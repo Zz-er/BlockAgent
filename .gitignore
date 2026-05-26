@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.block-agent/
+ai_com/
+.claude/

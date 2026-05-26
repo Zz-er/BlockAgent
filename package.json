@@ -1,0 +1,25 @@
+{
+  "name": "block-agent",
+  "version": "3.0.0",
+  "description": "Single-agent runtime where all context is a Block tree, behavior lives outside blocks (builders), and commands are the only mutation entry point.",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test -w @block-agent/core",
+    "dev": "npm run dev -w @block-agent/core",
+    "start": "npm run start -w @block-agent/cli"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
