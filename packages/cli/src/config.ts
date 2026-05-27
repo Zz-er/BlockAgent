@@ -3,10 +3,13 @@
  *
  * Design: ai_com/block-agent-cli-design.md §3.
  *
- * loadConfig() resolves a LauncherConfig from, highest-wins: CLI flags > env >
- * config file (block-agent.config.json) > compiled defaults. API key is read from
- * env ONLY (never a flag, never returned in config, never logged). A minimal
- * hand-rolled flag parser — no commander/yargs dependency.
+ * loadConfig() resolves a LauncherConfig from, highest-wins: CLI flags > config
+ * file (block-agent.config.json) > env > compiled defaults. The config file is
+ * authoritative over ambient env vars (a project's pinned config should not be
+ * silently overridden by a stray env var); only explicit CLI flags beat it. API key
+ * is the ONE exception to this chain — it is read from env ONLY (never a flag, never
+ * in the file, never returned in config, never logged). A minimal hand-rolled flag
+ * parser — no commander/yargs dependency.
  *
  * Pure: no Ink/React, no console. Returns data; main.tsx decides what to print.
  */
@@ -20,13 +23,19 @@ import type {
   ThinkingFormat,
 } from './types.js';
 
-/** Compiled defaults (design §3): anthropic, all three apps enabled. */
+/**
+ * Compiled defaults (design §3): anthropic; the three original apps + built-in
+ * `memory` enabled; `memory_letta` DISABLED by default (it needs an external Letta
+ * server, so a default boot must never try to connect to one).
+ */
 export const DEFAULTS: LauncherConfig = {
   provider: { kind: 'anthropic', model: 'claude-opus-4-7' },
   apps: {
     agent_identity: { enabled: true },
     messages: { enabled: true },
     tools: { enabled: true },
+    memory: { enabled: true },
+    memory_letta: { enabled: false },
   },
 };
 
@@ -167,14 +176,15 @@ function pick<T>(...candidates: Array<T | undefined>): T | undefined {
 // ============================================================================
 
 /**
- * loadConfig — merge flags ⊕ env ⊕ file ⊕ DEFAULTS into a resolved LauncherConfig
- * (highest-wins: flags > env > file > defaults, design §3).
+ * loadConfig — merge flags ⊕ file ⊕ env ⊕ DEFAULTS into a resolved LauncherConfig
+ * (highest-wins: flags > file > env > defaults, design §3). The config file is
+ * authoritative over ambient env vars; only explicit CLI flags beat it.
  *
- * The API key is NOT part of LauncherConfig — `launch.ts` reads it straight from
- * env (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). This loader never touches a key, so
- * it can never echo or persist one.
+ * The API key is the ONE exception to that chain — it is NOT part of LauncherConfig:
+ * `launch.ts` reads it straight from env (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`).
+ * This loader never touches a key, so it can never echo or persist one.
  *
- * Each field is resolved with `pick(flagVal, envVal, fileVal, defaultVal)`; a source
+ * Each field is resolved with `pick(flagVal, fileVal, envVal, defaultVal)`; a source
  * that omits or mis-types a field simply drops out of the chain (defensive narrowing),
  * so a malformed config file or stray env var degrades to the next source rather than
  * crashing.
@@ -200,30 +210,30 @@ export function loadConfig(
     pick(
       dryRun ? ('mock' as const) : undefined,
       asProviderKind(flags['provider']),
-      asProviderKind(env['BLOCK_AGENT_PROVIDER']),
       asProviderKind(fileProvider['kind']),
+      asProviderKind(env['BLOCK_AGENT_PROVIDER']),
       DEFAULTS.provider.kind,
     ) ?? DEFAULTS.provider.kind;
 
   const model: string =
     pick(
       asString(flags['model']),
-      asString(env['BLOCK_AGENT_MODEL']),
       asString(fileProvider['model']),
+      asString(env['BLOCK_AGENT_MODEL']),
       DEFAULTS.provider.model,
     ) ?? DEFAULTS.provider.model;
 
-  // base_url: flag > the provider-specific env > file. anthropic and openai-compat
-  // read different env vars; we offer whichever matches the resolved kind first, then
-  // fall back to the other so a misconfigured pair still surfaces something.
+  // base_url: flag > file > the provider-specific env. anthropic and openai-compat
+  // read different env vars; after the file we offer whichever matches the resolved
+  // kind first, then fall back to the other so a misconfigured pair still surfaces.
   const base_url = pick(
     asString(flags['base-url']),
+    asString(fileProvider['base_url']),
     kind === 'openai-compat'
       ? asString(env['OPENAI_BASE_URL'])
       : asString(env['ANTHROPIC_BASE_URL']),
     asString(env['ANTHROPIC_BASE_URL']),
     asString(env['OPENAI_BASE_URL']),
-    asString(fileProvider['base_url']),
   );
 
   const thinking_format = pick(
@@ -238,17 +248,17 @@ export function loadConfig(
     ...(thinking_format !== undefined ? { thinking_format } : {}),
   };
 
-  // Storage dir: flag > env > file > (undefined → launch defaults to cwd).
+  // Storage dir: flag > file > env > (undefined → launch defaults to cwd).
   const storage_dir = pick(
     asString(flags['storage-dir']),
-    asString(env['BLOCK_AGENT_STORAGE_DIR']),
     asString(file['storage_dir']),
+    asString(env['BLOCK_AGENT_STORAGE_DIR']),
   );
 
   const max_turns_per_wake = pick(
     asNumber(flags['max-turns-per-wake']),
-    asNumber(env['BLOCK_AGENT_MAX_TURNS_PER_WAKE']),
     asNumber(file['max_turns_per_wake']),
+    asNumber(env['BLOCK_AGENT_MAX_TURNS_PER_WAKE']),
   );
 
   return {
@@ -257,6 +267,8 @@ export function loadConfig(
       agent_identity: resolveIdentity(flags, fileApps),
       messages: resolveMessages(flags, fileApps),
       tools: resolveTools(flags, fileApps),
+      memory: resolveMemory(flags, fileApps),
+      memory_letta: resolveMemoryLetta(flags, fileApps, env),
     },
     ...(storage_dir !== undefined ? { storage_dir } : {}),
     ...(max_turns_per_wake !== undefined ? { max_turns_per_wake } : {}),
@@ -337,5 +349,62 @@ function resolveTools(
     enabled: appEnabled(flags, f, 'no-tools'),
     ...(tool_history_count !== undefined ? { tool_history_count } : {}),
     ...(enabled_tools !== undefined ? { enabled_tools } : {}),
+  };
+}
+
+/**
+ * resolveMemory — the built-in `memory` app config. Enabled by default (zero
+ * dependency, offline). `--no-memory` disables it. notes/user char limits and the
+ * recall limit are non-file overrides (flag > file); the app's own config.json seed +
+ * compiled Hermes defaults remain the fallback. The agent can never retune these at
+ * runtime (`memory.set_config` is user-only), so the operator pins them here.
+ */
+function resolveMemory(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['memory'] {
+  const f = pickObject(fileApps['memory']);
+  const notes_char_limit = pick(asNumber(flags['notes-char-limit']), asNumber(f['notes_char_limit']));
+  const user_char_limit = pick(asNumber(flags['user-char-limit']), asNumber(f['user_char_limit']));
+  const recall_limit = pick(asNumber(flags['memory-recall-limit']), asNumber(f['recall_limit']));
+  return {
+    enabled: appEnabled(flags, f, 'no-memory'),
+    ...(notes_char_limit !== undefined ? { notes_char_limit } : {}),
+    ...(user_char_limit !== undefined ? { user_char_limit } : {}),
+    ...(recall_limit !== undefined ? { recall_limit } : {}),
+  };
+}
+
+/**
+ * resolveMemoryLetta — the `memory_letta` app config. DISABLED by default (needs an
+ * external Letta server). Enable it explicitly via `--memory-letta` / file
+ * `apps.memory_letta.enabled: true`. base_url resolves flag > file > env
+ * (`LETTA_BASE_URL`); the app default `http://localhost:8283` applies when none is set.
+ * The API key is NEVER read here — `LETTA_API_KEY` is consumed only inside the Letta
+ * store at request time (the ANTHROPIC_API_KEY rule).
+ */
+function resolveMemoryLetta(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+): LauncherConfig['apps']['memory_letta'] {
+  const f = pickObject(fileApps['memory_letta']);
+  // Default-disabled: enabled ONLY when a positive flag or file value says so;
+  // `--no-memory-letta` also forces off (so an explicit no always wins).
+  const fileEnabled = asBool(f['enabled']) ?? false;
+  const flagOn = flags['memory-letta'] === true || flags['memory-letta'] === 'true';
+  const flagOff = flags['no-memory-letta'] === true || flags['no-memory-letta'] === 'true';
+  const enabled = flagOff ? false : flagOn || fileEnabled;
+
+  const base_url = pick(
+    asString(flags['letta-base-url']),
+    asString(f['base_url']),
+    asString(env['LETTA_BASE_URL']),
+  );
+  const recall_limit = pick(asNumber(flags['letta-recall-limit']), asNumber(f['recall_limit']));
+  return {
+    enabled,
+    ...(base_url !== undefined ? { base_url } : {}),
+    ...(recall_limit !== undefined ? { recall_limit } : {}),
   };
 }

@@ -25,13 +25,15 @@ import { Operations } from '@block-agent/core/core/operations.js';
 import { PolicyEngine } from '@block-agent/core/core/policy.js';
 import { Renderer } from '@block-agent/core/core/renderer.js';
 import { AppRegistry } from '@block-agent/core/app/registry.js';
-import { AgentRuntime } from '@block-agent/core/runtime/agent_runtime.js';
+import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_runtime.js';
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
 import { MockProvider } from '@block-agent/core/provider/mock.js';
 import { makeAgentIdentityApp } from '@block-agent/core/apps/agent_identity.js';
 import { MessagesApp } from '@block-agent/core/apps/messages.js';
 import { ToolsApp } from '@block-agent/core/apps/tools.js';
+import { MemoryApp } from '@block-agent/core/apps/memory.js';
+import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
@@ -124,6 +126,22 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   if (config.apps.tools.enabled) {
     registry.install(new ToolsApp(base).manifest());
   }
+  // Built-in memory (core; zero dependency). State-driven projection like tools, so
+  // seedProjectionBlocks below covers its `memory:*` blocks. Char limits / recall
+  // limit are seeded into the app's config (file seed + these overrides).
+  if (config.apps.memory.enabled) {
+    registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
+  }
+  // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
+  // @block-agent/memory-letta — core never imports it (DR-M4). base_url comes from
+  // config; the API key is read from LETTA_API_KEY env inside the store, never here.
+  if (config.apps.memory_letta.enabled) {
+    const lettaOpts =
+      config.apps.memory_letta.base_url !== undefined
+        ? { baseUrl: config.apps.memory_letta.base_url }
+        : {};
+    registry.install(new MemoryLettaApp(lettaOpts).manifest() as Parameters<typeof registry.install>[0]);
+  }
 
   // 3) PolicyEngine wired to the command capabilities + allowed_invokers, then
   //    Operations (the single mutation chokepoint, with the engine inside).
@@ -146,6 +164,11 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   });
 
   // 5) Runtime. root_name = the empty-tree root so its bookkeeping blocks attach.
+  //    tool_catalog advertises the agent-invokable commands to the provider each turn
+  //    (native tool dispatch) — without it a real model only ever emits plain text,
+  //    which fails commands-only, so it could never act. User-only commands are
+  //    excluded (PolicyEngine would deny them to the agent anyway).
+  const tool_catalog = buildToolCatalog(registry);
   const runtime = new AgentRuntime({
     operations,
     renderer,
@@ -154,6 +177,7 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
       ? { max_turns_per_wake: config.max_turns_per_wake }
       : {}),
     root_name: ROOT_NAME,
+    tool_catalog: () => tool_catalog,
   });
 
   // 6) Wake seam: a messages.ingest → ctx.wake → on_wake runs the turn loop. We chain
@@ -195,6 +219,38 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     provider,
     provider_id: provider.id,
   };
+}
+
+/**
+ * buildToolCatalog — enumerate the agent-invokable commands across all installed apps
+ * as the `SendOpts.tools` the runtime advertises to the provider each turn (native
+ * tool dispatch, §11.1). This mirrors context_view.appsView's command enumeration:
+ * each command factory is called with its manifest's initial_state to read the
+ * CommandManifest's name/description/args_schema.
+ *
+ * USER-ONLY commands — those whose `allowed_invokers` is set and excludes `'agent'`
+ * (e.g. agent_identity.set, messages.set_config, tools.set_config) — are filtered OUT:
+ * the PolicyEngine denies them to the agent at step 0 regardless, so advertising them
+ * would only invite refused calls and waste a turn. Commands are static per install in
+ * v3.0, so this is computed once at launch (the runtime holds it behind a thunk so a
+ * future dynamic command set still works).
+ */
+function buildToolCatalog(registry: AppRegistry): ToolCatalog {
+  const tools: ToolCatalog = [];
+  for (const manifest of registry.list()) {
+    for (const factory of manifest.commands) {
+      const cmd = factory(manifest.initial_state);
+      const agentAllowed =
+        cmd.allowed_invokers === undefined || cmd.allowed_invokers.includes('agent');
+      if (!agentAllowed) continue;
+      tools.push({
+        name: `${manifest.id}.${cmd.name}`,
+        description: cmd.description,
+        ...(cmd.args_schema !== undefined ? { args_schema: cmd.args_schema } : {}),
+      });
+    }
+  }
+  return tools;
 }
 
 /**
@@ -255,6 +311,27 @@ async function applyAppConfigOverrides(
       .invoke_command(
         'tools.set_config',
         { tool_history_count: config.apps.tools.tool_history_count },
+        user,
+      )
+      .catch(() => undefined);
+  }
+
+  if (config.apps.memory.enabled) {
+    const m = config.apps.memory;
+    const patch: Record<string, number> = {};
+    if (m.notes_char_limit !== undefined) patch['notes_char_limit'] = m.notes_char_limit;
+    if (m.user_char_limit !== undefined) patch['user_char_limit'] = m.user_char_limit;
+    if (m.recall_limit !== undefined) patch['recall_limit'] = m.recall_limit;
+    if (Object.keys(patch).length > 0) {
+      await operations.invoke_command('memory.set_config', patch, user).catch(() => undefined);
+    }
+  }
+
+  if (config.apps.memory_letta.enabled && config.apps.memory_letta.recall_limit !== undefined) {
+    await operations
+      .invoke_command(
+        'memory_letta.set_config',
+        { recall_limit: config.apps.memory_letta.recall_limit },
         user,
       )
       .catch(() => undefined);

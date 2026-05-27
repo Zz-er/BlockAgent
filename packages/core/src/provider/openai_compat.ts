@@ -31,6 +31,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { OpenAIReasoningAdapter, XmlTagThinkingAdapter } from './thinking.js';
+import { encodeToolNames, type EncodedToolNames } from './tool_names.js';
 
 type ThinkingFormat = ModelCapabilities['thinking_format'];
 
@@ -104,7 +105,14 @@ export class OpenAiCompatibleProvider implements ModelProvider {
   }
 
   private async *stream(prompt: RenderedPrompt, opts: SendOpts): AsyncIterable<ProviderChunk> {
-    const body = this.build_request_body(prompt, opts);
+    // Encode command full names (`<app>.<cmd>`) into wire-safe tool names: these APIs
+    // require `^[a-zA-Z0-9_-]+$`, so a `.` is rejected. We send the wire names and
+    // decode tool_call names back to the original on the way out (consume_sse).
+    const enc =
+      opts.tools && opts.tools.length > 0
+        ? encodeToolNames(opts.tools.map((t) => t.name))
+        : null;
+    const body = this.build_request_body(prompt, opts, enc);
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.api_key) headers['authorization'] = `Bearer ${this.api_key}`;
 
@@ -119,10 +127,14 @@ export class OpenAiCompatibleProvider implements ModelProvider {
       );
     }
 
-    yield* this.consume_sse(res.body);
+    yield* this.consume_sse(res.body, enc);
   }
 
-  private build_request_body(prompt: RenderedPrompt, opts: SendOpts): Record<string, unknown> {
+  private build_request_body(
+    prompt: RenderedPrompt,
+    opts: SendOpts,
+    enc: EncodedToolNames | null,
+  ): Record<string, unknown> {
     const content = this.render_user_content(prompt);
     const body: Record<string, unknown> = {
       model: this.model,
@@ -134,10 +146,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     };
     if (opts.temperature !== undefined) body['temperature'] = opts.temperature;
     if (opts.tools && opts.tools.length > 0) {
-      body['tools'] = opts.tools.map((t) => ({
+      body['tools'] = opts.tools.map((t, i) => ({
         type: 'function',
         function: {
-          name: t.name,
+          name: enc ? enc.wire[i]! : t.name,
           description: t.description,
           parameters: t.args_schema ?? { type: 'object', properties: {} },
         },
@@ -177,7 +189,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
    * reassembling a `choices[0].message`-shaped response for `thinking_adapter`.
    * Tool-call fragments arrive incrementally keyed by index; we stitch them.
    */
-  private async *consume_sse(body: ReadableStream<Uint8Array>): AsyncIterable<ProviderChunk> {
+  private async *consume_sse(
+    body: ReadableStream<Uint8Array>,
+    enc: EncodedToolNames | null,
+  ): AsyncIterable<ProviderChunk> {
     const decoder = new TextDecoder();
     const reader = body.getReader();
     let buffer = '';
@@ -245,7 +260,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     for (const idx of ordered) {
       const frag = tool_fragments.get(idx)!;
       if (frag.name.length === 0) continue;
-      const call: ToolCall = { id: frag.id, name: frag.name, args: parse_args(frag.args) };
+      // Decode the wire tool name back to the original command full name (`<app>.<cmd>`)
+      // so the runtime routes it through invoke_command unchanged.
+      const name = enc ? enc.decode(frag.name) : frag.name;
+      const call: ToolCall = { id: frag.id, name, args: parse_args(frag.args) };
       tool_calls.push(call);
       yield { kind: 'tool_call', call };
     }

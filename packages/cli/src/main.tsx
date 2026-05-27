@@ -38,7 +38,7 @@ function printMissingKeyHelp(err: MissingProviderKeyError): void {
       `  bash/zsh:    export ${envVar}="<your-key>"`,
       '',
       'Or run offline against the mock provider (no key, no network):',
-      '  npm run -w @block-agent/cli start -- --dry-run',
+      '  npm start -- --dry-run',
       '',
     ].join('\n'),
   );
@@ -64,7 +64,7 @@ function printNoTtyHelp(): void {
       'box cannot enable raw mode.',
       '',
       'Run it directly in your terminal:',
-      '  npm run -w @block-agent/cli start',
+      '  npm start',
       '',
       'For scripted/headless use, drive the logic layer (launch / makeCliChannel)',
       'directly instead of mounting the UI.',

@@ -24,6 +24,8 @@ function mockConfig(storage_dir: string): LauncherConfig {
       agent_identity: { enabled: true },
       messages: { enabled: true },
       tools: { enabled: true },
+      memory: { enabled: false },
+      memory_letta: { enabled: false },
     },
     storage_dir,
   };

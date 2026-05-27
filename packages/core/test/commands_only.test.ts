@@ -125,3 +125,73 @@ describe('commands-only', () => {
     expect(provider.turns_consumed).toBe(0);
   });
 });
+
+describe('tool catalog advertisement (§4.2 / §11.1 native tool dispatch)', () => {
+  it('forwards the tool_catalog to provider.send as SendOpts.tools each turn', async () => {
+    // Without this seam a native-tool-dispatch model is never told which commands
+    // exist, so it can only emit plain text → commands-only rejection → it can never
+    // act. The mock ignores tools (it is scripted), so we assert on what was SENT.
+    const catalog = [
+      { name: 'reply.say', description: 'Reply to the user', args_schema: { type: 'object' } },
+    ];
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'reply.say', args: { text: 'hi' } }] },
+      {},
+    ]);
+    const tree = makeEmptyTree();
+    const registry = new TestCommandRegistry();
+    makeReplyApp(registry);
+    const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
+    const ops = new TestOperations(tree, policy, registry);
+    const renderer = new TestRenderer(new TestBuilderRegistry());
+    const runtime = new AgentRuntime({
+      operations: ops,
+      renderer,
+      provider,
+      tool_catalog: () => catalog,
+    });
+
+    await runtime.on_wake(WAKE);
+
+    expect(provider.last_opts?.tools).toEqual(catalog);
+  });
+
+  it('omits tools entirely when no catalog is wired (unchanged scripted behavior)', async () => {
+    const provider = new MockProvider([{}]);
+    const { runtime } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+
+    // The key is absent (not an empty array), so the request is byte-identical to the
+    // pre-catalog behavior for providers that don't need advertised tools.
+    expect(provider.last_opts).not.toBeNull();
+    expect(provider.last_opts?.tools).toBeUndefined();
+  });
+});
+
+describe('error channel (a failed turn surfaces instead of silent no-op)', () => {
+  // An empty script makes MockProvider.send() throw — standing in for a real
+  // provider/transport failure (endpoint 4xx/5xx, network drop). The runtime must
+  // surface it on onError and return to idle, never crash or wedge in 'running'.
+  it('emits onError(phase=send) when the provider call fails and returns to idle', async () => {
+    const provider = new MockProvider([]);
+    const { runtime } = wire(provider);
+    const errs: Array<{ message: string; phase: string }> = [];
+    runtime.onError((e) => errs.push({ message: e.message, phase: e.phase }));
+
+    await runtime.on_wake(WAKE); // must not throw
+
+    expect(errs).toHaveLength(1);
+    expect(errs[0]?.phase).toBe('send');
+    expect(errs[0]?.message).toContain('script exhausted');
+    expect(runtime.state.kind).toBe('idle');
+  });
+
+  it('does not throw out of on_wake even with no error subscriber', async () => {
+    const provider = new MockProvider([]);
+    const { runtime } = wire(provider);
+
+    await expect(runtime.on_wake(WAKE)).resolves.toBeUndefined();
+    expect(runtime.state.kind).toBe('idle');
+  });
+});

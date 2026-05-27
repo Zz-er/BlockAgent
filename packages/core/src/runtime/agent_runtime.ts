@@ -27,6 +27,7 @@ import type {
   InvokerContext,
   Operations,
   Renderer,
+  RuntimeErrorEvent,
   ThinkingEvent,
   WakeEvent,
 } from '../core/types.js';
@@ -34,6 +35,7 @@ import type {
   ModelProvider,
   ProviderChunk,
   ProviderResponse,
+  SendOpts,
   ToolCall,
 } from '../provider/types.js';
 import type { CommandResult } from '../app/types.js';
@@ -50,6 +52,17 @@ import type { CommandResult } from '../app/types.js';
  */
 export type ThinkingListener = (event: ThinkingEvent) => void;
 
+/**
+ * ErrorListener — a UI/caller subscriber on the runtime's error channel. The runtime
+ * emits a RuntimeErrorEvent when a turn fails unexpectedly (e.g. the provider call
+ * errors) and then returns to idle. Symmetric to ThinkingListener; a throwing listener
+ * is isolated so it never breaks the turn loop.
+ */
+export type ErrorListener = (event: RuntimeErrorEvent) => void;
+
+/** The agent-invokable command list advertised to the provider each turn (§4.2). */
+export type ToolCatalog = NonNullable<SendOpts['tools']>;
+
 /** Construction wiring for the runtime. */
 export interface AgentRuntimeOptions {
   operations: Operations;
@@ -59,6 +72,17 @@ export interface AgentRuntimeOptions {
   spawn_depth?: number;
   /** Hard cap on turns within one wake, to bound a runaway tool-call loop. */
   max_turns_per_wake?: number;
+  /**
+   * The agent-invokable commands to advertise to the provider as `SendOpts.tools`
+   * each turn (native tool dispatch, §4.2 / §11.1). For a native-tool-dispatch model
+   * (Anthropic / OpenAI / DeepSeek) this is the ONLY way it learns which commands
+   * exist — without it the model can only emit plain text, which fails commands-only,
+   * so it can never act. Resolved fresh each turn (a thunk) so a future dynamic
+   * command set is picked up. Omit for scripted providers (mock) that ignore tools.
+   * The caller is responsible for excluding user-only commands (PolicyEngine would
+   * deny them anyway — no point advertising them to the agent).
+   */
+  tool_catalog?: () => ToolCatalog;
   /**
    * Parent block under which the runtime attaches its own bookkeeping blocks
    * (commands-only feedback, command-error blocks) when they don't yet exist.
@@ -73,11 +97,18 @@ export const COMMANDS_ONLY_FEEDBACK_BLOCK: BlockName = 'runtime:commands_only_fe
 /** Default root block name (matches the empty-tree boot in core/block.ts). */
 const DEFAULT_ROOT_NAME: BlockName = 'root:root';
 
-/** The exact feedback text written when an agent emits disallowed plain text (§4.2). */
+/**
+ * The exact feedback text written when an agent emits disallowed plain text (§4.2).
+ * Kept app-agnostic on purpose: core must not name specific app commands (the
+ * available commands are advertised to the model as tools, and which apps are
+ * installed varies). Earlier wording referenced `thoughts.append` (the thoughts app
+ * was removed in DR-27 — reasoning now flows to the UI thinking channel) and
+ * `chat.reply` (not a v3.0 app); both were stale and removed.
+ */
 export const COMMANDS_ONLY_FEEDBACK_TEXT =
   '你的上一条响应包含未通过 commands-only 校验的纯文本。' +
-  '所有 agent 输出必须是命令调用。' +
-  '想思考请用 thoughts.append，想回复用户请用 chat.reply。';
+  '所有 agent 输出必须是命令调用（tool call）。' +
+  '请使用提供给你的命令工具来行动或回复用户，不要直接输出纯文本。';
 
 const DEFAULT_MAX_TURNS_PER_WAKE = 16;
 
@@ -96,9 +127,13 @@ export class AgentRuntime {
   private readonly provider: ModelProvider;
   private readonly max_turns_per_wake: number;
   private readonly root_name: BlockName;
+  private readonly tool_catalog: (() => ToolCatalog) | undefined;
 
   /** UI subscribers on the thinking channel (§4.3). */
   private readonly thinking_listeners = new Set<ThinkingListener>();
+
+  /** UI/caller subscribers on the error channel (failed turns). */
+  private readonly error_listeners = new Set<ErrorListener>();
 
   /** Set when a turn produced commands-only-violating plain text (§4.2). */
   private pending_feedback: string | null = null;
@@ -110,6 +145,7 @@ export class AgentRuntime {
     this.spawn_depth = opts.spawn_depth ?? 0;
     this.max_turns_per_wake = opts.max_turns_per_wake ?? DEFAULT_MAX_TURNS_PER_WAKE;
     this.root_name = opts.root_name ?? DEFAULT_ROOT_NAME;
+    this.tool_catalog = opts.tool_catalog;
   }
 
   /**
@@ -122,6 +158,18 @@ export class AgentRuntime {
   onThinking(listener: ThinkingListener): () => void {
     this.thinking_listeners.add(listener);
     return () => this.thinking_listeners.delete(listener);
+  }
+
+  /**
+   * onError — subscribe to the runtime's error channel. Emits a RuntimeErrorEvent
+   * whenever a turn fails unexpectedly (most commonly the provider call erroring); the
+   * runtime then returns to idle rather than silently no-op'ing or crashing. The
+   * returned thunk unsubscribes. Symmetric to onThinking. A throwing listener is
+   * isolated (fire-and-forget) so it never breaks the turn loop.
+   */
+  onError(listener: ErrorListener): () => void {
+    this.error_listeners.add(listener);
+    return () => this.error_listeners.delete(listener);
   }
 
   /**
@@ -154,7 +202,17 @@ export class AgentRuntime {
         if (turns >= this.max_turns_per_wake) break;
         turns += 1;
 
-        const progressed = await this.runTurn();
+        let progressed: boolean;
+        try {
+          progressed = await this.runTurn();
+        } catch (err) {
+          // Safety net for an unexpected turn failure OUTSIDE the send path (which
+          // runTurn already catches and reports as phase 'send'). Surface it and end
+          // the wake gracefully so a failed turn never crashes the process or wedges
+          // the runtime in 'running'.
+          this.emitError(err, 'turn');
+          break;
+        }
 
         // If the turn parked the runtime (approval pending), stop the loop here;
         // resumption happens via a later on_wake once the approval resolves.
@@ -187,8 +245,21 @@ export class AgentRuntime {
     const snapshot = this.ops.snapshot();
     const prompt = await this.renderer.render(snapshot);
 
-    // 2) Send to the provider and accumulate the stream into one response.
-    const response = await this.collect(this.provider.send(prompt, {}));
+    // 2) Send to the provider and accumulate the stream into one response. We
+    //    advertise the agent-invokable command catalog as SendOpts.tools so a
+    //    native-tool-dispatch model can actually emit tool_calls (commands); without
+    //    it the model only ever produces plain text → commands-only rejection (§4.2).
+    //    A provider/transport failure (endpoint 4xx/5xx, network drop, unparseable
+    //    stream) is NOT a command refusal — it aborts the whole turn. We surface it on
+    //    the error channel and end the turn (no progress) instead of throwing, so the
+    //    caller who submitted a message gets a failure signal rather than silence.
+    let response: ProviderResponse;
+    try {
+      response = await this.collect(this.provider.send(prompt, this.buildSendOpts()));
+    } catch (err) {
+      this.emitError(err, 'send');
+      return false;
+    }
 
     // 3) Extract via the provider's thinking adapter. This is the seam that
     //    enforces INV #13: tool_calls are commands; thoughts/raw_text are NOT.
@@ -238,6 +309,29 @@ export class AgentRuntime {
         } catch {
           // A faulty UI subscriber never breaks the turn loop (fire-and-forget).
         }
+      }
+    }
+  }
+
+  /**
+   * emitError — publish a failed-turn event to the error channel. Like emitThoughts
+   * it is fire-and-forget: each listener is isolated in try/catch so a faulty
+   * subscriber never breaks the (already failing) turn. Normalizes the thrown value
+   * to a message but also forwards the original `error` for callers that want more.
+   */
+  private emitError(err: unknown, phase: RuntimeErrorEvent['phase']): void {
+    if (this.error_listeners.size === 0) return;
+    const event: RuntimeErrorEvent = {
+      message: err instanceof Error ? err.message : String(err),
+      error: err,
+      phase,
+      spawn_depth: this.spawn_depth,
+    };
+    for (const listener of this.error_listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A faulty error subscriber never breaks the turn loop (fire-and-forget).
       }
     }
   }
@@ -356,6 +450,18 @@ export class AgentRuntime {
   private async applySystemOps(ops: BlockOp[]): Promise<void> {
     const invoker: InvokerContext = { invoker: 'app' };
     await this.ops.apply(ops, invoker);
+  }
+
+  /**
+   * buildSendOpts — assemble the per-turn SendOpts. Currently this is just the tool
+   * catalog (the agent-invokable commands advertised so the model can call them). We
+   * omit `tools` entirely when the catalog is absent/empty (rather than passing an
+   * empty array), which `exactOptionalPropertyTypes` requires and which keeps the
+   * request identical to the old no-tools behavior for scripted providers.
+   */
+  private buildSendOpts(): SendOpts {
+    const tools = this.tool_catalog?.();
+    return tools && tools.length > 0 ? { tools } : {};
   }
 
   /** Accumulate a provider stream into one ProviderResponse for the adapter. */

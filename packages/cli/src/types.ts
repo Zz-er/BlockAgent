@@ -79,9 +79,40 @@ export interface ToolsConfig {
 }
 
 /**
- * LauncherConfig — resolved from flags ⊕ env ⊕ file ⊕ defaults by `loadConfig()`
- * (design §3, precedence highest-wins: flags > env > file > defaults). Pure data;
- * `launch()` turns it into the live core object graph.
+ * Built-in `memory` app config knobs (non-file overrides; the app's own config.json
+ * file seed is still honored). All optional — the app ships safe defaults (Hermes char
+ * limits). The agent can never retune these at runtime (`memory.set_config` is
+ * user-only), so the operator sets them here / in the file once.
+ */
+export interface MemoryConfig {
+  enabled: boolean;
+  /** Hard char cap on the agent-notes projection window (default 2200). */
+  notes_char_limit?: number;
+  /** Hard char cap on the user-profile projection window (default 1375). */
+  user_char_limit?: number;
+  /** Max records a recall returns (result-set cap, default 8). */
+  recall_limit?: number;
+}
+
+/**
+ * `memory_letta` app config knobs. DISABLED by default: it needs an external Letta
+ * server, so a default boot must not try to connect to one. The API key is NOT here —
+ * it is read from `LETTA_API_KEY` env ONLY (the ANTHROPIC_API_KEY rule). `base_url`
+ * resolves flag > file > env (`LETTA_BASE_URL`) > the app default `http://localhost:8283`.
+ */
+export interface MemoryLettaConfig {
+  enabled: boolean;
+  /** Letta server base URL (default `http://localhost:8283`). */
+  base_url?: string;
+  /** Max archival search results per recall (default 8). */
+  recall_limit?: number;
+}
+
+/**
+ * LauncherConfig — resolved from flags ⊕ file ⊕ env ⊕ defaults by `loadConfig()`
+ * (design §3, precedence highest-wins: flags > file > env > defaults; the config file
+ * is authoritative over ambient env vars). Pure data; `launch()` turns it into the
+ * live core object graph.
  */
 export interface LauncherConfig {
   provider: ProviderConfig;
@@ -89,6 +120,8 @@ export interface LauncherConfig {
     agent_identity: IdentityConfig;
     messages: MessagesConfig;
     tools: ToolsConfig;
+    memory: MemoryConfig;
+    memory_letta: MemoryLettaConfig;
   };
   /** Base dir for `.block-agent` storage (apps get an explicit dir); default cwd. */
   storage_dir?: string;
