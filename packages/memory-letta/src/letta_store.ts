@@ -269,16 +269,59 @@ export class LettaMemoryStore implements MemoryStore {
       const sdk = await getSdk();
       const apiKey = process.env['LETTA_API_KEY'] ?? 'no-key';
       const client = new sdk.Letta({ apiKey, baseURL: baseUrl ?? 'http://localhost:8283' });
-      const agent = await client.agents.create({
-        model: 'openai/gpt-4o-mini', // default; user can point at local model via Letta config
-        embedding: 'openai/text-embedding-3-small',
+      // LLM + embedding selection for agent creation — env-driven so ANY backend works
+      // without code changes. They matter ONLY at creation; afterwards the agent_id is used.
+      // Two ways per channel:
+      //   (a) a registered Letta HANDLE (LETTA_MODEL / LETTA_EMBEDDING), e.g.
+      //       `openai-proxy/qwen-plus`. Simple, but limited to what Letta auto-registered.
+      //   (b) a CUSTOM endpoint config (LETTA_CHAT_ENDPOINT+_MODEL / LETTA_EMBED_ENDPOINT+
+      //       _MODEL+_DIM). REQUIRED for an embedding that Letta won't route correctly via a
+      //       handle — notably Letta's default `openai/text-embedding-*` handles hit
+      //       api.openai.com, IGNORING OPENAI_API_BASE. For Alibaba DashScope / Bailian:
+      //         LETTA_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+      //         LETTA_EMBED_MODEL=text-embedding-v4   LETTA_EMBED_DIM=1024
+      //         LETTA_CHAT_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+      //         LETTA_CHAT_MODEL=qwen-plus
+      //       (the endpoint is called with the Letta server's openai-provider key, so that
+      //       key must be valid for the endpoint — e.g. the DashScope key.)
+      const payload: Record<string, unknown> = {
         memory_blocks: [
           { label: 'human', value: 'Human user information' },
           { label: 'persona', value: 'block-agent assistant' },
         ],
-      });
+      };
+      const chatEndpoint = process.env['LETTA_CHAT_ENDPOINT'];
+      if (chatEndpoint) {
+        payload['llm_config'] = {
+          model: process.env['LETTA_CHAT_MODEL'] ?? 'qwen-plus',
+          model_endpoint_type: 'openai',
+          model_endpoint: chatEndpoint,
+          context_window: Number(process.env['LETTA_CHAT_CONTEXT_WINDOW'] ?? '32768'),
+        };
+      } else {
+        payload['model'] = process.env['LETTA_MODEL'] ?? 'openai/gpt-4o-mini';
+      }
+      const embedEndpoint = process.env['LETTA_EMBED_ENDPOINT'];
+      if (embedEndpoint) {
+        payload['embedding_config'] = {
+          embedding_model: process.env['LETTA_EMBED_MODEL'] ?? 'text-embedding-v4',
+          embedding_endpoint_type: 'openai',
+          embedding_endpoint: embedEndpoint,
+          embedding_dim: Number(process.env['LETTA_EMBED_DIM'] ?? '1024'),
+          embedding_chunk_size: 300,
+        };
+      } else {
+        payload['embedding'] = process.env['LETTA_EMBEDDING'] ?? 'openai/text-embedding-3-small';
+      }
+      const agent = await client.agents.create(
+        payload as unknown as Parameters<typeof client.agents.create>[0],
+      );
       return (agent as { id?: unknown }).id != null ? String((agent as { id: string }).id) : null;
-    } catch {
+    } catch (err) {
+      // Surface WHY agent creation failed (e.g. an unknown model/embedding handle) — a
+      // silent null here hid a real misconfiguration during bring-up. Truncated, no key.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[memory_letta] LettaMemoryStore.createAgent failed (model/embedding handle or server config?) — ${msg.slice(0, 300)}`);
       return null;
     }
   }
