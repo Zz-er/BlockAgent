@@ -283,6 +283,21 @@ export function makeReplyApp(registry: TestCommandRegistry): void {
 }
 
 /**
+ * makeEndTurnApp — a fixture command (`done.reply`) that returns `end_turn: true`, like
+ * `messages.reply`. Lets a runtime test assert the turn loop STOPS after it (the agent
+ * finished responding) instead of looping for another turn.
+ */
+export function makeEndTurnApp(registry: TestCommandRegistry): void {
+  const manifest: CommandManifest = {
+    name: 'reply',
+    description: 'A fixture reply that ends the turn (end_turn: true).',
+    capabilities: [{ name: 'block:write' }],
+    invoke: async () => ({ ok: true }),
+  };
+  registry.register('done.reply', manifest, async () => ({ ok: true, end_turn: true }));
+}
+
+/**
  * makeDangerousApp — a fixture command (`danger.run`) declaring the `op:dangerous`
  * capability, so the agent invoker resolves to `pending` (approval) per §9.4.
  */

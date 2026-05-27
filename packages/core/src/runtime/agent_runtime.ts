@@ -276,9 +276,13 @@ export class AgentRuntime {
     // 4b) tool_use (commands) → invoke_command one by one (§4.2). PolicyEngine
     //     runs inside Operations.invoke_command; a `pending` decision parks the
     //     runtime (paused_for_approval) and aborts the rest of this turn.
-    const parked = await this.handleToolCalls(tool_calls);
+    const { parked, end_turn } = await this.handleToolCalls(tool_calls);
     if (tool_calls.length > 0) progressed = true;
     if (parked) return true; // parked → caller stops the loop; resumed via on_wake.
+    // The agent finished responding (a command set end_turn, e.g. messages.reply): stop
+    // the loop and return to idle to await the next event, instead of running another
+    // turn and re-replying. Multi-step tool use (no end_turn) keeps looping as before.
+    if (end_turn) return false;
 
     // 4c) plain text (not in thinking, not a tool_use) → commands-only REJECTION
     //     (§4.2). Write the feedback block; the agent self-corrects next turn.
@@ -338,16 +342,22 @@ export class AgentRuntime {
 
   /**
    * handleToolCalls — turn each structured tool_call into an invoke_command (§4.2).
-   * Returns true if the runtime parked on a `pending` policy decision (the rest of
-   * the calls are deferred until the approval resolves and on_wake re-enters).
+   *   - `parked`: the runtime parked on a `pending` policy decision (the rest of the
+   *     calls are deferred until the approval resolves and on_wake re-enters).
+   *   - `end_turn`: a command signaled the agent finished responding (e.g.
+   *     messages.reply) → the turn loop should stop after this turn.
    */
-  private async handleToolCalls(tool_calls: ToolCall[]): Promise<boolean> {
+  private async handleToolCalls(
+    tool_calls: ToolCall[],
+  ): Promise<{ parked: boolean; end_turn: boolean }> {
     const invoker: InvokerContext = { invoker: 'agent' };
+    let end_turn = false;
     for (const call of tool_calls) {
       const result = await this.invokeCommand(call, invoker);
-      if (result === 'parked') return true;
+      if (result === 'parked') return { parked: true, end_turn };
+      if (result === 'end_turn') end_turn = true;
     }
-    return false;
+    return { parked: false, end_turn };
   }
 
   /**
@@ -364,7 +374,7 @@ export class AgentRuntime {
   private async invokeCommand(
     call: ToolCall,
     invoker: InvokerContext,
-  ): Promise<'done' | 'parked'> {
+  ): Promise<'done' | 'parked' | 'end_turn'> {
     try {
       const res = await this.ops.invoke_command(call.name, call.args, invoker);
       // A `pending` policy decision surfaces two ways across impls: the real
@@ -376,6 +386,10 @@ export class AgentRuntime {
         this.state = { kind: 'paused_for_approval', gateway_token: token };
         return 'parked';
       }
+      // A successful command may signal it COMPLETED the agent's response (e.g.
+      // messages.reply): the runtime then stops the turn loop instead of looping and
+      // re-replying (CommandResult.end_turn, §8.1).
+      if (res.ok && res.end_turn === true) return 'end_turn';
       // Otherwise a deny/failed command is not fatal: Operations already recorded
       // the refusal as the CommandResult; the owning App's block (or the result's
       // own error surfaced to the agent next turn) reflects it. Nothing to do here

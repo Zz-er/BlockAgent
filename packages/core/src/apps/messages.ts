@@ -363,6 +363,15 @@ function ingestCommand(app: MessagesApp): CommandManifest<MessagesState> {
   return {
     name: 'ingest',
     description: 'Deliver an inbound user message into the conversation history (wakes the runtime).',
+    args_schema: {
+      type: 'object',
+      required: ['content'],
+      properties: {
+        content: { type: 'string', description: 'The inbound user message text.' },
+        id: { type: 'string', description: 'Optional explicit message id (auto-assigned if omitted).' },
+        from: { type: 'string', description: 'Optional sender label.' },
+      },
+    },
     capabilities: [{ name: 'block:write' }],
     invoke: async (args): Promise<CommandResult> => {
       const a = args as { id?: unknown; content?: unknown; from?: unknown } | undefined;
@@ -388,7 +397,15 @@ function ingestCommand(app: MessagesApp): CommandManifest<MessagesState> {
 function replyCommand(app: MessagesApp): CommandManifest<MessagesState> {
   return {
     name: 'reply',
-    description: 'Reply to the conversation: records the agent message + appends to the outbox.',
+    description: 'Reply to the user: send a message back. Put the reply text in `content`.',
+    args_schema: {
+      type: 'object',
+      required: ['content'],
+      properties: {
+        content: { type: 'string', description: 'The reply text to send to the user.' },
+        reply_to: { type: 'string', description: 'Optional id of the message being replied to.' },
+      },
+    },
     capabilities: [{ name: 'block:write' }],
     invoke: async (args, ctx): Promise<CommandResult> => {
       const a = args as Partial<ReplyArgs> | undefined;
@@ -407,7 +424,10 @@ function replyCommand(app: MessagesApp): CommandManifest<MessagesState> {
       // §6 Option B) — AFTER the durable write so a subscriber never sees a reply
       // that isn't yet recorded. Fire-and-forget; a throwing listener is isolated.
       app.emitReply({ id, content: a.content, ...(reply_to ? { reply_to } : {}) });
-      return { ok: true, data: { reply_id: id, ...(reply_to ? { reply_to } : {}) } };
+      // end_turn: replying to the user completes the agent's response for this wake, so
+      // the runtime stops the turn loop (goes idle to await the next message) instead of
+      // looping and re-replying.
+      return { ok: true, end_turn: true, data: { reply_id: id, ...(reply_to ? { reply_to } : {}) } };
     },
   };
 }
@@ -421,6 +441,12 @@ function peekCommand(): CommandManifest<MessagesState> {
   return {
     name: 'peek',
     description: 'Return the recent conversation messages (bodies) and the current summary.',
+    args_schema: {
+      type: 'object',
+      properties: {
+        count: { type: 'number', description: 'How many recent messages to return (default: display_count).' },
+      },
+    },
     invoke: async (args, ctx): Promise<CommandResult> => {
       const state = ctx.state;
       const n = readPositiveInt((args as { count?: unknown } | undefined)?.count);
@@ -441,6 +467,13 @@ function ackCommand(): CommandManifest<MessagesState> {
   return {
     name: 'ack',
     description: 'Remove a message from the recent projection by id (stays in the durable log).',
+    args_schema: {
+      type: 'object',
+      required: ['id'],
+      properties: {
+        id: { type: 'string', description: 'The message id to drop from the recent projection.' },
+      },
+    },
     capabilities: [{ name: 'block:write' }],
     invoke: async (args, ctx): Promise<CommandResult> => {
       const id = (args as { id?: unknown } | undefined)?.id;
@@ -469,6 +502,14 @@ function setConfigCommand(): CommandManifest<MessagesState> {
   return {
     name: 'set_config',
     description: 'Retune messages config (token budget / threshold / display count). User/UI only.',
+    args_schema: {
+      type: 'object',
+      properties: {
+        max_history_tokens: { type: 'number' },
+        compression_threshold: { type: 'number' },
+        display_count: { type: 'number' },
+      },
+    },
     capabilities: [{ name: 'block:write' }],
     allowed_invokers: ['user'],
     invoke: async (args, ctx, _invoker: InvokerContext): Promise<CommandResult> => {

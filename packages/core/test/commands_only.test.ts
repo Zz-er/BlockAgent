@@ -24,6 +24,7 @@ import {
   TestRenderer,
   makeEmptyTree,
   makeReplyApp,
+  makeEndTurnApp,
 } from './fixtures.js';
 
 const WAKE = { kind: 'sync_message_arrived', msg_id: 'm1' } as const;
@@ -192,6 +193,46 @@ describe('error channel (a failed turn surfaces instead of silent no-op)', () =>
     const { runtime } = wire(provider);
 
     await expect(runtime.on_wake(WAKE)).resolves.toBeUndefined();
+    expect(runtime.state.kind).toBe('idle');
+  });
+});
+
+describe('end_turn (a reply-style command ends the turn, §8.1)', () => {
+  it('stops the turn loop after a command returns end_turn — does NOT run another turn', async () => {
+    // Two turns are scripted; if end_turn did NOT stop the loop, the second would run
+    // (the agent re-replying — the over-reply bug). With end_turn the loop ends after one.
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'done.reply', args: {} }] },
+      { tool_calls: [{ id: 't2', name: 'done.reply', args: {} }] },
+    ]);
+    const tree = makeEmptyTree();
+    const registry = new TestCommandRegistry();
+    makeEndTurnApp(registry);
+    const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
+    const ops = new TestOperations(tree, policy, registry);
+    const runtime = new AgentRuntime({
+      operations: ops,
+      renderer: new TestRenderer(new TestBuilderRegistry()),
+      provider,
+    });
+
+    await runtime.on_wake(WAKE);
+
+    expect(provider.turns_consumed).toBe(1); // the scripted 2nd turn never ran
+    expect(runtime.state.kind).toBe('idle');
+  });
+
+  it('keeps looping for a non-end_turn command (multi-step tool use unaffected)', async () => {
+    // reply.say does NOT set end_turn → the loop runs a second turn (then ends on empty).
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'reply.say', args: { text: 'hi' } }] },
+      {},
+    ]);
+    const { runtime } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+
+    expect(provider.turns_consumed).toBe(2); // looped to the 2nd (empty) turn, unlike end_turn
     expect(runtime.state.kind).toBe('idle');
   });
 });
