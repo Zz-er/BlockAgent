@@ -224,6 +224,31 @@ function storeFromConfig(cfg: LettaMemoryConfig): LettaMemoryStore {
   return new LettaMemoryStore({ agentId: cfg.agent_id, baseUrl: cfg.base_url });
 }
 
+/**
+ * ensureAgentId — guarantee a Letta agent exists before a command uses the backend,
+ * creating one LAZILY on first use if needed. `registry.install` runs `on_install`
+ * fire-and-forget (`void on_install(...)`), so a command can fire before on_install's
+ * async agent-create has finished — relying on on_install alone is racy. This makes the
+ * commands self-sufficient: if `agent_id` is empty, create the agent now, persist it, and
+ * continue. Idempotent (a set id is returned as-is); returns null only if the Letta server
+ * is unreachable / creation failed (the command then degrades with a clear error).
+ */
+async function ensureAgentId(ctx: AppContext<LettaMemoryState>): Promise<string | null> {
+  const existing = ctx.state.config.agent_id;
+  if (existing) return existing;
+  const created = await LettaMemoryStore.createAgent(ctx.state.config.base_url);
+  if (created) {
+    ctx.set_state((s) => ({ ...s, config: { ...s.config, agent_id: created } }));
+    return created;
+  }
+  return null;
+}
+
+/** The error a command returns when the Letta backend cannot be reached / agent created. */
+const BACKEND_UNAVAILABLE =
+  'memory_letta backend unavailable: could not create or reach the Letta agent ' +
+  '(server unreachable or misconfigured — check LETTA_BASE_URL / LETTA_API_KEY and the server logs).';
+
 // ============================================================================
 // Content-addressed id (INV #16 — no random/clock)
 // ============================================================================
@@ -292,10 +317,11 @@ function makeRememberCommand(): CommandManifest<LettaMemoryState> {
         return { ok: false, error: scan.reason };
       }
 
+      // Lazily ensure the Letta agent exists (on_install is fire-and-forget, may not have
+      // finished). Re-read cfg afterwards so storeFromConfig sees the populated agent_id.
+      const agentId = await ensureAgentId(ctx);
+      if (!agentId) return { ok: false, error: BACKEND_UNAVAILABLE };
       const cfg = ctx.state.config;
-      if (!cfg.agent_id) {
-        return { ok: false, error: 'memory_letta is not configured: agent_id missing. Run memory_letta.set_config or reinstall.' };
-      }
 
       const origin: 'user' | 'agent' = invoker.invoker === 'user' ? 'user' : 'agent';
       const verified = origin === 'user';
@@ -348,10 +374,9 @@ function makeRecallCommand(): CommandManifest<LettaMemoryState> {
     ): Promise<CommandResult> {
       const { query, limit, tags } = args as { query: string; limit?: number; tags?: string[] };
 
+      const agentId = await ensureAgentId(ctx);
+      if (!agentId) return { ok: false, error: BACKEND_UNAVAILABLE };
       const cfg = ctx.state.config;
-      if (!cfg.agent_id) {
-        return { ok: false, error: 'memory_letta is not configured: agent_id missing.' };
-      }
 
       const cap = Math.min(limit ?? cfg.recall_limit, cfg.recall_limit);
 
@@ -406,10 +431,9 @@ function makeSetBlockCommand(): CommandManifest<LettaMemoryState> {
         return { ok: false, error: `Block '${label}' is read-only and cannot be modified.` };
       }
 
+      const agentId = await ensureAgentId(ctx);
+      if (!agentId) return { ok: false, error: BACKEND_UNAVAILABLE };
       const cfg = ctx.state.config;
-      if (!cfg.agent_id) {
-        return { ok: false, error: 'memory_letta is not configured: agent_id missing.' };
-      }
 
       // H1 scan — core blocks are injected into prompt too (INV #21).
       const scan = scanMemoryContent(value);
