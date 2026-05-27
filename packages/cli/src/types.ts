@@ -127,6 +127,20 @@ export interface LauncherConfig {
   storage_dir?: string;
   /** Forwarded to AgentRuntime. */
   max_turns_per_wake?: number;
+  /**
+   * Gate for the destructive `/app purge` command (physical delete of an app's local
+   * data). DISABLED by default — the operator must set `allow_purge: true` (file/flag)
+   * to even surface the command. Resolved by `loadConfig` and threaded onto
+   * `LaunchedAgent.allow_purge`. Nothing else reads it.
+   */
+  allow_purge?: boolean;
+  /**
+   * The config file path `loadConfig` actually consulted (the `--config <path>` value
+   * or the default `block-agent.config.json`). Threaded onto `LaunchedAgent.config_path`
+   * so `/app install|uninstall|swap` write back to the SAME file the operator launched
+   * with (not a guessed default). Resolved by `loadConfig`.
+   */
+  config_path?: string;
 }
 
 // ============================================================================
@@ -157,6 +171,33 @@ export interface LaunchedAgent {
   readonly messages: MessagesApp | null;
   readonly provider: ModelProvider;
   readonly provider_id: string;
+  /**
+   * Hot-uninstall a currently-installed app without requiring a restart (v1).
+   * Implemented by HotMutator in launch.ts (#5). When absent, appCommand falls back
+   * to "write config + prompt restart". Shape per spec §5.
+   *
+   *   - Returns `{ok:false, reason:'busy'}` when the runtime has in-flight turns.
+   *   - Returns `{ok:false, reason:'not_installed'}` when the id is unknown.
+   *   - Returns `{ok:true, removed_blocks}` on success.
+   */
+  hotUninstall?(app_id: string): Promise<HotUninstallResult>;
+  /**
+   * The config file `launch` was started from (typically the resolved `--config`
+   * path or `block-agent.config.json`). `/app install|uninstall|swap` write their
+   * `apps.<id>.enabled` patch back to THIS file. Typed replacement for the earlier
+   * `_configPath` cast. Absent ⇒ appCommand falls back to the default file name.
+   */
+  readonly config_path?: string;
+  /**
+   * Project storage base dir (the resolved `storage_dir`, default cwd). `/app purge`
+   * deletes `<storage_dir>/.block-agent/apps/<id>/`. Typed replacement for `_storageDir`.
+   */
+  readonly storage_dir?: string;
+  /**
+   * Whether the destructive `/app purge` command is enabled (from config `allow_purge`).
+   * Typed replacement for the `_allowPurge` / `_config.allow_purge` casts. Default false.
+   */
+  readonly allow_purge?: boolean;
 }
 
 // ============================================================================
@@ -202,10 +243,14 @@ export interface CliChannel {
  * (the abbreviated /context, /apps, /status, /help text, or a /cmd result). Kept a
  * discriminated union so the UI renders each shape deliberately; the exact member
  * fields are owned by impl-cli-logic + impl-cli-ui together (this is the seam).
+ *
+ * v1 change: the `apps` variant now carries two segments (installed + available) so
+ * the /apps panel can show what's running and what can be installed. Action results
+ * from /app sub-commands reuse `command_result` / `message` (no new variant needed).
  */
 export type CtxView =
   | { kind: 'context'; snapshot_hash: string; segments: SegmentSummary[] }
-  | { kind: 'apps'; apps: AppSummary[] }
+  | { kind: 'apps'; installed: AppSummary[]; available: AvailableApp[] }
   | { kind: 'status'; runtime_state: AgentState['kind']; provider_id: string; app_count: number; turns: number }
   | { kind: 'command_result'; ok: boolean; text: string }
   | { kind: 'message'; text: string };
@@ -218,13 +263,44 @@ export interface SegmentSummary {
   preview: string;
 }
 
-/** One app's reflection for the /apps view. */
+/** One app's reflection for the /apps installed segment. */
 export interface AppSummary {
   id: string;
   version: string;
   blocks: string[];
   /** Full command names `<id>.<cmd>`, each flagged if user-only (allowed_invokers). */
   commands: Array<{ full_name: string; user_only: boolean }>;
+}
+
+/**
+ * AvailableApp — catalog entry projected for the /apps available segment.
+ * Mirrors BuiltinAppEntry shape from app_catalog.ts but defined here as the
+ * CtxView-side seam (UI renders it; context_view.ts produces it).
+ */
+export interface AvailableApp {
+  id: string;
+  /** One-line Chinese summary (matches BUILTIN_APP_CATALOG[*].summary). */
+  summary: string;
+  default_enabled: boolean;
+  /** External dependency note (e.g. 'Letta server + LETTA_API_KEY'). */
+  requires?: string;
+}
+
+/**
+ * HotUninstallResult — result returned by LaunchedAgent.hotUninstall (defined here
+ * so both appCommand [caller] and launch.ts [implementer, #5] share the shape).
+ *
+ * Designed by spec §5: `ok:false + reason:'busy'` when the runtime had in-flight
+ * turns; `ok:true + removed_blocks` on success.
+ */
+export interface HotUninstallResult {
+  ok: boolean;
+  /** Present on failure: why uninstall was declined. */
+  reason?: 'busy' | 'not_installed' | 'error';
+  /** Block names whose nodes were removed (soft-deleted via Operations). */
+  removed_blocks?: string[];
+  /** Error message when reason='error'. */
+  error?: string;
 }
 
 /**

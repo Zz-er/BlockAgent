@@ -238,7 +238,28 @@ export interface AppManifest<TState = unknown> {
   commands: CommandManifestFactory<TState>[];
 
   // Lifecycle hooks.
+  /**
+   * Run once when the App is installed (after register, before/around the
+   * runtime's install wiring). Currently fire-and-forget at the AppRegistry
+   * (`void on_install`), so an App needing async setup must not assume it has
+   * finished before its first command runs (memory_letta's lazy `ensureAgentId`
+   * is the canonical workaround). Use it to warm state, not as a barrier.
+   */
   on_install?(ctx: AppContext<TState>): Promise<void>;
+  /**
+   * Run once when the App is uninstalled. SCOPE IS DELIBERATELY NARROW: do ONLY
+   * graceful teardown — flush in-memory buffers, close external connections
+   * (HTTP/Letta clients, DB handles), release advisory locks. It MUST NOT delete
+   * the App's durable data (its `.block-agent/apps/<id>/*.jsonl`, or external
+   * store records). Uninstall is "stop participating", not "destroy":
+   * INVARIANT #5 (删除即归档) — an uninstalled App's data is ARCHIVED in place and
+   * a later re-install of the same id continues to read it. Physical deletion is
+   * a SEPARATE, explicit, capability-gated path (the CLI `/app purge`,
+   * `block:delete_physical`, with confirmation), never this hook. The runtime's
+   * hot-uninstall orchestration removes the projection-block tree nodes and the
+   * registry index around this hook (see the lifecycle design / impl-split spec);
+   * `on_uninstall` itself touches neither the tree nor stored data.
+   */
   on_uninstall?(ctx: AppContext<TState>): Promise<void>;
 }
 

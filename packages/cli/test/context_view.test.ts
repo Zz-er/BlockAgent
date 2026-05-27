@@ -67,16 +67,25 @@ describe('context_view', () => {
     expect(text).toContain('segments:');
   });
 
-  it('appsView reflects each app id, version, blocks, and commands', () => {
-    const apps = appsView(agent);
-    const ids = apps.map((a) => a.id);
+  it('appsView reflects each app id, version, blocks, and commands (installed segment)', () => {
+    const { installed, available } = appsView(agent);
+    const ids = installed.map((a) => a.id);
     expect(ids).toEqual(expect.arrayContaining(['agent_identity', 'messages', 'tools']));
 
-    const messages = apps.find((a) => a.id === 'messages')!;
+    const messages = installed.find((a) => a.id === 'messages')!;
     // messages owns the recent + summary projection blocks.
     expect(messages.blocks).toEqual(expect.arrayContaining(['messages:recent', 'messages:summary']));
     // messages.set_config is user-only.
     const setConfig = messages.commands.find((c) => c.full_name === 'messages.set_config');
     expect(setConfig?.user_only).toBe(true);
+
+    // available segment: memory is disabled in mockConfig, memory_letta also disabled;
+    // both should appear in available (along with memory_letta since neither is installed).
+    const availableIds = available.map((a) => a.id);
+    expect(availableIds).toEqual(expect.arrayContaining(['memory', 'memory_letta']));
+    // installed ids must not appear in available.
+    for (const id of ids) {
+      expect(availableIds).not.toContain(id);
+    }
   });
 });

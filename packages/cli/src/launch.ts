@@ -38,7 +38,7 @@ import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
 import type { IdentityState } from '@block-agent/core/apps/agent_identity.js';
-import type { LauncherConfig, LaunchedAgent, ProviderKind } from './types.js';
+import type { LauncherConfig, LaunchedAgent, ProviderKind, HotUninstallResult } from './types.js';
 import { MISSING_PROVIDER_KEY_CODE } from './types.js';
 
 /** The empty-tree root name (core/block.ts:128 `core:root`); apps fill the tree on use. */
@@ -110,38 +110,13 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   // 1) Empty tree (synthetic `core:root`; apps fill it via commands at runtime).
   const tree = new BlockTree();
 
-  // 2) AppRegistry + install the enabled standard apps. Keep the MessagesApp handle
-  //    so the CLI can subscribe to onReply (reply=Option B, §6).
+  // 2) AppRegistry + install the enabled standard apps via the shared id→manifest
+  //    factory. installEnabledApps keeps the MessagesApp handle so the CLI can
+  //    subscribe to onReply (reply=Option B, §6). The boot path and any future hot
+  //    install share this ONE mapping (no second wiring path to drift, design §6.3).
   const registry = new AppRegistry();
   const base = appsBaseDir(config);
-  let messages: MessagesApp | null = null;
-
-  if (config.apps.agent_identity.enabled) {
-    registry.install(makeAgentIdentityApp(identityState(config)));
-  }
-  if (config.apps.messages.enabled) {
-    messages = new MessagesApp({ dir: join(base, 'messages'), configBase: base });
-    registry.install(messages.manifest());
-  }
-  if (config.apps.tools.enabled) {
-    registry.install(new ToolsApp(base).manifest());
-  }
-  // Built-in memory (core; zero dependency). State-driven projection like tools, so
-  // seedProjectionBlocks below covers its `memory:*` blocks. Char limits / recall
-  // limit are seeded into the app's config (file seed + these overrides).
-  if (config.apps.memory.enabled) {
-    registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
-  }
-  // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
-  // @block-agent/memory-letta — core never imports it (DR-M4). base_url comes from
-  // config; the API key is read from LETTA_API_KEY env inside the store, never here.
-  if (config.apps.memory_letta.enabled) {
-    const lettaOpts =
-      config.apps.memory_letta.base_url !== undefined
-        ? { baseUrl: config.apps.memory_letta.base_url }
-        : {};
-    registry.install(new MemoryLettaApp(lettaOpts).manifest() as Parameters<typeof registry.install>[0]);
-  }
+  const { messages } = installEnabledApps(config, registry, base);
 
   // 3) PolicyEngine wired to the command capabilities + allowed_invokers, then
   //    Operations (the single mutation chokepoint, with the engine inside).
@@ -168,7 +143,12 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    (native tool dispatch) — without it a real model only ever emits plain text,
   //    which fails commands-only, so it could never act. User-only commands are
   //    excluded (PolicyEngine would deny them to the agent anyway).
-  const tool_catalog = buildToolCatalog(registry);
+  //    tool_catalog is a MUTABLE reference behind the runtime's thunk: hot-uninstall
+  //    rebuilds it so the agent stops seeing a removed app's commands the very next
+  //    turn. The runtime contract is unchanged (still `() => ToolCatalog`); only the
+  //    value the thunk closes over can change (agent_runtime already anticipates a
+  //    dynamic command set, launch.ts §5).
+  let currentToolCatalog = buildToolCatalog(registry);
   const runtime = new AgentRuntime({
     operations,
     renderer,
@@ -177,7 +157,7 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
       ? { max_turns_per_wake: config.max_turns_per_wake }
       : {}),
     root_name: ROOT_NAME,
-    tool_catalog: () => tool_catalog,
+    tool_catalog: () => currentToolCatalog,
   });
 
   // 6) Wake seam: a messages.ingest → ctx.wake → on_wake runs the turn loop. We chain
@@ -185,8 +165,18 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    submit (the wake itself stays fire-and-forget for the App, §8.2). on_wake's own
   //    re-entrancy guard already ignores a wake that arrives mid-loop; chaining here makes
   //    the COMPLETION observable to CliChannel.submit (awaitTurnsSettled).
+  //    A `mutating` flag lets a hot-uninstall hold the safe window: while it is set,
+  //    incoming wakes are PARKED in `parkedWakes` (not dropped, not run concurrently)
+  //    and replayed once the mutation completes — so no turn starts mid-registry-edit
+  //    (INV #1: never change the builder index / tree while a render is in flight).
   let turnTail: Promise<void> = Promise.resolve();
+  let mutating = false;
+  const parkedWakes: import('@block-agent/core/core/types.js').WakeEvent[] = [];
   registry.wakeHook = (event) => {
+    if (mutating) {
+      parkedWakes.push(event);
+      return;
+    }
     turnTail = turnTail.then(() => runtime.on_wake(event)).catch(() => undefined);
   };
   turnBarriers.set(runtime, () => turnTail);
@@ -210,6 +200,49 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    here is non-fatal — the file seed / defaults still hold.
   await applyAppConfigOverrides(operations, config);
 
+  // 9) HotMutator (v1: hot-UNINSTALL only; hot-install is phase 2). Removes an app at
+  //    runtime without a restart, inside a safe window so an in-flight turn never sees
+  //    the registry / tree change mid-render (lifecycle design §5). Sequence:
+  //      a) await all queued turns settle, then assert runtime is idle (else 'busy');
+  //      b) set `mutating` so wakeHook parks new wakes for the duration;
+  //      c) unseedProjectionBlocks → soft-delete the app's projection nodes through
+  //         Operations (chokepoint, invoker=app — no bypass, INV #5 archival delete);
+  //      d) registry.uninstall → drop the builder index + run on_uninstall (graceful
+  //         teardown only; never deletes durable data, INV #5);
+  //      e) rebuild currentToolCatalog so the agent stops seeing the app's commands;
+  //      f) clear `mutating` and replay any parked wakes.
+  const hotUninstall = async (app_id: string): Promise<HotUninstallResult> => {
+    if (registry.get(app_id) === null) return { ok: false, reason: 'not_installed' };
+    // (a) safe window: let queued turns finish, then require idle.
+    await awaitTurnsSettled(runtime);
+    if (runtime.state.kind !== 'idle') return { ok: false, reason: 'busy' };
+
+    mutating = true;
+    try {
+      // (c) remove projection-block nodes through the chokepoint (BEFORE uninstall, so
+      //     the app's builders are still indexed and their output names resolvable).
+      const removed = await registry.unseedProjectionBlocks(
+        app_id,
+        (name) => operations.has(name),
+        (ops) => operations.apply(ops, { invoker: 'app' }),
+      );
+      // (d) drop the registry index + run on_uninstall (graceful teardown).
+      registry.uninstall(app_id);
+      // (e) rebuild the advertised command catalog (app's commands now gone).
+      currentToolCatalog = buildToolCatalog(registry);
+      return { ok: true, removed_blocks: removed };
+    } catch (err) {
+      return { ok: false, reason: 'error', error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      // (f) reopen the wake gate and replay anything parked during the mutation.
+      mutating = false;
+      const replay = parkedWakes.splice(0, parkedWakes.length);
+      for (const event of replay) {
+        turnTail = turnTail.then(() => runtime.on_wake(event)).catch(() => undefined);
+      }
+    }
+  };
+
   return {
     operations,
     renderer,
@@ -218,7 +251,62 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     messages,
     provider,
     provider_id: provider.id,
+    hotUninstall,
+    ...(config.config_path !== undefined ? { config_path: config.config_path } : {}),
+    ...(config.storage_dir !== undefined ? { storage_dir: config.storage_dir } : {}),
+    ...(config.allow_purge !== undefined ? { allow_purge: config.allow_purge } : {}),
   };
+}
+
+/**
+ * installEnabledApps — the single id→manifest install mapping shared by boot (here)
+ * and any future hot-install path (lifecycle design §6.3 / DR-L2). For each app the
+ * config enables, construct its manifest and `registry.install` it. Returns the
+ * MessagesApp handle (or null when messages is disabled) so the caller can wire
+ * `onReply` (reply=Option B, §6) — it is the one app whose live instance the CLI needs.
+ *
+ * Keeping this as ONE function (not 5 inline `if`s in launch + a second copy in a hot
+ * installer) means the boot order, the storage-dir convention, and the memory_letta
+ * widening cast all live in exactly one place. `base` is the apps storage root
+ * (`.block-agent/apps`).
+ */
+function installEnabledApps(
+  config: LauncherConfig,
+  registry: AppRegistry,
+  base: string,
+): { messages: MessagesApp | null } {
+  let messages: MessagesApp | null = null;
+
+  if (config.apps.agent_identity.enabled) {
+    registry.install(makeAgentIdentityApp(identityState(config)));
+  }
+  if (config.apps.messages.enabled) {
+    messages = new MessagesApp({ dir: join(base, 'messages'), configBase: base });
+    registry.install(messages.manifest());
+  }
+  if (config.apps.tools.enabled) {
+    registry.install(new ToolsApp(base).manifest());
+  }
+  // Built-in memory (core; zero dependency). State-driven projection like tools, so
+  // seedProjectionBlocks covers its `memory:*` blocks. Char limits / recall limit are
+  // seeded into the app's config (file seed + launcher overrides).
+  if (config.apps.memory.enabled) {
+    registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
+  }
+  // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
+  // @block-agent/memory-letta — core never imports it (DR-M4). base_url comes from
+  // config; the API key is read from LETTA_API_KEY env inside the store, never here.
+  if (config.apps.memory_letta.enabled) {
+    const lettaOpts =
+      config.apps.memory_letta.base_url !== undefined
+        ? { baseUrl: config.apps.memory_letta.base_url }
+        : {};
+    registry.install(
+      new MemoryLettaApp(lettaOpts).manifest() as Parameters<typeof registry.install>[0],
+    );
+  }
+
+  return { messages };
 }
 
 /**

@@ -757,3 +757,79 @@ physical delete via `block:delete_physical` capability (DR-M6).
 - `LETTA_API_KEY` env-only (the `ANTHROPIC_API_KEY` rule) — never in config/state/file/log.
 - New package `exports` map points at `.ts` SOURCE (no build step), mirroring core; tsx +
   NodeNext resolve via the workspace symlink.
+
+## BlockApp lifecycle v1 phase — Acceptance Record (2026-05-27)
+
+Built by team `blockagent-applifecycle` (architect: design + contract + integration ·
+impl-core: registry · impl-cli: CLI). Design: `ai_com/block-agent-app-lifecycle-design.md`
+(+ `…-app-lifecycle-impl-split.md`, + `…-app-lifecycle.drawio`). User-approved: all 6
+recommendations + **v1 includes hot-uninstall** (hot-install stays phase 2). Independently
+verified green by the architect (full re-run).
+
+### ① Delivered
+- **Contract** (architect, single-writer `app/types.ts`): `on_uninstall` comment narrowed to
+  enforce INV #5 — graceful teardown only (flush/close/release), NEVER delete durable data;
+  physical delete is the separate capability-gated `/app purge` path. Signature unchanged.
+- **core registry** (impl-core, `app/registry.ts`): ① `unseedProjectionBlocks(app_id, has,
+  apply)` — inverse of `seedProjectionBlocks`; computes the app's owned output names and
+  emits **soft-delete** (`{kind:'delete', target}`, no `physical`) ops through the injected
+  `apply` (Operations chokepoint, invoker=app — no bypass, INV #5/#9). Registry still never
+  touches the tree (single-writer). Idempotent (`has` skips absent names; unknown app → `[]`).
+  ② `ceiling_resolver?(trust: AppTrustLevel) → ReadonlySet<capName>` injected seam — install()
+  checks each command/builder capability against the ceiling (O(1) set-membership, INV #19),
+  **report-only** in v1 (warning, never reject; v1 resolves all apps as `'trusted'`). Unset ⇒
+  skipped (zero regression). 14 new tests.
+- **CLI** (impl-cli): `app_catalog.ts` `BUILTIN_APP_CATALOG` (5+1 metadata) · `config.ts`
+  `writeAppConfig(path, patch)` minimal JSON patch (preserves all other keys, never writes
+  keys) · `commands.ts` `appCommand` (one SlashCommand, invoker=user, sub-dispatch
+  info/install/uninstall/swap/purge; install·swap = write-config + restart prompt; uninstall =
+  `agent.hotUninstall` + write-config; purge = allow_purge gate + 'yes' confirmation + delete
+  local dir) · `context_view.ts` `appsView` two-segment `{installed, available}` · `types.ts`
+  `CtxView.apps` two-segment + `AvailableApp` + `HotUninstallResult` + `hotUninstall?`. 30 new tests.
+- **Integration** (architect, `cli/launch.ts` + `config.ts` + `types.ts`):
+  ① `installEnabledApps(config, registry, base)` — extracted the 5 inline install `if`s into one
+  id→manifest factory (boot + future hot-install share ONE mapping). ② **tool_catalog mutable
+  reference**: `let currentToolCatalog = buildToolCatalog(registry)` behind the runtime's
+  unchanged `() => currentToolCatalog` thunk; rebuilt on hot-uninstall. ③ **HotMutator
+  `hotUninstall`**: `awaitTurnsSettled(runtime)` → assert `runtime.state.kind==='idle'` (else
+  `{ok:false, reason:'busy'}`) → set `mutating` so the wakeHook PARKS new wakes (queued, not
+  dropped, not concurrent) → `unseedProjectionBlocks` (chokepoint soft-delete) → `registry.uninstall`
+  (runs on_uninstall) → rebuild `currentToolCatalog` → clear `mutating` + replay parked wakes.
+  ④ **typed LaunchedAgent fields** `config_path` / `storage_dir` / `allow_purge` (resolved by
+  `loadConfig`, threaded by `launch`) — replaced impl-cli's `_configPath`/`_storageDir`/
+  `_allowPurge`/`_config` underscore-cast hacks with proper typed fields (updated appCommand
+  + the app_lifecycle test's fake agent to match).
+
+### ② Verification (all EXIT 0)
+- `npm run typecheck` (all 3 workspaces) → 0.
+- core **181** (+14 app_lifecycle) · cli **58** (+30 app_lifecycle) · memory-letta **44** = 283.
+- **Dependency isolation held**: `npm ls --omit=dev -w @block-agent/core` → core-only closure.
+- **Headless hot-uninstall smoke** (`--dry-run`, temp storage): boot with tools enabled →
+  `agent.hotUninstall('tools')` → ALL 11 assertions PASS: tools dropped from registry,
+  `tools:recent` projection block soft-deleted from the tree, tool_catalog drops `tools.*`,
+  `appsView` moves tools installed→available, `removed_blocks=['tools:recent']`, runtime stays
+  `idle` (no crash).
+
+### ③ Key decisions (DR-L1..L9, design §10; all 6 forks user-ratified)
+discovery = config-list authoritative + static catalog + npm whitelist (never auto-scan-then-
+install) · install timing = config+restart for the INSTALL side, **hot-uninstall in v1**, hot-
+install phase 2 · swap = ordered uninstall+install (config write-back in v1) · uninstall =
+archive-not-delete (INV #5), `on_uninstall` graceful-only · purge = separate `/app purge`,
+allow_purge-gated + confirmation, deletes the app's local dir · `/app` = invoker=user slash,
+never in tool_catalog (agent can't install/uninstall apps).
+
+### ④ Flagged for follow-up (NOT v1-blocking)
+- **Hot-install** is deferred to phase 2 (DR-L2): `/app install` and `/app swap` write config +
+  prompt restart in v1; the `installEnabledApps` factory is already shared so hot-install can
+  reuse it. tool_catalog is already a mutable reference; the safe-window/wake-parking machinery
+  is already in place (hot-uninstall uses it) — hot-install mainly needs install-side seeding +
+  the id→manifest factory call inside the same window.
+- **`memory` catalog summary** says "向量记忆库…语义召回" but built-in memory is full-text/
+  substring (no vectors, DR-21). Cosmetic copy fix in `app_catalog.ts` (impl-cli). Low severity.
+- **capability ceiling is report-only** + v1 resolves everything as `'trusted'` and the launcher
+  does not yet inject a `ceiling_resolver` (seam built, not wired). The `agent_authored` lane
+  (reject + tightened ceiling) is the §5b out-of-process sandbox follow-up.
+- **`/app purge` of `memory_letta`** deletes only the LOCAL dir; the external Letta server's
+  agent/passages are untouched (by design — block-agent has no authority to delete external
+  store data). "pinned immune" (§5b.6) is not selective in v1 — purge deletes the whole app dir;
+  the warning text states this.

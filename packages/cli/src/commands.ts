@@ -18,8 +18,13 @@
  * always invoker=user (chokepoint intact — the CLI never forges invoker:'agent'/'app').
  */
 
+import { rmSync } from 'node:fs';
+import { join } from 'node:path';
+
 import type { DispatchFn, LaunchedAgent, SetView, SlashCommand } from './types.js';
-import { summarize, dumpFull, appsView } from './context_view.js';
+import { summarize, dumpFull, appsView, installedApps } from './context_view.js';
+import { BUILTIN_APP_CATALOG } from './app_catalog.js';
+import { writeAppConfig, DEFAULT_CONFIG_FILE } from './config.js';
 
 /**
  * Per-session turn counter for /status. The runtime exposes its current state but not a
@@ -115,12 +120,309 @@ const dumpCommand: SlashCommand = {
   },
 };
 
-/** /apps — list installed apps with their block names + commands (user_only flagged). */
+/** /apps — list installed apps (blocks/commands) + available catalog entries. */
 const appsCommand: SlashCommand = {
   name: 'apps',
-  summary: 'List installed apps, their blocks, and their commands (user-only flagged).',
+  summary: 'List installed apps, their blocks and commands, plus installable catalog entries.',
   run(agent, _argv, setView) {
-    setView({ kind: 'apps', apps: appsView(agent) });
+    const { installed, available } = appsView(agent);
+    setView({ kind: 'apps', installed, available });
+  },
+};
+
+/**
+ * /app <sub-command> — BlockApp lifecycle operations (invoker=user only, never agent).
+ *
+ * Sub-commands: info / install / uninstall / swap / purge.
+ * NOT in tool_catalog — slash commands are never exposed to the agent.
+ * All writes go through writeAppConfig; hot-uninstall goes through agent.hotUninstall.
+ *
+ * Design: ai_com/block-agent-app-lifecycle-impl-split.md §3.3.
+ */
+const appCommand: SlashCommand = {
+  name: 'app',
+  summary: 'Manage BlockApps: info / install / uninstall / swap / purge.',
+  usage: '<info|install|uninstall|swap|purge> [args]',
+  async run(agent, argv, setView) {
+    const sub = argv[0];
+
+    if (sub === undefined || sub.length === 0) {
+      setView({
+        kind: 'command_result',
+        ok: false,
+        text: [
+          'usage: /app <sub-command> [args]',
+          '  /app info <id>             — show info for an app (installed or catalog)',
+          '  /app install <id>          — write config enabled:true (restart to apply)',
+          '  /app uninstall <id>        — hot-uninstall + write config enabled:false',
+          '  /app swap <current> <next> — plan: uninstall current, install next (restart)',
+          '  /app purge <id>            — delete local app data (requires allow_purge + confirm)',
+        ].join('\n'),
+      });
+      return;
+    }
+
+    // Resolve the config file `/app install|uninstall|swap` write back to. launch.ts
+    // threads the resolved path onto LaunchedAgent.config_path (the file loadConfig
+    // actually consulted); fall back to the default name when absent (e.g. a test
+    // agent that did not set it). [integration #5: was `(agent as {_configPath}).…`]
+    const configPath: string = agent.config_path ?? DEFAULT_CONFIG_FILE;
+
+    // ── info ────────────────────────────────────────────────────────────────
+    if (sub === 'info') {
+      const id = argv[1];
+      if (id === undefined || id.length === 0) {
+        setView({ kind: 'command_result', ok: false, text: 'usage: /app info <id>' });
+        return;
+      }
+      // Check registry first (installed).
+      const installed = installedApps(agent).find((a) => a.id === id);
+      if (installed !== undefined) {
+        const lines: string[] = [
+          `app: ${id}  [installed]`,
+          `version: ${installed.version}`,
+          `blocks: ${installed.blocks.join(', ') || '(none)'}`,
+          `commands: ${installed.commands.map((c) => `${c.full_name}${c.user_only ? ' (user-only)' : ''}`).join(', ') || '(none)'}`,
+        ];
+        const catalogEntry = BUILTIN_APP_CATALOG.find((e) => e.id === id);
+        if (catalogEntry !== undefined) {
+          lines.push(`summary: ${catalogEntry.summary}`);
+          if (catalogEntry.requires !== undefined) lines.push(`requires: ${catalogEntry.requires}`);
+        }
+        setView({ kind: 'message', text: lines.join('\n') });
+        return;
+      }
+      // Not installed — look up catalog.
+      const entry = BUILTIN_APP_CATALOG.find((e) => e.id === id);
+      if (entry !== undefined) {
+        const lines: string[] = [
+          `app: ${id}  [not installed]`,
+          `summary: ${entry.summary}`,
+          `default_enabled: ${entry.default_enabled}`,
+        ];
+        if (entry.requires !== undefined) lines.push(`requires: ${entry.requires}`);
+        setView({ kind: 'message', text: lines.join('\n') });
+        return;
+      }
+      setView({
+        kind: 'command_result',
+        ok: false,
+        text: `unknown app id '${id}'. Run /apps to see the catalog.`,
+      });
+      return;
+    }
+
+    // ── install ─────────────────────────────────────────────────────────────
+    if (sub === 'install') {
+      const id = argv[1];
+      if (id === undefined || id.length === 0) {
+        setView({ kind: 'command_result', ok: false, text: 'usage: /app install <id>' });
+        return;
+      }
+      if (!BUILTIN_APP_CATALOG.some((e) => e.id === id)) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: `unknown app id '${id}'. Run /apps to see installable apps.`,
+        });
+        return;
+      }
+      try {
+        writeAppConfig(configPath, { apps: { [id]: { enabled: true } } });
+      } catch (err) {
+        setView({ kind: 'command_result', ok: false, text: `install failed: ${errorText(err)}` });
+        return;
+      }
+      setView({
+        kind: 'command_result',
+        ok: true,
+        text: `Wrote apps.${id}.enabled=true to ${configPath}.\n⚠ Restart to take effect.`,
+      });
+      return;
+    }
+
+    // ── uninstall ────────────────────────────────────────────────────────────
+    if (sub === 'uninstall') {
+      const id = argv[1];
+      if (id === undefined || id.length === 0) {
+        setView({ kind: 'command_result', ok: false, text: 'usage: /app uninstall <id>' });
+        return;
+      }
+      if (agent.registry.get(id) === null) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: `app '${id}' is not installed. Run /apps to see installed apps.`,
+        });
+        return;
+      }
+
+      let hotResult: string | undefined;
+
+      if (typeof agent.hotUninstall === 'function') {
+        // Hot-uninstall: safe-window + unseed + uninstall + catalog rebuild (HotMutator).
+        const r = await agent.hotUninstall(id);
+        if (!r.ok) {
+          const reason = r.reason ?? 'error';
+          if (reason === 'busy') {
+            setView({
+              kind: 'command_result',
+              ok: false,
+              text: `Cannot uninstall '${id}' right now: a turn is in flight. Wait for the agent to finish and retry.`,
+            });
+            return;
+          }
+          if (reason === 'not_installed') {
+            // Unusual: registry said installed but HotMutator disagrees — still write config.
+            hotResult = `(hot-uninstall: not_installed, writing config anyway)`;
+          } else {
+            setView({
+              kind: 'command_result',
+              ok: false,
+              text: `hot-uninstall failed for '${id}': ${r.error ?? reason}`,
+            });
+            return;
+          }
+        } else {
+          const removed = r.removed_blocks?.length ? ` Removed blocks: ${r.removed_blocks.join(', ')}.` : '';
+          hotResult = `Hot-uninstalled '${id}'.${removed}`;
+        }
+      }
+
+      // Write config enabled:false so the app stays off after a restart.
+      try {
+        writeAppConfig(configPath, { apps: { [id]: { enabled: false } } });
+      } catch (err) {
+        setView({ kind: 'command_result', ok: false, text: `config write failed: ${errorText(err)}` });
+        return;
+      }
+
+      const lines: string[] = [];
+      if (hotResult !== undefined) lines.push(hotResult);
+      else lines.push(`No hot-uninstall hook available.`);
+      lines.push(`Wrote apps.${id}.enabled=false to ${configPath}.`);
+      if (hotResult === undefined) lines.push(`⚠ Restart to fully take effect.`);
+      setView({ kind: 'command_result', ok: true, text: lines.join('\n') });
+      return;
+    }
+
+    // ── swap ─────────────────────────────────────────────────────────────────
+    if (sub === 'swap') {
+      const idA = argv[1];
+      const idB = argv[2];
+      if (idA === undefined || idA.length === 0 || idB === undefined || idB.length === 0) {
+        setView({ kind: 'command_result', ok: false, text: 'usage: /app swap <current-id> <new-id>' });
+        return;
+      }
+      if (agent.registry.get(idA) === null) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: `app '${idA}' is not installed. Nothing to swap out.`,
+        });
+        return;
+      }
+      if (!BUILTIN_APP_CATALOG.some((e) => e.id === idB)) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: `unknown app id '${idB}'. Run /apps to see installable apps.`,
+        });
+        return;
+      }
+      try {
+        writeAppConfig(configPath, {
+          apps: { [idA]: { enabled: false }, [idB]: { enabled: true } },
+        });
+      } catch (err) {
+        setView({ kind: 'command_result', ok: false, text: `swap failed: ${errorText(err)}` });
+        return;
+      }
+      setView({
+        kind: 'command_result',
+        ok: true,
+        text: [
+          `Plan: uninstall '${idA}', install '${idB}'.`,
+          `Wrote apps.${idA}.enabled=false, apps.${idB}.enabled=true to ${configPath}.`,
+          `⚠ Restart to take effect.`,
+        ].join('\n'),
+      });
+      return;
+    }
+
+    // ── purge ─────────────────────────────────────────────────────────────────
+    if (sub === 'purge') {
+      const id = argv[1];
+      if (id === undefined || id.length === 0) {
+        setView({ kind: 'command_result', ok: false, text: 'usage: /app purge <id>' });
+        return;
+      }
+
+      // allow_purge capability gate (from config, threaded onto LaunchedAgent by
+      // launch.ts). Default: purge is DISABLED — operator must explicitly set
+      // allow_purge:true in config. [integration #5: was `(agent as {_allowPurge}).…`]
+      const allowPurge: boolean = agent.allow_purge === true;
+
+      if (!allowPurge) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: [
+            `/app purge is disabled. Set allow_purge:true in ${configPath} to enable it.`,
+            `WARNING: purge deletes ALL local data for the app and cannot be undone.`,
+          ].join('\n'),
+        });
+        return;
+      }
+
+      // Second-factor confirmation: require argv[2] === 'yes' OR --confirm flag.
+      const confirmed = argv[2] === 'yes' || argv.includes('--confirm');
+      if (!confirmed) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: [
+            `WARNING: /app purge ${id} will delete ALL local data for app '${id}' (this cannot be undone).`,
+            `Re-run with confirmation: /app purge ${id} yes`,
+          ].join('\n'),
+        });
+        return;
+      }
+
+      // Resolve the app's local data directory: <storage_dir>/.block-agent/apps/<id>/.
+      // storage_dir is the project root (threaded onto LaunchedAgent by launch.ts);
+      // default to cwd. [integration #5: was `(agent as {_storageDir}).…`]
+      const storageDir: string = agent.storage_dir ?? process.cwd();
+      const appDir = join(storageDir, '.block-agent', 'apps', id);
+
+      try {
+        rmSync(appDir, { recursive: true, force: true });
+      } catch (err) {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text: `purge failed: could not delete ${appDir}: ${errorText(err)}`,
+        });
+        return;
+      }
+
+      setView({
+        kind: 'command_result',
+        ok: true,
+        text: [
+          `Purged ALL local data for '${id}': deleted ${appDir}.`,
+          `WARNING: this operation deleted all local data for the app and cannot be undone.`,
+        ].join('\n'),
+      });
+      return;
+    }
+
+    // Unknown sub-command.
+    setView({
+      kind: 'command_result',
+      ok: false,
+      text: `unknown /app sub-command '${sub}'. Try /app (no args) for usage.`,
+    });
   },
 };
 
@@ -181,6 +483,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   contextCommand,
   dumpCommand,
   appsCommand,
+  appCommand,
   statusCommand,
   helpCommand,
   quitCommand,
