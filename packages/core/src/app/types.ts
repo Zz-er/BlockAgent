@@ -169,6 +169,15 @@ export interface CommandResult {
   data?: unknown;
   /** Set when ok === false. */
   error?: string;
+  /**
+   * Signals the runtime that, with this command, the agent has FINISHED responding for
+   * this wake — the turn loop should stop and return to idle (await the next event)
+   * rather than running another turn. A reply-to-the-user command (e.g. `messages.reply`)
+   * sets this: without it the loop keeps spinning (a reply "progressed", so another turn
+   * runs) and the agent re-replies. Commands that produce results the agent should react
+   * to (tool calls) leave it unset so multi-step tool use still loops. Absent ⇒ false.
+   */
+  end_turn?: boolean;
 }
 
 /**

@@ -204,6 +204,14 @@ function readIdentityPatch(args: unknown): Partial<IdentityState> {
 const IdentitySetCommand: CommandManifest = {
   name: 'set',
   description: 'Set the agent identity (role / persona / instructions). User/UI only.',
+  args_schema: {
+    type: 'object',
+    properties: {
+      role: { type: 'string' },
+      persona: { type: 'string' },
+      instructions: { type: 'string' },
+    },
+  },
   capabilities: [{ name: 'block:write' }],
   // The "who, not what" gate: only the user/UI may change identity (anti-jailbreak).
   allowed_invokers: ['user'],
