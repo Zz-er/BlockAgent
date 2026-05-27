@@ -45,6 +45,18 @@ import type {
 } from './types.js';
 
 // ============================================================================
+// Capability ceiling (INV #19 — O(1) set-membership, injected seam)
+// ============================================================================
+
+/**
+ * Trust level of an App's authorship — drives the capability ceiling. v1 only
+ * ever produces 'trusted' (built-in + audited npm packages installed in-process,
+ * the only form v1 supports). 'agent_authored' is reserved for the follow-up
+ * out-of-process sandbox lane (§5b) and never appears in v1.
+ */
+export type AppTrustLevel = 'trusted' | 'agent_authored';
+
+// ============================================================================
 // Errors (§5.2 / DR-25)
 // ============================================================================
 
@@ -251,6 +263,24 @@ export class AppRegistry
   /** Per-App config injected into BuildContext.config in place of process.env. */
   private readonly configs = new Map<string, Readonly<Record<string, string>>>();
 
+  /**
+   * Capability ceiling resolver: given a trust level, return the set of capability
+   * NAMES that authorship level is allowed to declare on its commands/builders.
+   * install() checks every declared capability against this set; a capability
+   * outside the ceiling is reported as a warning in InstallResult.warnings (v1 is
+   * report-only — it does NOT reject, since built-in apps all pass; the seam is
+   * built so the follow-up agent_authored lane can tighten to reject).
+   *
+   * Injected (like the other registry seams: commandRouter / wakeHook / blockReader),
+   * so the engine stays decoupled and the check is O(1) set-membership (INV #19).
+   * Unset (undefined) ⇒ no ceiling check at all (current behavior preserved).
+   *
+   * Return a set that INCLUDES all caps for 'trusted' (built-ins pass); for
+   * 'agent_authored' it MUST exclude the escalation caps (e.g. cred:read_blob,
+   * block:delete_physical) per §5b.6 — but that path is follow-up, not wired in v1.
+   */
+  ceiling_resolver?: (trust: AppTrustLevel) => ReadonlySet<string>;
+
   /** Optional config supplied at construction, keyed by manifest.id. */
   constructor(opts?: { configs?: Record<string, Record<string, string>> }) {
     if (opts?.configs) {
@@ -285,6 +315,32 @@ export class AppRegistry
     }
 
     const instance = this.instantiate(installed_id, manifest, warnings);
+
+    // Capability ceiling check (INV #19 — report-only in v1; seam built for future
+    // agent_authored lane to tighten to reject). Skipped when ceiling_resolver is
+    // not injected, so all existing tests are unaffected.
+    if (this.ceiling_resolver) {
+      const allowed = this.ceiling_resolver('trusted'); // v1: all apps are 'trusted'
+      for (const cmd of instance.commands.values()) {
+        for (const cap of cmd.capabilities ?? []) {
+          if (!allowed.has(cap.name)) {
+            warnings.push(
+              `App '${installed_id}' command '${cmd.name}' declares capability '${cap.name}' outside the ceiling (report-only)`,
+            );
+          }
+        }
+      }
+      for (const builder of instance.builders) {
+        for (const cap of builder.capabilities ?? []) {
+          if (!allowed.has(cap.name)) {
+            warnings.push(
+              `App '${installed_id}' builder '${builder.name}' declares capability '${cap.name}' outside the ceiling (report-only)`,
+            );
+          }
+        }
+      }
+    }
+
     this.apps.set(installed_id, instance);
     this.indexBuilders(instance);
 
@@ -417,6 +473,57 @@ export class AppRegistry
     }));
     if (ops.length > 0) await apply(ops);
     return names;
+  }
+
+  /**
+   * Inverse of seedProjectionBlocks: remove the projection-block tree nodes a
+   * given (about-to-be-uninstalled) App owns. The registry stays single-writer-
+   * clean — it NEVER touches the tree directly; it computes the block names to
+   * delete from the App's builder outputs and emits them through the injected
+   * `apply`, exactly as seedProjectionBlocks emits its create ops (so the delete
+   * flows through Operations.apply({invoker:'app'}) and re-enters PolicyEngine —
+   * no bypass, §9.1).
+   *
+   * CALL ORDER (hot-uninstall, orchestrated by the CLI HotMutator, §5): call this
+   * BEFORE registry.uninstall(app_id) — while the App's builders are still indexed
+   * — so the names are resolvable from the registry; then uninstall() drops the
+   * index + runs on_uninstall.
+   *
+   * @param app_id  the App whose owned projection-block names should be removed.
+   * @param has     predicate: is a block with this name currently live in the tree?
+   *                (skip names not present → idempotent across repeats / partial state).
+   * @param apply   applies the delete ops through the chokepoint (invoker=app).
+   *                Soft delete (BlockOp.delete WITHOUT physical) — INV #5: the node
+   *                is archived, not physically erased; this is install-time infra
+   *                teardown, not a destructive purge.
+   * @returns the block names actually deleted (for HotMutator logging / tests).
+   */
+  async unseedProjectionBlocks(
+    app_id: string,
+    has: (name: BlockName) => boolean,
+    apply: (ops: BlockOp[]) => Promise<unknown>,
+  ): Promise<BlockName[]> {
+    const instance = this.apps.get(app_id);
+    if (!instance) return []; // already uninstalled → idempotent, no names
+
+    // Collect all output names owned by this app's builders. Sort for determinism.
+    const ownedNames: BlockName[] = [];
+    for (const builder of instance.builders) {
+      for (const out of builder.outputs) {
+        ownedNames.push(out);
+      }
+    }
+    ownedNames.sort();
+
+    // Only emit delete ops for names that are currently live in the tree (idempotent).
+    const toDelete = ownedNames.filter((n) => has(n));
+    const ops: BlockOp[] = toDelete.map((name) => ({
+      kind: 'delete',
+      target: name,
+      // physical omitted (undefined) → soft delete / archival (INV #5).
+    }));
+    if (ops.length > 0) await apply(ops);
+    return toDelete;
   }
 
   // --------------------------------------------------------------------------

@@ -14,7 +14,7 @@
  * Pure: no Ink/React, no console. Returns data; main.tsx decides what to print.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 import type {
   LauncherConfig,
@@ -40,7 +40,7 @@ export const DEFAULTS: LauncherConfig = {
 };
 
 /** The config file consulted when `--config` is absent (design §3 / §11.4). */
-const DEFAULT_CONFIG_FILE = 'block-agent.config.json';
+export const DEFAULT_CONFIG_FILE = 'block-agent.config.json';
 
 /** The provider kinds we accept on flags / env / file. */
 const PROVIDER_KINDS: ReadonlySet<string> = new Set<ProviderKind>([
@@ -261,6 +261,11 @@ export function loadConfig(
     asNumber(env['BLOCK_AGENT_MAX_TURNS_PER_WAKE']),
   );
 
+  // allow_purge: gate for the destructive `/app purge` command (flag `--allow-purge`
+  // or file `allow_purge:true`). DISABLED unless explicitly set, so a stray boot can
+  // never enable irrecoverable deletion. Not an env var (too easy to leave globally on).
+  const allow_purge = pick(asBool(flags['allow-purge']), asBool(file['allow_purge'])) ?? false;
+
   return {
     provider,
     apps: {
@@ -272,6 +277,10 @@ export function loadConfig(
     },
     ...(storage_dir !== undefined ? { storage_dir } : {}),
     ...(max_turns_per_wake !== undefined ? { max_turns_per_wake } : {}),
+    ...(allow_purge ? { allow_purge } : {}),
+    // The file `loadConfig` actually consulted — so `/app *` write-backs target it
+    // (not a re-guessed default). Always defined here (default file name when no flag).
+    config_path: configPath,
   };
 }
 
@@ -373,6 +382,70 @@ function resolveMemory(
     ...(user_char_limit !== undefined ? { user_char_limit } : {}),
     ...(recall_limit !== undefined ? { recall_limit } : {}),
   };
+}
+
+// ============================================================================
+// writeAppConfig — minimal JSON patch write-back (design §3.2)
+// ============================================================================
+
+/**
+ * writeAppConfig — patch `apps.<id>.enabled` in a block-agent.config.json, preserving
+ * every other field (read-modify-write). Spec: ai_com/block-agent-app-lifecycle-impl-
+ * split.md §3.2.
+ *
+ * - Missing file → create with just the patched apps section (no other keys).
+ * - Unreadable / malformed existing file → throw (do NOT silently clobber the
+ *   operator's file; surface the error so the operator can fix it).
+ * - API keys are NEVER written here (key only lives in env — the KEY iron law).
+ * - JSON comments are lost on write (acceptable: the format is JSON, not JSONC).
+ */
+export function writeAppConfig(
+  path: string,
+  patch: { apps: Record<string, { enabled: boolean }> },
+): void {
+  let base: Record<string, unknown> = {};
+
+  if (existsSync(path)) {
+    let raw: string;
+    try {
+      raw = readFileSync(path, 'utf8');
+    } catch (err) {
+      throw new Error(
+        `writeAppConfig: cannot read ${path}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(
+        `writeAppConfig: ${path} contains malformed JSON — fix it before writing: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`writeAppConfig: ${path} root is not a JSON object`);
+    }
+    base = parsed as Record<string, unknown>;
+  }
+
+  // Deep-merge only apps.<id>.enabled; all other keys are preserved untouched.
+  const existingApps: Record<string, unknown> =
+    typeof base['apps'] === 'object' && base['apps'] !== null && !Array.isArray(base['apps'])
+      ? { ...(base['apps'] as Record<string, unknown>) }
+      : {};
+
+  for (const [id, update] of Object.entries(patch.apps)) {
+    const existingApp: Record<string, unknown> =
+      typeof existingApps[id] === 'object' &&
+      existingApps[id] !== null &&
+      !Array.isArray(existingApps[id])
+        ? { ...(existingApps[id] as Record<string, unknown>) }
+        : {};
+    existingApps[id] = { ...existingApp, enabled: update.enabled };
+  }
+
+  const result: Record<string, unknown> = { ...base, apps: existingApps };
+  writeFileSync(path, JSON.stringify(result, null, 2), 'utf8');
 }
 
 /**

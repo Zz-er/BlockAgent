@@ -17,7 +17,8 @@
 import { writeFileSync } from 'node:fs';
 
 import type { RenderedPrompt } from '@block-agent/core/core/types.js';
-import type { LaunchedAgent, CtxView, SegmentSummary, AppSummary } from './types.js';
+import type { LaunchedAgent, CtxView, SegmentSummary, AppSummary, AvailableApp } from './types.js';
+import { BUILTIN_APP_CATALOG, type BuiltinAppEntry } from './app_catalog.js';
 
 /** Byte length of a UTF-8 string (matches what a provider would actually send). */
 function utf8Bytes(text: string): number {
@@ -87,14 +88,12 @@ export async function dumpFull(agent: LaunchedAgent, file: string): Promise<void
 }
 
 /**
- * appsView — the /apps reflection (design §5). For each installed app: id, version, the
- * block names its builders own, and its full command names (`<id>.<cmd>`) each flagged
- * `user_only` when the command declares `allowed_invokers` that excludes `'agent'`
- * (e.g. `agent_identity.set`, `messages.set_config`, `tools.set_config`). Read-only over
- * the registry; this is the user-UI command-panel path the architecture allows (the
- * engine still enforces `allowed_invokers` at step 0 — this only ANNOTATES).
+ * installedApps — build the `installed` segment: each registry entry reflected as an
+ * AppSummary (id, version, sorted block names, commands with user_only flag).
+ *
+ * Called by appsView and also by appCommand's info sub-command.
  */
-export function appsView(agent: LaunchedAgent): AppSummary[] {
+export function installedApps(agent: LaunchedAgent): AppSummary[] {
   return agent.registry.list().map((manifest) => {
     const blocks: string[] = [];
     for (const factory of manifest.builders) {
@@ -119,5 +118,47 @@ export function appsView(agent: LaunchedAgent): AppSummary[] {
   });
 }
 
+/**
+ * availableApps — the `available` segment: catalog entries whose id is NOT in the
+ * currently-installed set. Accepts an optional catalog argument so tests can inject
+ * a fake catalog without touching the module-level constant.
+ */
+export function availableApps(
+  agent: LaunchedAgent,
+  catalog: readonly BuiltinAppEntry[] = BUILTIN_APP_CATALOG,
+): AvailableApp[] {
+  const installedIds = new Set(agent.registry.list().map((m) => m.id));
+  return catalog
+    .filter((entry) => !installedIds.has(entry.id))
+    .map((entry) => ({
+      id: entry.id,
+      summary: entry.summary,
+      default_enabled: entry.default_enabled,
+      ...(entry.requires !== undefined ? { requires: entry.requires } : {}),
+    }));
+}
+
+/**
+ * appsView — the /apps reflection (design §5, v1 two-segment form).
+ *
+ * `installed`: each registry app's id / version / sorted block names / commands
+ * (user_only annotated). Read-only over the registry; engine still enforces
+ * `allowed_invokers` at step 0 — this only annotates.
+ *
+ * `available`: BUILTIN_APP_CATALOG entries whose id is not in the installed set,
+ * each carrying the one-line summary + default_enabled + optional requires hint.
+ *
+ * Accepts an optional catalog argument for test injection.
+ */
+export function appsView(
+  agent: LaunchedAgent,
+  catalog: readonly BuiltinAppEntry[] = BUILTIN_APP_CATALOG,
+): { installed: AppSummary[]; available: AvailableApp[] } {
+  return {
+    installed: installedApps(agent),
+    available: availableApps(agent, catalog),
+  };
+}
+
 // Re-export the summary shapes so the UI imports them from one place if preferred.
-export type { SegmentSummary, AppSummary };
+export type { SegmentSummary, AppSummary, AvailableApp };

@@ -43,8 +43,8 @@ function renderBody(view: CtxView): JSX.Element {
     case 'apps':
       return (
         <Box flexDirection="column">
-          <Text bold>{`apps  ·  ${view.apps.length} installed`}</Text>
-          {view.apps.map((a) => (
+          <Text bold>{`apps  ·  ${view.installed.length} installed`}</Text>
+          {view.installed.map((a) => (
             <Box key={a.id} flexDirection="column" marginTop={1}>
               <Text>
                 <Text color="cyan" bold>{a.id}</Text>
@@ -59,6 +59,17 @@ function renderBody(view: CtxView): JSX.Element {
               ))}
             </Box>
           ))}
+          {view.available.length > 0 ? (
+            <Box flexDirection="column" marginTop={1}>
+              <Text dimColor bold>{`available (${view.available.length})`}</Text>
+              {view.available.map((a) => (
+                <Box key={a.id} flexDirection="row" marginTop={0}>
+                  <Text color="yellow">{`  ${a.id}`}</Text>
+                  {a.requires !== undefined ? <Text dimColor>{`  [requires: ${a.requires}]`}</Text> : null}
+                </Box>
+              ))}
+            </Box>
+          ) : null}
         </Box>
       );
 

@@ -37,10 +37,10 @@ function capture(): { setView: (v: CtxView) => void; last: () => CtxView | null 
 }
 
 describe('SLASH_COMMANDS registry', () => {
-  it('registers the v3.0 command set', () => {
+  it('registers the v3.0 command set including /app', () => {
     const names = SLASH_COMMANDS.map((c) => c.name);
     expect(names).toEqual(
-      expect.arrayContaining(['cmd', 'context', 'dump', 'apps', 'status', 'help', 'quit', 'exit']),
+      expect.arrayContaining(['cmd', 'context', 'dump', 'apps', 'app', 'status', 'help', 'quit', 'exit']),
     );
   });
 });
@@ -92,15 +92,19 @@ describe('dispatch', () => {
     expect(Array.isArray(ctx.segments)).toBe(true);
   });
 
-  it('/apps lists installed apps with commands flagged user_only', async () => {
+  it('/apps lists installed apps with commands flagged user_only, plus available catalog entries', async () => {
     const cap = capture();
     await dispatch(agent, '/apps', cap.setView);
     const view = cap.last() as Extract<CtxView, { kind: 'apps' }>;
     expect(view.kind).toBe('apps');
-    const identity = view.apps.find((a) => a.id === 'agent_identity');
+    // installed segment
+    const identity = view.installed.find((a) => a.id === 'agent_identity');
     expect(identity).toBeDefined();
     const setCmd = identity!.commands.find((c) => c.full_name === 'agent_identity.set');
     expect(setCmd?.user_only).toBe(true); // allowed_invokers: ['user'] excludes 'agent'
+    // available segment: memory + memory_letta not installed in mockConfig
+    const availableIds = view.available.map((a) => a.id);
+    expect(availableIds).toEqual(expect.arrayContaining(['memory', 'memory_letta']));
   });
 
   it('/status reports runtime state, provider id, and app count', async () => {
