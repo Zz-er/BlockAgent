@@ -680,3 +680,80 @@ byte_identical 4 · app_install 4) · `npm run dev` → full loop exit 0.
   to "advisory write lock (POSIX flock / cross-platform lock-file)".
 - **Manifest factory TS2379 fix** (LOCKED): build typed `AppManifest<TState>`
   internally, `return manifest as AppManifest` at the boundary. All three apps follow it.
+
+## Memory apps phase — Acceptance Record (2026-05-27)
+
+Built by team `blockagent-memory` (architect: contract + integration · impl-memory ·
+impl-letta). Design: `ai_com/block-agent-memory-design.md` (+ `…-memory-impl-split.md`).
+Independently verified green by the architect (full re-run).
+
+### ① Delivered
+- **Shared contract** (architect, single-writer): `src/apps/memory_store.ts` — the
+  passive `MemoryStore` seam (`store`/`load`/`query`/`delete`, NO render/projection
+  method — INV #20) + `MemoryRecord`/`MemoryProvenance`(deterministic, no wall-clock,
+  INV #21)/`MemoryQuery`(required `limit` = the P3 result-set cap). Plus the **H1
+  write-injection scanner** `scanMemoryContent` (1:1 port of Hermes
+  `_scan_memory_content`: 10 threat regexes + 10 invisible/bidi code points written as
+  explicit `String.fromCodePoint(0x…)` for reviewable ASCII source; default-on, NOT a
+  config port) and the shared provenance fence (`fenceRecalledContent` +
+  `MEMORY_CONTEXT_OPEN/CLOSE/NOTE`, §4.3). Zero external deps — stays in core.
+- **Built-in `memory` app** (impl-memory): `src/apps/memory.ts` — Hermes-style notes +
+  user profile, `JsonlMemoryStore` (§12.2 JSONL discipline; soft-delete tombstone folded
+  on read, physical-delete file rewrite, INV #5), full-text/substring recall (no vectors,
+  DR-21), four projection blocks `memory:pinned`(stable)/`memory:notes`(slow_changing)/
+  `memory:user`(slow_changing)/`memory:recalled`(volatile, provenance-fenced). Commands
+  remember/recall/pin/unpin/forget/set_config(user-only). 41 tests.
+- **`memory_letta` package** (impl-letta): NEW `packages/memory-letta/` — `LettaMemoryStore
+  implements MemoryStore` wrapping `@letta-ai/letta-client` (lazy-imported, DR-M4), and the
+  `memory_letta` app (`memory_letta:core` slow_changing / `:recalled` volatile; commands
+  remember/recall/set_block[read_only refused]/set_config[user-only]). Semantic recall +
+  vectors live ENTIRELY in the Letta server (DR-M3 / DR-21). Graceful degrade when the
+  server is unreachable (SETUP_NEEDED style). 44 tests (FakeMemoryStore / stub-client).
+- **Integration** (architect): `packages/cli` `types.ts`(+`MemoryConfig`/`MemoryLettaConfig`)
+  / `config.ts`(+`resolveMemory` enabled-by-default, `resolveMemoryLetta` DISABLED-by-default,
+  `LETTA_BASE_URL` via config/env) / `launch.ts`(install both per config; `memory` via
+  `seedProjectionBlocks` like tools; `memory_letta` import from `@block-agent/memory-letta`,
+  core never imports it). cli `package.json` +`@block-agent/memory-letta` workspace dep;
+  memory-letta `package.json` +`exports` map (mirrors core's `./*`→`./src/*` source map).
+
+### ② Verification (all EXIT 0)
+- `npm run typecheck` (all 3 workspaces) → 0.
+- core **167** · memory-letta **44** · cli **28** (launch.test +1: memory app installed +
+  `memory.remember`/`memory.recall` in tool_catalog, `memory.set_config` filtered as user-only).
+- **Dependency isolation held**: `npm ls --omit=dev -w @block-agent/core` → closure is core
+  only (no Letta); core source has NO `@letta-ai` import (only the string "Letta" in
+  `memory_store.ts` doc comments).
+- **Headless boot smoke**: `--dry-run` boot with memory on → installed + seeded, 3-segment
+  prompt with identity, no crash. `--memory-letta` with an unreachable server → installs +
+  boot survives (graceful degrade).
+
+### ③ Key decisions (DR-M1..M6, design §11)
+Two apps share ONE narrow `MemoryStore` contract, each its own BlockApp (DR-M1). Built-in
+store = JSONL not `node:sqlite` (still experimental + needs `--experimental-sqlite` in Node
+24) (DR-M2). RAG/vectors only in Letta → DR-21 core intact (DR-M3). Letta SDK isolated in
+its own package (DR-M4). H1 scan + provenance fence default-on, not a config port (DR-M5).
+Write commands open to all invokers (gated by capability + H1), only `*.set_config` user-only;
+physical delete via `block:delete_physical` capability (DR-M6).
+
+### ④ Flagged for follow-up (NOT v3.1-blocking)
+- **`memory.forget` physical-delete gate** (impl-memory): physical delete is gated by a
+  handler-internal `invoker==='agent' → deny`, NOT a manifest capability — because declaring
+  `block:delete_physical` on `forget` would make PolicyEngine deny ALL forgets (incl. soft).
+  Behavior is correct + tested, but it re-implements a policy decision inside the handler
+  instead of going through the chokepoint. **Architect adjudication: split into `forget`
+  (soft-only) + `forget_physical` (declares `block:delete_physical`)** so PolicyEngine gates
+  it at the chokepoint (agent flatly denied per §9.4 table, user/app allowed) — INV #5 / §9.1.
+  Small, contained; routed to impl-memory.
+- **`memory_letta.remember` seed id uses `Date.now()`+`Math.random()`** (letta_store /
+  app line ~277). It is overwritten by the Letta-assigned id (`store()` return) before
+  reaching state/prompt, so it does NOT break byte-identical rendering (INV #16 constrains
+  `build`, not commands). Still a latent hazard + a spec deviation (design said
+  content-addressed id even for the seed). Low severity; recommend swapping to a
+  content-addressed seed for hygiene.
+
+### ⑤ Conventions reused
+- §12.2 JSONL discipline (append-only / ≤64KB/line / lock-file 'wx' / startup tail-truncate)
+  reused verbatim by `JsonlMemoryStore` (own copy, no sibling-app import).
+- `LETTA_API_KEY` env-only (the `ANTHROPIC_API_KEY` rule) — never in config/state/file/log.
+- New package `exports` map points at `.ts` SOURCE (no build step), mirroring core; tsx +
+  NodeNext resolve via the workspace symlink.

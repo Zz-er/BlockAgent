@@ -27,6 +27,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { AnthropicThinkingAdapter } from './thinking.js';
+import { encodeToolNames, type EncodedToolNames } from './tool_names.js';
 
 /** Anthropic allows at most 4 cache breakpoints per request (§11.3). */
 const ANTHROPIC_MAX_BREAKPOINTS = 4;
@@ -119,7 +120,14 @@ export class AnthropicProvider implements ModelProvider {
     opts: SendOpts,
     api_key: string,
   ): AsyncIterable<ProviderChunk> {
-    const body = this.build_request_body(prompt, opts);
+    // Encode command full names (`<app>.<cmd>`) into wire-safe tool names: Anthropic
+    // requires tool names to match `^[a-zA-Z0-9_-]+$`, so a `.` is rejected. We send
+    // the wire names and decode tool_use names back to the original on the way out.
+    const enc =
+      opts.tools && opts.tools.length > 0
+        ? encodeToolNames(opts.tools.map((t) => t.name))
+        : null;
+    const body = this.build_request_body(prompt, opts, enc);
     const init: RequestInit = {
       method: 'POST',
       headers: {
@@ -137,11 +145,15 @@ export class AnthropicProvider implements ModelProvider {
       throw new Error(`AnthropicProvider: request failed (${res.status} ${res.statusText}) ${detail}`);
     }
 
-    yield* this.consume_sse(res.body);
+    yield* this.consume_sse(res.body, enc);
   }
 
   /** Build the Messages API request body from the rendered prompt + opts. */
-  private build_request_body(prompt: RenderedPrompt, opts: SendOpts): Record<string, unknown> {
+  private build_request_body(
+    prompt: RenderedPrompt,
+    opts: SendOpts,
+    enc: EncodedToolNames | null,
+  ): Record<string, unknown> {
     const hint = this.cache_hint(prompt.segments);
     const breakpoint_set = new Set(hint.breakpoints);
 
@@ -168,8 +180,8 @@ export class AnthropicProvider implements ModelProvider {
     };
     if (opts.temperature !== undefined) body['temperature'] = opts.temperature;
     if (opts.tools && opts.tools.length > 0) {
-      body['tools'] = opts.tools.map((t) => ({
-        name: t.name,
+      body['tools'] = opts.tools.map((t, i) => ({
+        name: enc ? enc.wire[i]! : t.name,
         description: t.description,
         input_schema: t.args_schema ?? { type: 'object', properties: {} },
       }));
@@ -183,7 +195,10 @@ export class AnthropicProvider implements ModelProvider {
    * (thinking / text / tool_use), `content_block_delta` (text/thinking/input
    * deltas), `content_block_stop`, and `message_delta` (usage).
    */
-  private async *consume_sse(body: ReadableStream<Uint8Array>): AsyncIterable<ProviderChunk> {
+  private async *consume_sse(
+    body: ReadableStream<Uint8Array>,
+    enc: EncodedToolNames | null,
+  ): AsyncIterable<ProviderChunk> {
     const decoder = new TextDecoder();
     const reader = body.getReader();
     let buffer = '';
@@ -207,7 +222,7 @@ export class AnthropicProvider implements ModelProvider {
           const event = parse_sse_data(frame);
           if (!event) continue;
 
-          for (const chunk of this.handle_event(event, blocks)) {
+          for (const chunk of this.handle_event(event, blocks, enc)) {
             if (chunk.kind === 'usage') {
               if (chunk.input_tokens !== undefined) input_tokens = chunk.input_tokens;
               if (chunk.output_tokens !== undefined) output_tokens = chunk.output_tokens;
@@ -224,13 +239,21 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   /** Translate one parsed SSE event object into zero or more ProviderChunks. */
-  private *handle_event(event: SseEvent, blocks: Map<number, AccumBlock>): Iterable<ProviderChunk> {
+  private *handle_event(
+    event: SseEvent,
+    blocks: Map<number, AccumBlock>,
+    enc: EncodedToolNames | null,
+  ): Iterable<ProviderChunk> {
     switch (event.type) {
       case 'content_block_start': {
         const index = event.index ?? 0;
         const cb = event.content_block ?? {};
         if (cb.type === 'tool_use') {
-          blocks.set(index, { type: 'tool_use', id: cb.id ?? '', name: cb.name ?? '', json: '' });
+          // Decode the wire tool name back to the original command full name now, so
+          // both the streamed tool_call and the assembled response carry `<app>.<cmd>`.
+          const rawName = cb.name ?? '';
+          const name = enc ? enc.decode(rawName) : rawName;
+          blocks.set(index, { type: 'tool_use', id: cb.id ?? '', name, json: '' });
         } else if (cb.type === 'thinking') {
           blocks.set(index, { type: 'thinking', text: '' });
         } else {

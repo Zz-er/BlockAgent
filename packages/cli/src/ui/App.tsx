@@ -6,6 +6,7 @@
  * composes the leaf components. In a useEffect (mounted once per agent) it wires the
  * two core side-channels, symmetric to core's own:
  *   - agent.runtime.onThinking → ThinkingStream
+ *   - agent.runtime.onError → ContextView (a failed turn surfaces, never silent)
  *   - channel.onDeliver (→ agent.messages.onReply, reply=Option B §6) → MessageList
  * onSubmit classifies plain text vs /slash: plain text goes through CliChannel.submit
  * (messages.ingest, invoker=user, awaiting the turn); /slash goes to commands.dispatch
@@ -43,11 +44,18 @@ export function App({ agent }: AppProps): JSX.Element {
   // render-time throw here never breaks a turn (agent_runtime / messages emit guards).
   useEffect(() => {
     const offThinking = agent.runtime.onThinking((e) => setThinking((prev) => [...prev, e]));
+    // A failed turn (e.g. the provider call erroring) no longer throws out of
+    // channel.submit — the runtime catches it and emits here, so this is the ONLY way
+    // the UI learns of it. Surface it as an error view instead of silent nothing.
+    const offError = agent.runtime.onError((e) =>
+      setCtxView({ kind: 'command_result', ok: false, text: `agent turn failed (${e.phase}): ${e.message}` }),
+    );
     const offDeliver = channel.onDeliver((reply) =>
       setMessages((prev) => [...prev, { role: 'agent', content: reply.content }]),
     );
     return () => {
       offThinking();
+      offError();
       offDeliver();
     };
   }, [agent, channel]);

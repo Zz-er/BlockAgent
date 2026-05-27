@@ -4,3 +4,6 @@ dist/
 .block-agent/
 ai_com/
 .claude/
+block-agent.config.json
+.env
+.env.*

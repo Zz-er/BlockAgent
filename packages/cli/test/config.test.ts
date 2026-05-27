@@ -1,7 +1,7 @@
 /**
  * test/config.test.ts — loadConfig multi-source merge (impl-cli-logic).
  *
- * Covers the design §3 precedence (flags > env > file > defaults), the api-key-never-in-
+ * Covers the design §3 precedence (flags > file > env > defaults), the api-key-never-in-
  * config rule, --dry-run forcing mock, --no-<app> disabling, and the defensive bad-JSON
  * file behavior (defaults win, never throws). The flag parser variants (`--k v` /
  * `--k=v` / `--flag`) are exercised through loadConfig + parseFlags directly.
@@ -95,7 +95,7 @@ describe('loadConfig config file', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('reads a valid file under defaults but env/flags still win', () => {
+  it('reads a valid file over defaults; flags still win over the file', () => {
     writeFileSync(
       file,
       JSON.stringify({
@@ -112,6 +112,30 @@ describe('loadConfig config file', () => {
     // A flag overrides the file value.
     const overridden = loadConfig(['--config', file, '--model', 'flag-model'], EMPTY_ENV);
     expect(overridden.provider.model).toBe('flag-model');
+  });
+
+  it('config file overrides env (file is authoritative over ambient env vars)', () => {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        provider: { kind: 'openai-compat', model: 'file-model', base_url: 'http://from-file' },
+      }),
+      'utf8',
+    );
+    const env: NodeJS.ProcessEnv = {
+      BLOCK_AGENT_PROVIDER: 'anthropic',
+      BLOCK_AGENT_MODEL: 'env-model',
+      OPENAI_BASE_URL: 'http://from-env',
+    };
+    const cfg = loadConfig(['--config', file], env);
+    // File beats env for every provider field…
+    expect(cfg.provider.kind).toBe('openai-compat');
+    expect(cfg.provider.model).toBe('file-model');
+    expect(cfg.provider.base_url).toBe('http://from-file');
+
+    // …but a flag still beats the file.
+    const withFlag = loadConfig(['--config', file, '--model', 'flag-model'], env);
+    expect(withFlag.provider.model).toBe('flag-model');
   });
 
   it('ignores a malformed JSON file (defaults win, never throws)', () => {

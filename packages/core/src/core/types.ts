@@ -312,6 +312,29 @@ export interface ThinkingEvent {
   spawn_depth: number;
 }
 
+/**
+ * RuntimeErrorEvent — a turn that failed unexpectedly, emitted on the runtime's
+ * error channel (`AgentRuntime.onError`), symmetric to the thinking channel.
+ *
+ * A turn can fail for reasons outside the commands-only loop — most commonly a
+ * provider/transport error (the model endpoint returns 4xx/5xx, the network drops,
+ * the response is unparseable). Such a failure is NOT a command refusal (those are
+ * recorded as CommandResults the agent sees next turn); it aborts the whole turn. The
+ * runtime catches it, emits it here for a UI/caller to surface, and returns to idle —
+ * so a failed turn never silently no-ops (the caller submitted a message and would
+ * otherwise get nothing back) and never crashes the process. `phase` says where it
+ * happened so a UI can word the message ('send' = the provider call failed).
+ */
+export interface RuntimeErrorEvent {
+  /** Normalized human-facing message (err.message, or String(err)). */
+  message: string;
+  /** The original thrown value, for callers that want more than the message. */
+  error: unknown;
+  /** Coarse location of the failure within the turn. */
+  phase: 'send' | 'turn';
+  spawn_depth: number;
+}
+
 // ============================================================================
 // ACTOR INTERFACES (wave 2 — added so runtime/index wire against stable shapes)
 //
