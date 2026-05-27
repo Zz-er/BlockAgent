@@ -1,0 +1,7 @@
+{
+  "$comment": "Root tsconfig so `tsx` run from repo root (npm start) applies jsx:react-jsx to the CLI .tsx. Per-package tsconfig.json still governs tsc typecheck/build; this only feeds tsx/esbuild the JSX runtime from the repo-root cwd.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "jsx": "react-jsx" },
+  "include": ["packages/**/*.ts", "packages/**/*.tsx"],
+  "exclude": ["node_modules", "**/dist", "**/node_modules"]
+}
