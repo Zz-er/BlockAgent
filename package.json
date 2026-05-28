@@ -4,6 +4,7 @@
   "description": "Single-agent runtime where all context is a Block tree, behavior lives outside blocks (builders), and commands are the only mutation entry point.",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "workspaces": [
     "packages/*"
   ],

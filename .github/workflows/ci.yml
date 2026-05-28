@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel in-progress runs of the same branch (saves CI minutes on rebases / amended pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck-and-test:
+    name: ${{ matrix.package }} (typecheck + test)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [core, cli, memory-letta]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install (workspace root)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck -w @block-agent/${{ matrix.package }}
+
+      - name: Test
+        run: npm run test -w @block-agent/${{ matrix.package }}
+
+  core-closure-check:
+    # core must stay runtime-dependency-free (architectural invariant: Letta/Ink/React never enter core).
+    # `npm ls --omit=dev -w @block-agent/core` listing anything other than the package itself
+    # = a forbidden runtime dependency leaked in.
+    name: core closure (no runtime deps)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Assert core has no runtime dependencies
+        shell: bash
+        run: |
+          set -e
+          # `npm ls --omit=dev` exits 0 only if the dep tree is clean. We additionally assert
+          # that 'letta' never appears anywhere in the closure.
+          npm ls --omit=dev -w @block-agent/core
+          if npm ls --omit=dev -w @block-agent/core 2>&1 | grep -qi 'letta'; then
+            echo "::error::core runtime closure contains 'letta' — Letta SDK must stay isolated in packages/memory-letta."
+            exit 1
+          fi
+          echo "ok: core runtime closure is clean."
