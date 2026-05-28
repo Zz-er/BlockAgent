@@ -14,6 +14,7 @@
  * relying on `lastFrame` (which Ink 5 does not expose on render()).
  */
 
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -157,13 +158,36 @@ describe('App lifecycle — showWelcome state', () => {
     return { stdout: stream, output: () => chunks.join('') };
   }
 
+  /**
+   * Fake stdin for Ink — App.tsx uses useInput which calls setRawMode on the
+   * input stream. On CI (Linux runner) process.stdin.isTTY=false and setRawMode
+   * throws "Raw mode is not supported …". We supply a stdin that claims to be
+   * a TTY and no-ops setRawMode so Ink can mount without crashing.
+   */
+  function makeMockStdin(): NodeJS.ReadStream {
+    const stdin = new EventEmitter() as unknown as NodeJS.ReadStream;
+    const rec = stdin as unknown as Record<string, unknown>;
+    rec['isTTY'] = true;
+    rec['setRawMode'] = () => stdin;
+    rec['resume'] = () => stdin;
+    rec['pause'] = () => stdin;
+    rec['setEncoding'] = () => stdin;
+    rec['ref'] = () => stdin;
+    rec['unref'] = () => stdin;
+    rec['read'] = () => null;
+    return stdin;
+  }
+
   it('renders WelcomeScreen on mount; unmounts after first plain-text submit', async () => {
     const agent = makeStubAgent(false); // showCube=false: simpler output, no cube noise
     const { stdout, output } = makeMockStdout();
+    const stdin = makeMockStdin();
 
-    // Render App with the stub agent; use mock stdout so Ink writes there not process.stdout.
+    // Render App with the stub agent; use mock stdout/stdin so Ink writes there and
+    // doesn't try to setRawMode on the actual process.stdin (which fails on non-TTY CI).
     const instance = render(createElement(App, { agent }), {
       stdout: stdout as unknown as NodeJS.WriteStream,
+      stdin: stdin,
     });
 
     // Let Ink flush its initial render.
