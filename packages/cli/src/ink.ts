@@ -10,5 +10,5 @@
  * here if/when needed; keep it the ONLY module that imports 'ink'.
  */
 
-export { render, Box, Text, useApp, useInput, useStdin } from 'ink';
+export { render, Box, Text, useApp, useInput, useStdin, useStdout } from 'ink';
 export type { Key } from 'ink';

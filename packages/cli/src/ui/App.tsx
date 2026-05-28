@@ -15,7 +15,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { Box, Text } from '../ink.js';
+import { Box } from '../ink.js';
 import type { LaunchedAgent, CtxView } from '../types.js';
 import type { ThinkingEvent } from '@block-agent/core/core/types.js';
 import { makeCliChannel } from '../cli_channel.js';
@@ -23,6 +23,7 @@ import { dispatch } from '../commands.js';
 import { MessageList, type UiMessage } from './MessageList.js';
 import { ThinkingStream } from './ThinkingStream.js';
 import { ContextView } from './ContextView.js';
+import { IntroBanner } from './IntroBanner.js';
 import { SlashHint } from './SlashHint.js';
 import { PromptInput } from './PromptInput.js';
 
@@ -89,10 +90,7 @@ export function App({ agent }: AppProps): JSX.Element {
 
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column" marginBottom={1}>
-        <Text bold color="cyan">block-agent</Text>
-        <Text dimColor>{`${agent.provider_id} · type a message, or /help for commands · Ctrl-C to quit`}</Text>
-      </Box>
+      <IntroBanner providerId={agent.provider_id} />
       <MessageList items={messages} />
       <ThinkingStream events={thinking} />
       <ContextView view={ctxView} />

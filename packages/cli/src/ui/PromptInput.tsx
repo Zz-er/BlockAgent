@@ -9,9 +9,13 @@
  *     and the parent clears `value`.
  *   - Ctrl-C exits the process (useApp().exit()); Ctrl-U clears the line.
  * The draft is lifted to App (value/onChange) so SlashHint can read it.
+ *
+ * v3.1: The input row is sandwiched between two dashed dividers (┄, dim gray)
+ * whose width tracks the terminal columns. Spec:
+ * docs/superpowers/specs/2026-05-29-cli-intro-banner-design.md
  */
 
-import { Box, Text, useApp, useInput } from '../ink.js';
+import { Box, Text, useApp, useInput, useStdout } from '../ink.js';
 
 export interface PromptInputProps {
   onSubmit: (text: string) => void;
@@ -20,6 +24,12 @@ export interface PromptInputProps {
   onChange: (value: string) => void;
   /** Disable input capture while a turn is in flight. */
   busy?: boolean;
+}
+
+function DashLine(): JSX.Element {
+  const { stdout } = useStdout();
+  const width = stdout?.columns ?? 60;
+  return <Text dimColor>{'┄'.repeat(width)}</Text>;
 }
 
 export function PromptInput({ onSubmit, value, onChange, busy }: PromptInputProps): JSX.Element {
@@ -55,10 +65,14 @@ export function PromptInput({ onSubmit, value, onChange, busy }: PromptInputProp
   );
 
   return (
-    <Box>
-      <Text color={busy ? 'gray' : 'cyan'}>{'› '}</Text>
-      <Text>{value}</Text>
-      {busy ? null : <Text inverse> </Text>}
+    <Box flexDirection="column">
+      <DashLine />
+      <Box>
+        <Text color={busy ? 'gray' : 'cyan'}>{'› '}</Text>
+        <Text>{value}</Text>
+        {busy ? null : <Text inverse> </Text>}
+      </Box>
+      <DashLine />
     </Box>
   );
 }

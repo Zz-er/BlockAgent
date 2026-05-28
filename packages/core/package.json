@@ -14,7 +14,7 @@
     "./runtime/*": "./src/runtime/*"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
