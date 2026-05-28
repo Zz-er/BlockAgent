@@ -4,6 +4,7 @@
   "description": "memory_letta BlockApp: semantic recall via external Letta server. Letta SDK dependency is isolated here; @block-agent/core never imports it (DR-M4).",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "$exports_note": "Mirrors @block-agent/core's wildcard subpath map: exports point at .ts SOURCE (no build step). The cli imports '@block-agent/memory-letta/memory_letta_app.js' which NodeNext resolves to ./src/memory_letta_app.ts via the workspace symlink. tsx runs the same source directly.",
   "exports": {
     "./*": "./src/*"
