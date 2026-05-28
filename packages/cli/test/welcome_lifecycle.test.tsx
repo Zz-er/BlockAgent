@@ -151,8 +151,11 @@ describe('App lifecycle — showWelcome state', () => {
         cb();
       },
     }) as unknown as NodeJS.WritableStream;
-    // Ink 5 checks isTTY / columns / rows on the stdout stream it receives.
-    (stream as unknown as Record<string, unknown>)['isTTY'] = false;
+    // Ink 5 with isTTY=false renders to stream only at exit/flush (log-update path is
+    // skipped); set isTTY=true so Ink uses the TTY log-update path and writes
+    // synchronously on each render — needed for non-TTY CI runners where the test
+    // captures output via this stream rather than process.stdout.
+    (stream as unknown as Record<string, unknown>)['isTTY'] = true;
     (stream as unknown as Record<string, unknown>)['columns'] = 120;
     (stream as unknown as Record<string, unknown>)['rows'] = 40;
     return { stdout: stream, output: () => chunks.join('') };
@@ -190,8 +193,9 @@ describe('App lifecycle — showWelcome state', () => {
       stdin: stdin,
     });
 
-    // Let Ink flush its initial render.
-    await new Promise((r) => setTimeout(r, 50));
+    // Let Ink flush its initial render. Linux CI runners can be slower than local;
+    // wait a few flush cycles to be sure useEffect + log-update has written.
+    await new Promise((r) => setTimeout(r, 250));
 
     const beforeSubmit = output();
     // The WelcomeScreen is mounted: welcome text should appear in the initial render.
