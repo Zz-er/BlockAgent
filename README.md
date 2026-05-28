@@ -1,5 +1,8 @@
 # block-agent
 
+[![CI](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 > 一个通用单-agent runtime：进入 LLM 的**全部上下文是一棵块树（BlockTree）**，每一片功能都是一个可装可卸的 **BlockApp**，而**命令（tool call）是唯一的状态写入口**。
 
 block-agent 把"agent 的上下文/能力"做成统一的、可插拔的结构：对话历史、工具、记忆、身份——全是 BlockApp，第三方扩展走**完全相同**的形态，没有"内核特权 app"。
@@ -77,4 +80,8 @@ npm start -- --dry-run
 
 ## 状态
 
-v3.0 核心闭环 + 内置 app + 交互式 CLI + BlockApp 生命周期 v1（含热卸载）+ memory_letta（真实 Letta + 百炼 DashScope e2e 跑通）。测试：core 181 / cli 60 / memory-letta 44 = **285** 全绿。
+v3.0 核心闭环 + 内置 app + 交互式 CLI + BlockApp 生命周期 v1（含热卸载）+ memory_letta（真实 Letta + 百炼 DashScope e2e 跑通）。测试：core 183 / cli 60 / memory-letta 44 = **287** 全绿。
+
+## License
+
+[MIT](./LICENSE) © 2026 zzer and BlockAgent contributors

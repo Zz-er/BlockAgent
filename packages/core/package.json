@@ -4,6 +4,7 @@
   "description": "block-agent core runtime: Block tree, Operations + PolicyEngine, Renderer, App framework, providers, AgentRuntime. Zero runtime dependencies.",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "$exports_note": "No '.' root export: src/index.ts is the demo boot (self-runs main()). Consumers import the classes/types they need via these area subpaths, e.g. '@block-agent/core/core/block.js'.",
   "exports": {
     "./core/*": "./src/core/*",

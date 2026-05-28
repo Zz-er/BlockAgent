@@ -4,6 +4,7 @@
   "description": "block-agent interactive CLI: an Ink (React terminal UI) ChannelAdapter (invoker=user) over @block-agent/core. Ink/React deps are isolated here so core stays zero-runtime-dependency.",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "bin": {
     "block-agent": "dist/main.js"
   },
