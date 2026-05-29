@@ -21,8 +21,8 @@ describe('WELCOME_LINES', () => {
     expect(WELCOME_LINES.length).toBe(26);
   });
 
-  it('row 13 (index 12) contains the capability equation', () => {
-    expect(WELCOME_LINES[12]!.text).toContain('capability = f(weights, context)');
+  it('row 14 (index 13) contains the capability equation', () => {
+    expect(WELCOME_LINES[13]!.text).toContain('capability = f(weights, context)');
   });
 
   it('every entry has a valid color token', () => {
@@ -32,27 +32,27 @@ describe('WELCOME_LINES', () => {
     }
   });
 
-  it('rows 4-9 (BLOCK ASCII) are cyan', () => {
-    for (let i = 3; i <= 8; i++) {
+  it('rows 5-10 (BLOCK ASCII) are cyan', () => {
+    for (let i = 4; i <= 9; i++) {
       expect(WELCOME_LINES[i]!.color).toBe('cyan');
     }
   });
 
-  it('row 2 (Welcome to) is gray', () => {
-    expect(WELCOME_LINES[1]!.color).toBe('gray');
+  it('row 3 (Welcome to) is gray', () => {
+    expect(WELCOME_LINES[2]!.color).toBe('gray');
   });
 
-  it('row 22 (tip line) is gray', () => {
-    expect(WELCOME_LINES[21]!.color).toBe('gray');
+  it('row 23 (tip line) is gray', () => {
+    expect(WELCOME_LINES[22]!.color).toBe('gray');
   });
 
-  it('row 15 uses U+2019 RIGHT SINGLE QUOTATION MARK', () => {
+  it('row 16 uses U+2019 RIGHT SINGLE QUOTATION MARK', () => {
     // "You can't change the weights." — the apostrophe must be U+2019
-    expect(WELCOME_LINES[14]!.text).toContain('’');
+    expect(WELCOME_LINES[15]!.text).toContain('’');
   });
 
-  it('row 18 uses U+2014 EM DASH', () => {
-    expect(WELCOME_LINES[17]!.text).toContain('—');
+  it('row 19 uses U+2014 EM DASH', () => {
+    expect(WELCOME_LINES[18]!.text).toContain('—');
   });
 });
 

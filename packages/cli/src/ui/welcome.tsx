@@ -21,22 +21,30 @@ export interface WelcomeScreenProps {
 export function WelcomeScreen({ showCube = true, stopped = false }: WelcomeScreenProps): JSX.Element {
   const renderCube = showCube && process.stdout.isTTY !== false;
 
+  // Outer Box: row layout, justifyContent="center" centers the cube+welcome pair
+  // horizontally within the terminal width (the Box stretches to the column-parent's
+  // width by default, then justifies its child to the centre).
+  // Inner Box: alignItems="center" vertically aligns Cube and the welcome column so
+  // their midlines match — the welcome content is rebalanced (2 blank top + 21 rows
+  // + 3 blank bottom, midline at row 13) to coincide with the cube's halfH.
   return (
-    <Box flexDirection="row">
-      {renderCube && (
-        <Cube stopped={stopped} />
-      )}
-      <Box flexDirection="column" marginLeft={renderCube ? 1 : 0}>
-        {WELCOME_LINES.map((line, i) => {
-          if (line.color === 'gray') {
-            return <Text key={i} dimColor>{line.text}</Text>;
-          }
-          if (line.color === 'cyan') {
-            return <Text key={i} color="cyan">{line.text}</Text>;
-          }
-          // white — default foreground, no color prop
-          return <Text key={i}>{line.text}</Text>;
-        })}
+    <Box flexDirection="row" justifyContent="center">
+      <Box flexDirection="row" alignItems="center">
+        {renderCube && (
+          <Cube stopped={stopped} />
+        )}
+        <Box flexDirection="column" marginLeft={renderCube ? 1 : 0}>
+          {WELCOME_LINES.map((line, i) => {
+            if (line.color === 'gray') {
+              return <Text key={i} dimColor>{line.text}</Text>;
+            }
+            if (line.color === 'cyan') {
+              return <Text key={i} color="cyan">{line.text}</Text>;
+            }
+            // white — default foreground, no color prop
+            return <Text key={i}>{line.text}</Text>;
+          })}
+        </Box>
       </Box>
     </Box>
   );
