@@ -16,7 +16,7 @@ export interface CubeRendererOpts {
   height: number;
   /** Terminal cell aspect compensation (cell height / cell width). Default 0.5. */
   aspect?: number;
-  /** ASCII shading gradient, darkest→brightest. Default '.,-~:;=!*#$@'. */
+  /** ASCII shading gradient, darkest→brightest. Default is the "dense-70" gradient (68 chars) for finer luminance resolution; pass classic-12 ".,-~:;=!*#$@" for a sparser look. */
   gradient?: string;
   /** Ambient light coefficient. Default 0.25. */
   ambient?: number;
@@ -70,7 +70,7 @@ export function createRenderer(opts: CubeRendererOpts): CubeRenderer {
   const W = opts.width;
   const H = opts.height;
   const aspect        = opts.aspect         ?? 0.5;
-  const gradient      = opts.gradient       ?? '.,-~:;=!*#$@';
+  const gradient      = opts.gradient       ?? " .'`,^:;Il!i><~+_-?][}{1)(\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
   const ambient       = opts.ambient        ?? 0.25;
   const diffuse       = opts.diffuse        ?? 0.75;
   const lightAzimuth  = opts.lightAzimuth   ?? 135;
