@@ -21,6 +21,7 @@ import type {
   ProviderConfig,
   ProviderKind,
   ThinkingFormat,
+  WelcomeConfig,
 } from './types.js';
 
 /**
@@ -37,6 +38,7 @@ export const DEFAULTS: LauncherConfig = {
     memory: { enabled: true },
     memory_letta: { enabled: false },
   },
+  welcome: { cube: true },
 };
 
 /** The config file consulted when `--config` is absent (design §3 / §11.4). */
@@ -281,6 +283,7 @@ export function loadConfig(
     // The file `loadConfig` actually consulted — so `/app *` write-backs target it
     // (not a re-guessed default). Always defined here (default file name when no flag).
     config_path: configPath,
+    welcome: resolveWelcome(flags, file),
   };
 }
 
@@ -382,6 +385,23 @@ function resolveMemory(
     ...(user_char_limit !== undefined ? { user_char_limit } : {}),
     ...(recall_limit !== undefined ? { recall_limit } : {}),
   };
+}
+
+/**
+ * resolveWelcome — the welcome screen config. `--no-cube` (boolean flag, spec §3.1)
+ * sets `cube = false`. Config file `{ "welcome": { "cube": false } }` is the file
+ * equivalent. Precedence: flags > file > defaults (`cube: true`).
+ */
+function resolveWelcome(
+  flags: ParsedFlags,
+  file: Record<string, unknown>,
+): WelcomeConfig {
+  const fileWelcome = pickObject(file['welcome']);
+  // `--no-cube` is the spec-locked flag name. A bare `--no-cube` → `true` in ParsedFlags.
+  const noCubeFlag = flags['no-cube'] === true || flags['no-cube'] === 'true';
+  const fileCube = asBool(fileWelcome['cube']);
+  const cube = noCubeFlag ? false : (fileCube ?? DEFAULTS.welcome!.cube);
+  return { cube };
 }
 
 // ============================================================================

@@ -78,6 +78,12 @@ export interface ToolsConfig {
   enabled_tools?: string[];
 }
 
+/** Welcome screen config knobs (cube animation toggle). */
+export interface WelcomeConfig {
+  /** When true (default), the rotating cube is rendered. `--no-cube` sets this to false. */
+  cube: boolean;
+}
+
 /**
  * Built-in `memory` app config knobs (non-file overrides; the app's own config.json
  * file seed is still honored). All optional — the app ships safe defaults (Hermes char
@@ -141,6 +147,11 @@ export interface LauncherConfig {
    * with (not a guessed default). Resolved by `loadConfig`.
    */
   config_path?: string;
+  /**
+   * Welcome screen config. Optional in LauncherConfig (defaults to `{ cube: true }` in
+   * DEFAULTS). Always defined on LaunchedAgent once launch resolves it.
+   */
+  welcome?: WelcomeConfig;
 }
 
 // ============================================================================
@@ -198,6 +209,11 @@ export interface LaunchedAgent {
    * Typed replacement for the `_allowPurge` / `_config.allow_purge` casts. Default false.
    */
   readonly allow_purge?: boolean;
+  /**
+   * Resolved welcome screen config (always present after launch). `cube` controls
+   * whether the rotating cube animation renders in WelcomeScreen. Default `{ cube: true }`.
+   */
+  readonly welcome: WelcomeConfig;
 }
 
 // ============================================================================

@@ -255,6 +255,9 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     ...(config.config_path !== undefined ? { config_path: config.config_path } : {}),
     ...(config.storage_dir !== undefined ? { storage_dir: config.storage_dir } : {}),
     ...(config.allow_purge !== undefined ? { allow_purge: config.allow_purge } : {}),
+    // welcome is always defined after loadConfig (DEFAULTS.welcome = { cube: true });
+    // fall back to the default if for any reason config.welcome is absent.
+    welcome: config.welcome ?? { cube: true },
   };
 }
 
