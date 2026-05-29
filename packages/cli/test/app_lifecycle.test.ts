@@ -80,6 +80,7 @@ function makeFakeAgent(opts: {
     messages: null,
     provider: {} as LaunchedAgent['provider'],
     provider_id: 'mock',
+    welcome: { cube: true },
     // typed LaunchedAgent fields launch.ts threads through (integration #5).
     ...(opts.configPath !== undefined ? { config_path: opts.configPath } : {}),
     ...(opts.allowPurge !== undefined ? { allow_purge: opts.allowPurge } : {}),

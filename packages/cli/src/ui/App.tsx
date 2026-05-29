@@ -25,6 +25,7 @@ import { ThinkingStream } from './ThinkingStream.js';
 import { ContextView } from './ContextView.js';
 import { SlashHint } from './SlashHint.js';
 import { PromptInput } from './PromptInput.js';
+import { WelcomeScreen } from './welcome.js';
 
 export interface AppProps {
   agent: LaunchedAgent;
@@ -36,6 +37,7 @@ export function App({ agent }: AppProps): JSX.Element {
   const [ctxView, setCtxView] = useState<CtxView | null>(null);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [showWelcome, setShowWelcome] = useState(true);
 
   // One channel per agent — holds the chokepoint submit + the onReply delivery seam.
   const channel = useMemo(() => makeCliChannel(agent), [agent]);
@@ -73,7 +75,8 @@ export function App({ agent }: AppProps): JSX.Element {
 
     // Plain text → chokepoint (messages.ingest, invoker=user). Local echo first,
     // clear the prior turn's thinking + any open view, then await the turn while
-    // onThinking/onReply keep re-rendering.
+    // onThinking/onReply keep re-rendering. First submit also unmounts WelcomeScreen.
+    setShowWelcome(false);
     setMessages((prev) => [...prev, { role: 'user', content: t }]);
     setThinking([]);
     setCtxView(null);
@@ -93,6 +96,7 @@ export function App({ agent }: AppProps): JSX.Element {
         <Text bold color="cyan">block-agent</Text>
         <Text dimColor>{`${agent.provider_id} · type a message, or /help for commands · Ctrl-C to quit`}</Text>
       </Box>
+      {showWelcome && <WelcomeScreen showCube={agent.welcome.cube} />}
       <MessageList items={messages} />
       <ThinkingStream events={thinking} />
       <ContextView view={ctxView} />
