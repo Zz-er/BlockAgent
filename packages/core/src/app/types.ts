@@ -32,6 +32,9 @@ import type {
   InvokerContext,
   WakeEvent,
 } from '../core/types.js';
+// Type-only import; erased at compile time, so the contracts.ts↔types.ts cycle is
+// purely structural (no runtime dependency edge, core's runtime closure unchanged).
+import type { ContractDef } from './contracts.js';
 
 // ============================================================================
 // §9 Capabilities (referenced by manifests; full ACL model lives in policy.ts)
@@ -192,6 +195,28 @@ export interface CommandManifest<TState = unknown> {
   description: string;
   /** Optional input schema for args validation. */
   args_schema?: JsonSchema;
+  /**
+   * The shape this command's `CommandResult.data` returns (R-1, C-API-1). A
+   * command used as a contract provider's `via` declares it here; the
+   * AssembleTime type check is then DECLARATION-vs-DECLARATION — the contract's
+   * `output_schema` is checked against THIS `result_schema` (not by running the
+   * command and inspecting its data, which would be a hallucinated guarantee).
+   * Optional + additive: commands that never back a contract leave it unset.
+   * Validated at runtime by R-3's checker as a backstop. See app/contracts.ts
+   * `validateAgainstSchema`.
+   */
+  result_schema?: JsonSchema;
+  /**
+   * Marks a command as a pure READ — it returns `CommandResult.data` and applies
+   * NO tree mutations (R-3, C-API-9 / CM-1). This is MECHANISM, not convention:
+   * a contract `provides.via` command MUST be `readonly` (the registry asserts
+   * it at assemble time), and consume-refresh pulls a provider via
+   * `Operations.invoke_query` (resolve → check → route → return only `data`,
+   * never applyOps). That keeps the render-time refresh from writing the tree, so
+   * byte-identical rendering (INVARIANT #1) holds by construction. Absent ⇒ the
+   * command may mutate (current behavior — no command is read-only unless it says so).
+   */
+  readonly?: boolean;
   /** Capabilities required to invoke; PolicyEngine checks these per invoker. */
   capabilities?: Capability[];
   /**
@@ -231,8 +256,45 @@ export type CommandManifestFactory<TState = unknown> = (
 export interface AppManifest<TState = unknown> {
   id: string;
   version: string;
-  /** Other App ids this App depends on (topologically sorted at bootstrap). */
+  /**
+   * Other App ids this App depends on (topologically sorted at bootstrap).
+   *
+   * @deprecated Do NOT use this to express a DATA dependency — that is what
+   * contracts (`consumes` / `provides`) are for (§3.3a / E1). `depends_on` names
+   * a concrete app-id, which is exactly the identity coupling contracts remove:
+   * if a consumer keeps `depends_on: ['messages']`, swapping MessageApp →
+   * wechatLikeApp leaves `consumes` intact but breaks `depends_on`, defeating the
+   * decoupling. Availability ("a provider must exist") is now the contract
+   * "satisfiability" check (§3.4); install ordering evaporates (consume happens at
+   * render time; a provider may install later and the next consume-refresh picks
+   * it up). Kept for backward-compat bootstrap topo-sort; the registry emits a
+   * deprecation warning when a non-empty `depends_on` is installed. New contract
+   * apps declare `depends_on: []`. May be removed / renamed to `install_after?`
+   * in a later phase (P3).
+   */
   depends_on: string[];
+
+  /**
+   * Contracts this App SATISFIES: each entry says "command `via` satisfies
+   * contract `contract`" (§3.3). The registry derives a `contract → [{app_id,
+   * via}]` resolution table from every installed manifest's `provides` (no
+   * hand-written route table) and, at assemble time, checks the contract's
+   * `output_schema` against the via command's `result_schema` (declaration vs
+   * declaration, R-1). All fields are `string` (NOT a literal/branded type) so a
+   * third-party `contract` name never has to be widened (C-API-4). Optional +
+   * additive: an App that provides nothing leaves it unset.
+   */
+  provides?: { contract: string; via: string }[];
+  /**
+   * Contracts this App CONSUMES: each entry says "I consume contract `contract`;
+   * fold the merged result into `state[as]`" (§3.3). The consumer NEVER names a
+   * provider app-id (no identity coupling) — the registry resolves providers from
+   * the table and `combine`s their outputs (sum / list / first). The registry's
+   * satisfiability check warns when a consumed contract has zero providers
+   * (replacing the `depends_on` missing-dep error — a warning, not a throw). All
+   * fields `string` (C-API-4). Optional + additive.
+   */
+  consumes?: { contract: string; as: string }[];
 
   /** Subtree root this App owns, e.g. `/memory` (block names use the bare id prefix). */
   tree_namespace: string;
@@ -444,4 +506,51 @@ export interface BuilderRegistry {
   tier_of(block_name: BlockName): CacheTier | null;
   /** All registered builders (e.g. for topo sort / cycle check at bootstrap). */
   list_builders(): BuilderManifest[];
+  /**
+   * Register a SYSTEM builder that belongs to no installed App (R-5 / B1). The
+   * runtime constructs a system builder (a closure over its own bookkeeping state)
+   * and registers it here AFTER construction (CM-5), so that `resolve_builder` /
+   * `tier_of` / `list_builders` and `seedProjectionBlocks` all see its outputs. The
+   * registry stays the single owner of `ownerByBlockName` (F3): core mutates builder
+   * ownership ONLY through this seam, never by touching the index directly. The
+   * builder's owner must be `system` (INV #4 — never `agent`); its output names must
+   * not already be owned by an installed App (INV #3).
+   */
+  registerSystemBuilder(builder: BuilderManifest): void;
+
+  // --------------------------------------------------------------------------
+  // Consume-refresh seam (R-4 / CM-2 / CM-9) — OPTIONAL on the interface.
+  // --------------------------------------------------------------------------
+  //
+  // The runtime holds the registry as `BuilderRegistry` and runs a render-time
+  // `consumeRefresh()` over these four accessors (AppRegistry implements all of
+  // them). They are OPTIONAL so test doubles that don't model the contract layer
+  // (e.g. TestBuilderRegistry in test/fixtures.ts) still satisfy the interface —
+  // adding them as REQUIRED would break every `implements BuilderRegistry` double
+  // and turn the baseline red. The runtime guards each call (and wraps the whole
+  // refresh in try/catch, R-4 layer 3), so an undefined member ⇒ refresh is a
+  // no-op for that registry, which is exactly right for a contract-less double.
+
+  /**
+   * Every INSTALLED App that declares `consumes`, as `{app_id, consumes}` pairs.
+   * `app_id` is the installed id (the key `get_app_context` expects). Apps with no
+   * `consumes` are omitted, so an empty result ⇒ consume-refresh is a no-op.
+   */
+  consumers?(): { app_id: string; consumes: { contract: string; as: string }[] }[];
+
+  /**
+   * The providers of a contract over the currently-installed Apps, as
+   * `[{app_id, via}]`. `app_id` is the installed id; the runtime calls each via
+   * `invoke_query(`${app_id}.${via}`, …)`. An unprovided contract yields `[]`.
+   */
+  providers_of?(contract: string): { app_id: string; via: string }[];
+
+  /** The `ContractDef` for a contract name (its `output_schema` / `combine`), or null. */
+  resolve_contract?(name: string): ContractDef | null;
+
+  /**
+   * The LIVE AppContext for an installed App (the `set_state` seam consume-refresh
+   * folds merged results through), or null if no such App is installed.
+   */
+  get_app_context?(app_id: string): AppContext | null;
 }

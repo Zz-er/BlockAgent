@@ -40,6 +40,8 @@ function mockLauncherConfig(dir: string, overrides: Partial<LauncherConfig> = {}
       tools: { enabled: true },
       memory: { enabled: true },
       memory_letta: { enabled: false },
+      task: { enabled: false },
+      stats: { enabled: false },
     },
     storage_dir: dir,
     welcome: DEFAULTS.welcome,

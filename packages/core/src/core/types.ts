@@ -283,14 +283,22 @@ export type AgentState =
   | { kind: 'paused_for_approval'; gateway_token: string };
 
 /**
- * WakeEvent — the only things that move the runtime out of idle (§8.1). Delivered
- * by the messages App (sync/async), tasks App, a scheduler, a completed off-tree
- * builder, or a returning sub-agent.
+ * WakeEvent — the only things that move the runtime out of idle (§8.1).
+ *
+ * A5 base-ification (resolutions R-? / §3.7): core does NOT enumerate per-App wake
+ * reasons. App-originated wakes (a message arriving, a task arriving, any App-defined
+ * trigger) all collapse into a single `app_event`. The App that raised it stamps
+ * `source` (its app_id), and OPAQUELY-to-core `reason`/`ref` — core never branches on
+ * or interprets `reason`/`ref`; only the App that wrote them (or a UI) reads them.
+ * This keeps core app-agnostic: adding a new App (or a new wake reason within one)
+ * needs no change here.
+ *
+ * The remaining variants are core/infrastructure wakes, not App domain events:
+ * `scheduled_tick` (scheduler), `builder_completed` (a completed off-tree builder —
+ * the runtime itself owns this transition, §8.1), and `sub_agent_returned`.
  */
 export type WakeEvent =
-  | { kind: 'sync_message_arrived'; msg_id: string }
-  | { kind: 'async_message_arrived'; msg_id: string }
-  | { kind: 'task_arrived'; task_id: string }
+  | { kind: 'app_event'; source: string; reason?: string; ref?: string }
   | { kind: 'scheduled_tick'; cron_id: string }
   | { kind: 'builder_completed'; builder_id: string; output_block_id: string }
   | { kind: 'sub_agent_returned'; sub_id: string };
@@ -436,6 +444,30 @@ export interface Operations {
 
   /** Freeze a snapshot for rendering (delegates to the underlying BlockTree). */
   snapshot(): BlockSnapshot;
+
+  /**
+   * invoke_query — a PURE read down the command path (R-3, C-API-9 / CM-1): same
+   * front half as `invoke_command` (PolicyEngine.check FIRST, then resolve+route)
+   * but it NEVER applies ops — it returns only the command's `CommandResult.data`
+   * and DROPS any `ops`. Consume-refresh (R-4) pulls a contract provider's readonly
+   * `via` command through this, so render-time refresh cannot write the tree
+   * (byte-identical, INV #1, by MECHANISM not convention — there is no applyOps on
+   * this path).
+   *
+   * OPTIONAL on this contract by design: the concrete `Operations` class always
+   * implements it, but this interface is the MINIMAL cross-module surface and a
+   * test double (`TestOperations` in test/fixtures.ts) need not model the contract
+   * layer. Making it REQUIRED would break every `implements Operations` double and
+   * turn the baseline red (the established additive rule for this contract — the
+   * low-level `find`/`read`/… primitives are deliberately off it for the same
+   * reason). The consume-refresh caller guards the call and wraps the whole refresh
+   * in try/catch, so an Operations without it ⇒ refresh is a no-op.
+   */
+  invoke_query?(
+    full_name: string,
+    args: unknown,
+    invoker_ctx: InvokerContext,
+  ): Promise<CommandResult>;
 }
 
 /**

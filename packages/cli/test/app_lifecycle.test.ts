@@ -100,14 +100,16 @@ function capture(): { setView: (v: CtxView) => void; last: () => CtxView | null 
 // ============================================================================
 
 describe('BUILTIN_APP_CATALOG', () => {
-  it('contains exactly 5+1 entries (agent_identity / messages / tools / memory / memory_letta)', () => {
+  it('contains exactly 7 entries (the 5 originals + the contract-model task / stats)', () => {
     const ids = BUILTIN_APP_CATALOG.map((e) => e.id);
-    expect(ids).toHaveLength(5);
+    expect(ids).toHaveLength(7);
     expect(ids).toContain('agent_identity');
     expect(ids).toContain('messages');
     expect(ids).toContain('tools');
     expect(ids).toContain('memory');
     expect(ids).toContain('memory_letta');
+    expect(ids).toContain('task');
+    expect(ids).toContain('stats');
   });
 
   it('default_enabled values mirror DEFAULTS.apps', () => {

@@ -43,6 +43,7 @@ import type {
   SystemAgentHandle,
   TokenBudget,
 } from './types.js';
+import type { ContractDef } from './contracts.js';
 
 // ============================================================================
 // Capability ceiling (INV #19 — O(1) set-membership, injected seam)
@@ -192,9 +193,13 @@ function assertMatchesSchema(
  * reserved full-names `core.find` / `core.read` / `core.create` / `core.update`
  * / `core.delete` / `core.move` (impl-core). Commands use a DOT and block names
  * a COLON, so `core.*` (commands) and `core:*` (any blocks) live in the same
- * reserved id. install() auto-renames any App that asks for a reserved id.
+ * reserved id. `runtime` is reserved for the runtime's own system blocks (e.g.
+ * `runtime:commands_only_feedback`, §3.1) which the runtime writes straight into
+ * the tree via `Operations.apply`; a third-party App with id `runtime` would
+ * shadow that system namespace. install() auto-renames any App that asks for a
+ * reserved id.
  */
-const RESERVED_APP_IDS: ReadonlySet<string> = new Set(['core']);
+const RESERVED_APP_IDS: ReadonlySet<string> = new Set(['core', 'runtime']);
 
 // ============================================================================
 // §3.1 — name helpers (namespace split for O(1) owner resolution)
@@ -260,8 +265,30 @@ export class AppRegistry
    */
   private readonly ownerByBlockName = new Map<BlockName, BuilderManifest>();
 
+  /**
+   * System builders that belong to NO installed App (R-5 / B1): the runtime's own
+   * bookkeeping builder is registered here via `registerSystemBuilder`. Their outputs
+   * also live in `ownerByBlockName` (so `resolve_builder` / `tier_of` /
+   * `seedProjectionBlocks` see them); this array exists so `list_builders` can include
+   * them too (it otherwise enumerates only installed Apps). Insertion order is
+   * preserved and appended deterministically after the App builders.
+   */
+  private readonly systemBuilders: BuilderManifest[] = [];
+
   /** Per-App config injected into BuildContext.config in place of process.env. */
   private readonly configs = new Map<string, Readonly<Record<string, string>>>();
+
+  /**
+   * Contract registry: contract NAME → its `ContractDef` (§3.2). The boot registers
+   * the built-in contracts (app/contracts.ts MESSAGE_COUNT / TASK_COUNT) plus any
+   * App-declared ones here, so the assemble-time check (R-1) can resolve a
+   * `provides.contract` string to the contract's `output_schema` and compare it
+   * against the via command's `result_schema`. Keeping this on the registry (not a
+   * boot-side param) keeps the registry the single owner of contract derivation
+   * (F3). Empty by default → an App that declares no `provides`/`consumes` runs
+   * exactly as before (no new warnings), so existing installs are unaffected.
+   */
+  private readonly contracts = new Map<string, ContractDef>();
 
   /**
    * Capability ceiling resolver: given a trust level, return the set of capability
@@ -341,6 +368,12 @@ export class AppRegistry
       }
     }
 
+    // Contract PROVIDES checks (R-1 / R-3 / DR-F — all per-manifest, additive). An
+    // App that declares no `provides` adds no warnings here, so contract-less
+    // installs are byte-for-byte unchanged. We run this AFTER instance.commands is
+    // built so a `provides.via` resolves to its CommandManifest.
+    this.checkProvides(installed_id, manifest, instance, warnings);
+
     this.apps.set(installed_id, instance);
     this.indexBuilders(instance);
 
@@ -403,10 +436,213 @@ export class AppRegistry
    * InstallResult for each in install (topological) order. Throws
    * AppDependencyCycleError on a cycle or AppManifestError on a missing
    * dependency.
+   *
+   * Contract satisfiability (A3 / §3.3): after the batch derives its
+   * `contract → providers` table, every `consumes` whose contract has ZERO
+   * providers gets a WARNING appended to that consumer's InstallResult — the
+   * additive replacement for the `depends_on` missing-dep ERROR (a missing
+   * contract degrades a consumer, it does not abort the boot). A batch with no
+   * `consumes` declarations is unaffected (no new warnings).
    */
   bootstrap(manifests: AppManifest[]): InstallResult[] {
     const ordered = topoSort(manifests);
-    return ordered.map((m) => this.install(m));
+    const table = this.deriveContractTable(ordered);
+    const results = ordered.map((m) => this.install(m));
+    ordered.forEach((m, i) => {
+      for (const { contract, as } of m.consumes ?? []) {
+        if ((table.get(contract)?.length ?? 0) === 0) {
+          results[i]!.warnings.push(
+            `App '${results[i]!.installed_id}' consumes contract '${contract}' (as '${as}') ` +
+              `but no installed App provides it; '${as}' will be unset until a provider is added`,
+          );
+        }
+      }
+    });
+    return results;
+  }
+
+  // --------------------------------------------------------------------------
+  // Contract model — registration + derived provider table + assemble checks
+  // --------------------------------------------------------------------------
+
+  /**
+   * Register a `ContractDef` so the assemble-time check can resolve a
+   * `provides.contract` / `consumes.contract` NAME to its `output_schema`. The
+   * boot calls this for the built-in contracts (app/contracts.ts MESSAGE_COUNT /
+   * TASK_COUNT) before bootstrap; an App may register its own. Last write wins for
+   * a duplicate name (a redefinition is a manifest decision, not a registry error).
+   */
+  registerContract(def: ContractDef): void {
+    this.contracts.set(def.name, def);
+  }
+
+  /** The `ContractDef` for a contract name, or null if none is registered. */
+  resolve_contract(name: string): ContractDef | null {
+    return this.contracts.get(name) ?? null;
+  }
+
+  /**
+   * deriveContractTable — scan every manifest's `provides` and build the
+   * `contract → [{app_id, via}]` resolution table (A3, §3.3). Multiple providers
+   * of the same contract FAN IN (the consumer's `combine` later merges them). No
+   * hand-written route table: the table is purely derived from declarations.
+   * Deterministic: contracts are visited in manifest order and providers preserve
+   * that order, so a given manifest set always yields the same table. `app_id` is
+   * the manifest's declared id (collision-renames happen at install; the table is
+   * a pre-install derivation over the batch, A3).
+   */
+  deriveContractTable(
+    manifests: AppManifest[],
+  ): Map<string, { app_id: string; via: string }[]> {
+    const table = new Map<string, { app_id: string; via: string }[]>();
+    for (const m of manifests) {
+      for (const { contract, via } of m.provides ?? []) {
+        const list = table.get(contract) ?? [];
+        list.push({ app_id: m.id, via });
+        table.set(contract, list);
+      }
+    }
+    return table;
+  }
+
+  /**
+   * consumers — enumerate every INSTALLED App that declares `consumes`, as
+   * `{app_id, consumes}` pairs (R-4 consume-refresh seam). The runtime's
+   * render-time `consumeRefresh()` walks this list: for each consumer it resolves
+   * each `{contract, as}` (`resolve_contract` → ContractDef.output_schema/combine),
+   * finds the providers (`deriveContractTable` over `list()`), pulls each via
+   * `Operations.invoke_query`, validates + combines, and folds the merged value
+   * into `state[as]` via `get_app_context(app_id).set_state` (CM-9).
+   *
+   * `app_id` is the INSTALLED id (post collision-rename), so it is the key
+   * `get_app_context` expects — NOT the raw manifest id. Apps with no `consumes`
+   * are omitted (an empty result ⇒ consume-refresh is a no-op, so a contract-less
+   * boot is unaffected). Deterministic order (by installed id, like `list()`), and
+   * each `consumes` array is a fresh copy so a caller can never mutate the live
+   * manifest. The registry stays the single owner of contract derivation (F3).
+   */
+  consumers(): { app_id: string; consumes: { contract: string; as: string }[] }[] {
+    const out: { app_id: string; consumes: { contract: string; as: string }[] }[] = [];
+    for (const id of [...this.apps.keys()].sort()) {
+      const consumes = this.apps.get(id)!.manifest.consumes;
+      if (consumes && consumes.length > 0) {
+        out.push({ app_id: id, consumes: consumes.map((c) => ({ ...c })) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * providers_of — resolve a contract NAME to its `[{app_id, via}]` provider list
+   * over the CURRENTLY-INSTALLED Apps (R-4 consume-refresh seam). This is the
+   * cohesive twin of `consumers()`: it derives the table from the live install set
+   * (`list()`) via `deriveContractTable` and returns the one contract's entry, so a
+   * caller never has to assemble the manifest list or hold the whole table. The
+   * registry stays the single owner of contract derivation (F3).
+   *
+   * `app_id` is the INSTALLED id (we read each install record's `id`, NOT the raw
+   * `manifest.id` — those differ after a collision rename, and only the installed
+   * id is routable). It is exactly the key `resolve_command` / `route` /
+   * `invoke_query` (`${app_id}.${via}`) expect; deriving via `list()` +
+   * `deriveContractTable` would instead emit the pre-rename `manifest.id` and break
+   * a renamed provider. `via` is the provider's bare command name. Deterministic
+   * order (by installed id, like `consumers()`). An unprovided contract yields `[]`
+   * (consume-refresh then `combine`s an empty fan-in: `sum`→0, `list`→[], `first`→
+   * downgrade — the caller decides).
+   */
+  providers_of(contract: string): { app_id: string; via: string }[] {
+    const out: { app_id: string; via: string }[] = [];
+    for (const id of [...this.apps.keys()].sort()) {
+      for (const { contract: c, via } of this.apps.get(id)!.manifest.provides ?? []) {
+        if (c === contract) out.push({ app_id: id, via });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Per-manifest `provides` validation (R-1 / R-3 / DR-F). All findings are
+   * WARNINGS appended to the install's InstallResult (report-only — a contract
+   * declaration problem degrades the binding, it does not abort the install). Three
+   * checks per `provides` entry:
+   *   - R-3 (readonly mechanism): the `via` command MUST be `readonly === true`
+   *     (consume-refresh pulls it via Operations.invoke_query, which never writes;
+   *     a non-readonly via is a manifest bug — its body might mutate).
+   *   - R-1 (declaration-vs-declaration type check): the contract's `output_schema`
+   *     must be shape-compatible with the via command's `result_schema`. Minimal
+   *     form per the briefing: their `type` fields must be equal. (We compare the
+   *     two SCHEMAS, not a value vs a schema — validateAgainstSchema is value-vs-
+   *     schema and is used at RUNTIME by consume-refresh, not here.)
+   *   - DR-F (tool_catalog footgun): if the via command is agent-visible
+   *     (allowed_invokers absent or includes 'agent'), warn — a contract provider
+   *     surfacing in the agent's tool catalog is a footgun (the agent could call a
+   *     bookkeeping query directly). We only warn; the real exclusion is the
+   *     command's own allowed_invokers, which the runtime honors.
+   */
+  private checkProvides(
+    installed_id: string,
+    manifest: AppManifest,
+    instance: AppInstance,
+    warnings: string[],
+  ): void {
+    for (const { contract, via } of manifest.provides ?? []) {
+      const { command } = splitCommandName(via);
+      // `via` is a bare `<command>` within this App; resolve it in this instance.
+      const cmd = instance.commands.get(via) ?? instance.commands.get(command);
+      if (!cmd) {
+        warnings.push(
+          `App '${installed_id}' provides contract '${contract}' via unknown command '${via}'`,
+        );
+        continue;
+      }
+
+      // R-3 — the via command must be a pure read (readonly mechanism).
+      if (cmd.readonly !== true) {
+        warnings.push(
+          `App '${installed_id}' provides contract '${contract}' via non-readonly command '${via}' ` +
+            `(a contract via command must be readonly so consume-refresh cannot write the tree, R-3)`,
+        );
+      }
+
+      // R-1 — declaration-vs-declaration type check (output_schema ⊨ result_schema).
+      // Needs the contract's ContractDef (registered via registerContract). An
+      // UNREGISTERED contract name is a "references an unknown contract" warning —
+      // report-only, same severity as missing-provider; the type check is then
+      // skipped (no def to compare against), but the reference is still flagged.
+      const def = this.contracts.get(contract);
+      if (!def) {
+        warnings.push(
+          `App '${installed_id}' provides unknown contract '${contract}' via '${via}' ` +
+            `(no ContractDef registered; the output⊨result type check is skipped, R-1)`,
+        );
+      } else {
+        const outType = schemaType(def.output_schema);
+        const resType = schemaType(cmd.result_schema);
+        if (cmd.result_schema === undefined) {
+          warnings.push(
+            `App '${installed_id}' provides contract '${contract}' via '${via}' but that command ` +
+              `declares no result_schema (cannot verify it returns the contract's ${describeType(outType)}, R-1)`,
+          );
+        } else if (outType !== resType) {
+          warnings.push(
+            `App '${installed_id}' provides contract '${contract}' via '${via}': the contract's ` +
+              `output_schema type ${describeType(outType)} != the command's result_schema type ` +
+              `${describeType(resType)} (declaration-vs-declaration mismatch, R-1)`,
+          );
+        }
+      }
+
+      // DR-F — tool_catalog footgun: an agent-visible via command.
+      const invokers = cmd.allowed_invokers;
+      const agentVisible = invokers === undefined || invokers.includes('agent');
+      if (agentVisible) {
+        warnings.push(
+          `App '${installed_id}' provides contract '${contract}' via agent-visible command '${via}' ` +
+            `(allowed_invokers ${invokers ? `includes 'agent'` : 'is unset'}); it will appear in the ` +
+            `agent tool catalog (DR-F footgun) — restrict allowed_invokers if the agent should not call it`,
+        );
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -582,13 +818,50 @@ export class AppRegistry
     return this.ownerByBlockName.get(block_name)?.cache_tier ?? null;
   }
 
-  /** All registered builders, deterministically ordered by app_id then name. */
+  /**
+   * All registered builders: installed-App builders (deterministically ordered by
+   * app_id then declared order) followed by system builders (R-5 / B1) in
+   * registration order. System builders own no App so they cannot be enumerated via
+   * `this.apps`; they are appended last so existing App-only ordering is unchanged.
+   */
   list_builders(): BuilderManifest[] {
     const all: BuilderManifest[] = [];
     for (const id of [...this.apps.keys()].sort()) {
       all.push(...this.apps.get(id)!.builders);
     }
+    all.push(...this.systemBuilders);
     return all;
+  }
+
+  /**
+   * registerSystemBuilder (R-5 / B1) — register a builder that belongs to NO installed
+   * App. The runtime's bookkeeping builder (a closure over its `pending_feedback` /
+   * `recent_errors` state) is registered here AFTER the runtime is constructed (CM-5),
+   * so that `resolve_builder` / `tier_of` / `list_builders` hit it and
+   * `seedProjectionBlocks` (which reads `ownerByBlockName`) seeds its output names.
+   *
+   * The registry stays the SINGLE owner of `ownerByBlockName` (F3): system builders go
+   * through the same INV #4 (owner≠'agent') guard as App builders and the same INV #3
+   * (single owner per block name) check. A name already owned by an installed App or a
+   * previously registered system builder is a wiring bug → throw. Idempotent only for
+   * the exact same builder instance re-registering its own names (no-op), so a boot
+   * that runs twice in one process does not falsely trip INV #3.
+   */
+  registerSystemBuilder(builder: BuilderManifest): void {
+    // INV #4 (runtime arm): owner must be system/plugin/tool, never 'agent'. Reuse
+    // the same guard App builders pass; 'system:runtime' labels the synthetic owner.
+    this.assertLegalBuilder('system:runtime', builder);
+    // INV #3: claim each output name; reject a clash with a different owner.
+    for (const out of builder.outputs) {
+      const existing = this.ownerByBlockName.get(out);
+      if (existing && existing !== builder)
+        throw new AppManifestError(
+          `block name '${out}' already owned by builder '${existing.name}' (INV #3)`,
+          'system:runtime',
+        );
+      this.ownerByBlockName.set(out, builder);
+    }
+    if (!this.systemBuilders.includes(builder)) this.systemBuilders.push(builder);
   }
 
   // --------------------------------------------------------------------------
@@ -810,6 +1083,26 @@ export class AppRegistry
    * `on_wake` at boot; backs `AppContext.wake`. Until set, `ctx.wake` is inert.
    */
   wakeHook?: (event: WakeEvent) => void;
+}
+
+// ============================================================================
+// Contract schema-shape helpers (R-1 declaration-vs-declaration comparison)
+// ============================================================================
+
+/**
+ * The `type` keyword of a JsonSchema, or undefined when absent / not a string.
+ * Used by the assemble-time check to compare a contract's `output_schema` with a
+ * via command's `result_schema` at the minimal "same scalar/kind" granularity the
+ * briefing allows (full schema-vs-schema subsumption is out of scope here).
+ */
+function schemaType(schema: JsonSchema | undefined): string | undefined {
+  const t = schema?.['type'];
+  return typeof t === 'string' ? t : undefined;
+}
+
+/** A readable label for a schema type in a warning (handles the typeless case). */
+function describeType(t: string | undefined): string {
+  return t === undefined ? '(none)' : `'${t}'`;
 }
 
 // ============================================================================

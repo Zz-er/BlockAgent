@@ -22,8 +22,8 @@
 
 import type {
   AgentState,
+  Block,
   BlockName,
-  BlockOp,
   InvokerContext,
   Operations,
   Renderer,
@@ -38,7 +38,13 @@ import type {
   SendOpts,
   ToolCall,
 } from '../provider/types.js';
-import type { CommandResult } from '../app/types.js';
+import type {
+  BuilderManifest,
+  BuilderRegistry,
+  BuildContext,
+  CommandResult,
+} from '../app/types.js';
+import { combineResults, validateAgainstSchema } from '../app/contracts.js';
 
 /**
  * ThinkingListener — a UI subscriber on the runtime's thinking channel (§4.3).
@@ -68,6 +74,15 @@ export interface AgentRuntimeOptions {
   operations: Operations;
   renderer: Renderer;
   provider: ModelProvider;
+  /**
+   * The App/Builder registry handle (R-5 / F1). The runtime uses it to register its
+   * own bookkeeping `system` builder (`registry.registerSystemBuilder`, B1) after
+   * construction, and is the seam through which it will reach `get_app_context` for
+   * the consume-refresh pass (P3). Held as the `BuilderRegistry` interface so the
+   * runtime stays decoupled from the concrete `AppRegistry` (core never imports the
+   * registry class — only its interfaces).
+   */
+  registry: BuilderRegistry;
   /** sub-agent recursion depth; 0 = main agent (§8.1). */
   spawn_depth?: number;
   /** Hard cap on turns within one wake, to bound a runaway tool-call loop. */
@@ -84,9 +99,15 @@ export interface AgentRuntimeOptions {
    */
   tool_catalog?: () => ToolCatalog;
   /**
-   * Parent block under which the runtime attaches its own bookkeeping blocks
-   * (commands-only feedback, command-error blocks) when they don't yet exist.
-   * Defaults to the empty-tree root `root:root`.
+   * The actual tree ROOT the boot built (CM-4). B1 no longer writes its bookkeeping
+   * blocks into the tree itself — the boot seeds their empty placeholders via
+   * `registry.seedProjectionBlocks(has, apply, parent)` and the system builders then
+   * project runtime state onto them each render. Those seeded placeholders MUST attach
+   * under the live tree root, or they are orphaned and never render (the bookkeeping
+   * silently disappears). `registry.seedProjectionBlocks` defaults its `parent` to
+   * `core:root`, which is NOT the empty-tree root (`root:root`); so the boot must pass
+   * THIS value (exposed via the `root` getter) as the seed parent. Defaults to the
+   * empty-tree root `root:root` (matches core/block.ts boot + fixtures + index.ts).
    */
   root_name?: BlockName;
 }
@@ -94,8 +115,18 @@ export interface AgentRuntimeOptions {
 /** The block name the runtime writes commands-only rejection feedback to (§4.2). */
 export const COMMANDS_ONLY_FEEDBACK_BLOCK: BlockName = 'runtime:commands_only_feedback';
 
+/** The block name the runtime projects recent command failures into (§8.1). */
+export const COMMAND_ERROR_BLOCK: BlockName = 'runtime:command_error';
+
 /** Default root block name (matches the empty-tree boot in core/block.ts). */
 const DEFAULT_ROOT_NAME: BlockName = 'root:root';
+
+/**
+ * Upper bound on the command-error ring the runtime keeps (CM-6, INV #16). Older
+ * failures fall off the front so `recent_errors` never grows unbounded; the
+ * `runtime:command_error` projection renders them oldest→newest deterministically.
+ */
+const MAX_RECENT_COMMAND_ERRORS = 8;
 
 /**
  * The exact feedback text written when an agent emits disallowed plain text (§4.2).
@@ -125,6 +156,8 @@ export class AgentRuntime {
   private readonly ops: Operations;
   private readonly renderer: Renderer;
   private readonly provider: ModelProvider;
+  /** Registry handle (R-5): registerSystemBuilder for B1 + future get_app_context. */
+  private readonly registry: BuilderRegistry;
   private readonly max_turns_per_wake: number;
   private readonly root_name: BlockName;
   private readonly tool_catalog: (() => ToolCatalog) | undefined;
@@ -135,17 +168,55 @@ export class AgentRuntime {
   /** UI/caller subscribers on the error channel (failed turns). */
   private readonly error_listeners = new Set<ErrorListener>();
 
-  /** Set when a turn produced commands-only-violating plain text (§4.2). */
+  /**
+   * Set when a turn produced commands-only-violating plain text (§4.2). The
+   * commands-only feedback system builder PROJECTS this into the tree (B1): when
+   * non-null the block renders the feedback text, when null it renders nothing.
+   * No longer written to the tree directly (the old `upsertBookkeepingBlock` path) —
+   * this state IS the source of truth and the builder is its only reader.
+   */
   private pending_feedback: string | null = null;
+
+  /**
+   * Recent non-policy command failures, oldest→newest, bounded to
+   * `MAX_RECENT_COMMAND_ERRORS` (CM-6). The command-error system builder (B1)
+   * projects these into a SINGLE `runtime:command_error` block; like
+   * `pending_feedback` they are state, never written to the tree directly. `id` is
+   * the failing tool_call id (kept for de-dup/debuggability); `text` is the rendered
+   * line. Replaces the old per-id `runtime:command_error.<id>` tree blocks.
+   */
+  private readonly recent_errors: { id: string; text: string }[] = [];
 
   constructor(opts: AgentRuntimeOptions) {
     this.ops = opts.operations;
     this.renderer = opts.renderer;
     this.provider = opts.provider;
+    this.registry = opts.registry;
     this.spawn_depth = opts.spawn_depth ?? 0;
     this.max_turns_per_wake = opts.max_turns_per_wake ?? DEFAULT_MAX_TURNS_PER_WAKE;
     this.root_name = opts.root_name ?? DEFAULT_ROOT_NAME;
     this.tool_catalog = opts.tool_catalog;
+
+    // B1 (CM-5): register the runtime's two bookkeeping system builders AFTER all
+    // state fields exist (the builders close over `this.pending_feedback` /
+    // `this.recent_errors`). They belong to no installed App, so they go through the
+    // registry's `registerSystemBuilder` seam (F3: the registry stays the single
+    // owner of builder ownership). Once registered, `seedProjectionBlocks` will seed
+    // their output names and the Renderer projects live runtime state each turn —
+    // no runtime block is ever written to the tree directly.
+    this.registry.registerSystemBuilder(this.makeFeedbackBuilder());
+    this.registry.registerSystemBuilder(this.makeCommandErrorBuilder());
+  }
+
+  /**
+   * The live tree root the runtime's bookkeeping placeholders must be seeded under
+   * (CM-4). The boot reads this to pass as `seedProjectionBlocks`' `parent`, instead
+   * of relying on that method's `core:root` default which does not match the
+   * empty-tree root. Exposing it keeps the authoritative root in ONE place (the
+   * runtime), so the seed parent can never silently drift from the real root.
+   */
+  get root(): BlockName {
+    return this.root_name;
   }
 
   /**
@@ -239,6 +310,16 @@ export class AgentRuntime {
    * no feedback (it is done).
    */
   private async runTurn(): Promise<boolean> {
+    // 0) Consume-refresh (§3.5 / R-4): BEFORE the snapshot, pull each consumer App's
+    //    declared contracts from their providers and fold the merged result into the
+    //    consumer's state[as]. It runs OUTSIDE the builder sandbox and BEFORE the
+    //    snapshot, so builders stay pure and rendering stays byte-identical (INV #1):
+    //    the only state it touches is App state via set_state, and it never writes the
+    //    tree (it pulls via Operations.invoke_query, which drops ops). The method holds
+    //    the three-layer guardrail (R-4/CM-2) and never throws, so it cannot crash the
+    //    turn even if a provider/validate/set_state misbehaves.
+    await this.consumeRefresh();
+
     // 1) Render the current snapshot into a prompt (§10). Byte-identical for a
     //    given (snapshot, tiers) — the runtime relies on Operations.snapshot()
     //    being a frozen COW capture (INV #1).
@@ -292,6 +373,153 @@ export class AgentRuntime {
     }
 
     return progressed;
+  }
+
+  /**
+   * consumeRefresh — the render-time consume-refresh lifecycle point (§3.5, R-4).
+   *
+   * BEFORE each turn's snapshot, for every installed consumer App C (those that
+   * declare `consumes`), pull each declared contract from its providers and fold the
+   * merged result into C's `state[as]`. Mechanically:
+   *   for each C in registry.consumers():
+   *     for each {contract, as} in C.consumes:
+   *       def       = registry.resolve_contract(contract)        // output_schema/combine
+   *       providers = registry.providers_of(contract)            // [{app_id, via}]
+   *       datas     = providers.map(p => ops.invoke_query(`${p.app_id}.${p.via}`, {},
+   *                                       {invoker:'app', identity:C.app_id}).data)  // CM-9
+   *                   each `data` validated against def.output_schema (R-2)
+   *       collect[as] = combineResults(datas, def.combine)        // sum / list / first
+   *     registry.get_app_context(C).set_state(s => ({...s, ...collect}))
+   *
+   * THREE-LAYER GUARDRAIL (R-4 / CM-2 — the red-team BLOCKER's resolution). The pull
+   * crosses an App boundary, validates untrusted data, and writes App state whose
+   * `set_state` UNLOADS the App on a schema breach; none of that may corrupt a
+   * consumer's state or crash the turn:
+   *   1. PER-ENTRY try/catch — each `{contract, as}` is computed in isolation
+   *      (invoke_query / validate / combineResults each may fail or throw); the first
+   *      failure marks the WHOLE consumer degraded and stops computing its entries.
+   *   2. PER-CONSUMER ATOMIC (all-or-nothing) — `collect` is assembled fully BEFORE any
+   *      write; if any entry failed, the consumer is left at its PREVIOUS state (no
+   *      set_state at all), never half-new/half-old (CM-2 — no mixed snapshot).
+   *   3. ONE set_state per consumer, itself guarded — a merged value that breaches the
+   *      `as` field's state_schema throws AppStateViolation (which would unload the
+   *      App); we catch it so a bad merge degrades that consumer instead of unloading it.
+   *   4. THE WHOLE METHOD is wrapped in try/catch — nothing bubbles out of
+   *      consumeRefresh, so a refresh fault can never crash the turn (it runs before
+   *      the snapshot; an uncaught throw here would abort `runTurn`).
+   *
+   * Seam-optional (additive): the registry's consume-refresh accessors and
+   * Operations.invoke_query are OPTIONAL on their interfaces, so a contract-less wiring
+   * (e.g. a test double, or a boot with no consumers) makes this a clean no-op. It
+   * touches NO tree (invoke_query drops ops) and NO builder, so INV #1 / the builder
+   * sandbox are intact.
+   */
+  private async consumeRefresh(): Promise<void> {
+    try {
+      const consumers = this.registry.consumers?.();
+      if (!consumers || consumers.length === 0) return; // no consumers ⇒ no-op
+
+      for (const consumer of consumers) {
+        // One bad consumer must never affect the others (defense in depth; the
+        // per-consumer body below is already guarded, this is the outer net). The
+        // `await` is REQUIRED: refreshOneConsumer awaits each provider pull, so without
+        // it consume-refresh would return before set_state ran and the snapshot would
+        // render STALE state (the refresh completing after the render) — defeating the
+        // "before snapshot" guarantee. Awaiting also lets this try/catch catch its
+        // rejection (a non-awaited async throw would escape it).
+        try {
+          await this.refreshOneConsumer(consumer);
+        } catch {
+          /* isolate a single consumer's failure */
+        }
+      }
+    } catch {
+      // Layer 4: NOTHING bubbles out of consume-refresh. It runs before the snapshot,
+      // so an uncaught throw here would abort the whole turn — which is exactly the
+      // crash R-4 forbids. Swallow it; the turn proceeds with last-good consumer state.
+    }
+  }
+
+  /**
+   * refreshOneConsumer — compute + commit the consume-refresh for ONE consumer App,
+   * with the per-entry (layer 1) and per-consumer-atomic (layer 2) + guarded-set_state
+   * (layer 3) guardrails. Split out of `consumeRefresh` so the control flow of "abandon
+   * this consumer on the first failed entry" is a single early-`return` rather than
+   * nested flags. Synchronous wrt. its own structure but `await`s each provider pull.
+   */
+  private async refreshOneConsumer(consumer: {
+    app_id: string;
+    consumes: { contract: string; as: string }[];
+  }): Promise<void> {
+    const ctx = this.registry.get_app_context?.(consumer.app_id);
+    if (!ctx) return; // App gone / no context seam ⇒ skip (no-op for this consumer)
+
+    // Assemble the full set of merged values BEFORE writing anything (layer 2).
+    const collect: Record<string, unknown> = {};
+    for (const { contract, as } of consumer.consumes) {
+      let merged: unknown;
+      try {
+        merged = await this.pullContract(contract, consumer.app_id);
+      } catch {
+        // Layer 1: this entry failed (resolve / pull / validate / combine). The whole
+        // consumer degrades to its previous state — abandon WITHOUT any set_state.
+        return;
+      }
+      collect[as] = merged;
+    }
+
+    // Layer 3: ONE set_state for the whole consumer, guarded. A merged value that
+    // breaches the `as` field's state_schema throws AppStateViolation (which would
+    // UNLOAD the App); we catch it so the consumer simply keeps its previous state.
+    try {
+      ctx.set_state((s) => ({ ...(s as Record<string, unknown>), ...collect }));
+    } catch {
+      /* schema breach (or any set_state fault) ⇒ keep previous state, do not unload */
+    }
+  }
+
+  /**
+   * pullContract — resolve ONE contract to its merged value for a consumer (§3.5).
+   * Resolves the ContractDef (for `output_schema` + `combine`), enumerates providers,
+   * pulls each via the READ-ONLY `Operations.invoke_query` under `invoker:'app'` tagged
+   * with the consumer's identity (CM-9), validates each provider's `data` against the
+   * contract's `output_schema` (R-2), then folds the validated outputs with
+   * `combineResults`. THROWS on any failure (unresolved contract, a failed/denied
+   * query, a schema-invalid datum, an empty `first`/`sum` misuse) — the caller's
+   * per-entry try/catch (layer 1) turns that into a graceful consumer degrade.
+   */
+  private async pullContract(contract: string, consumer_app_id: string): Promise<unknown> {
+    const def = this.registry.resolve_contract?.(contract);
+    if (!def) throw new Error(`consume-refresh: contract '${contract}' is not registered`);
+
+    const providers = this.registry.providers_of?.(contract) ?? [];
+    const invoker: InvokerContext = { invoker: 'app', identity: consumer_app_id };
+
+    const datas: unknown[] = [];
+    for (const provider of providers) {
+      const full_name = `${provider.app_id}.${provider.via}`;
+      // invoke_query is OPTIONAL on the Operations interface; absence ⇒ no pull path.
+      if (!this.ops.invoke_query) {
+        throw new Error('consume-refresh: Operations.invoke_query is unavailable');
+      }
+      const res = await this.ops.invoke_query(full_name, {}, invoker);
+      if (!res.ok) {
+        throw new Error(
+          `consume-refresh: query '${full_name}' failed: ${res.error ?? 'unknown error'}`,
+        );
+      }
+      const check = validateAgainstSchema(res.data, def.output_schema);
+      if (!check.ok) {
+        throw new Error(
+          `consume-refresh: '${full_name}' data violates contract '${contract}': ${check.error}`,
+        );
+      }
+      datas.push(res.data);
+    }
+
+    // combineResults throws on misuse (non-number sum, empty first); that surfaces as
+    // this contract entry failing → the consumer degrades (layer 1).
+    return combineResults(datas, def.combine);
   }
 
   /**
@@ -413,57 +641,84 @@ export class AgentRuntime {
   }
 
   /**
-   * writeCommandsOnlyFeedback — write/overwrite the feedback block (§4.2). Written
-   * with invoker='app' via the system primitive because no App owns a command for
-   * it. Becomes the agent's input next turn so it self-corrects.
+   * writeCommandsOnlyFeedback — record a commands-only violation (§4.2). B1: this no
+   * longer writes the tree — it just sets `pending_feedback` runtime state. The
+   * feedback system builder projects that state into `runtime:commands_only_feedback`
+   * on the NEXT render, so the agent sees it and self-corrects. `async` is kept (the
+   * call site `await`s it and a future variant may do async work); the body is sync.
    */
   private async writeCommandsOnlyFeedback(): Promise<void> {
     this.pending_feedback = COMMANDS_ONLY_FEEDBACK_TEXT;
-    await this.upsertBookkeepingBlock(
-      COMMANDS_ONLY_FEEDBACK_BLOCK,
-      COMMANDS_ONLY_FEEDBACK_TEXT,
-    );
   }
 
-  /** Record a non-policy command failure as a tree block the agent can read. */
+  /**
+   * recordCommandError — record a non-policy command failure (§8.1). B1: pushes a
+   * line onto the bounded `recent_errors` ring (oldest evicted past
+   * `MAX_RECENT_COMMAND_ERRORS`, CM-6) instead of writing a per-id tree block. The
+   * command-error system builder projects the ring into the single
+   * `runtime:command_error` block next render, so the agent reads its recent failures.
+   */
   private async recordCommandError(call: ToolCall, err: unknown): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
-    const target = `runtime:command_error.${call.id}` as BlockName;
-    await this.upsertBookkeepingBlock(target, `command ${call.name} failed: ${message}`);
+    this.recent_errors.push({
+      id: call.id,
+      text: `command ${call.name} failed: ${message}`,
+    });
+    // Bound the ring: drop the oldest entries so it never grows without limit.
+    while (this.recent_errors.length > MAX_RECENT_COMMAND_ERRORS) {
+      this.recent_errors.shift();
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // B1 — bookkeeping system builders (state → block projection, no tree writes)
+  // --------------------------------------------------------------------------
+
+  /**
+   * makeFeedbackBuilder — the `runtime:commands_only_feedback` system builder (B1).
+   * It is a CLOSURE over this runtime: each render it reads `this.pending_feedback`
+   * and projects the feedback text when a violation is pending, or returns `null`
+   * (render nothing) on a clean turn. owner='system' (INV #4 — never 'agent'), no
+   * `app_id` (it reads runtime state via the closure, not an AppContext), volatile
+   * tier so it never poisons the stable cache prefix. Deterministic: identical
+   * `pending_feedback` → byte-identical block (INV #1 / #16).
+   */
+  private makeFeedbackBuilder(): BuilderManifest {
+    return {
+      name: 'runtime.commands_only_feedback',
+      version: '1.0.0',
+      owner: 'system',
+      inputs: [],
+      outputs: [COMMANDS_ONLY_FEEDBACK_BLOCK],
+      cache_tier: 'volatile',
+      build: async (ctx: BuildContext): Promise<Block | null> =>
+        this.pending_feedback === null
+          ? null
+          : projectionBlock(ctx, COMMANDS_ONLY_FEEDBACK_BLOCK, this.pending_feedback),
+    };
   }
 
   /**
-   * upsertBookkeepingBlock — set `text` on a runtime-owned block, creating it under
-   * the root if absent and updating it in place otherwise. The block id is
-   * content-addressed off its name so the choice stays deterministic (no random
-   * UUID, INV #16). Applied with invoker='app' (§9.4).
+   * makeCommandErrorBuilder — the `runtime:command_error` system builder (B1). A
+   * closure over this runtime: each render it projects the bounded `recent_errors`
+   * ring (oldest→newest, CM-6 ordering) into ONE block, or returns `null` when there
+   * are no errors. Same discipline as the feedback builder (system owner, volatile,
+   * deterministic). Replaces the old per-id `runtime:command_error.<id>` blocks.
    */
-  private async upsertBookkeepingBlock(name: BlockName, text: string): Promise<void> {
-    const op: BlockOp = this.ops.has(name)
-      ? { kind: 'update', target: name, content_text: text }
-      : {
-          kind: 'create',
-          parent: this.root_name,
-          block: {
-            id: `runtime-${name}`,
-            name,
-            children: [],
-            content_text: text,
-            content_blob: null,
-          },
-        };
-    await this.applySystemOps([op]);
-  }
-
-  /**
-   * applySystemOps — apply runtime-owned ops with invoker='app'. Both the feedback
-   * block and command-error blocks are runtime bookkeeping, not agent-initiated
-   * commands, so they go through `apply` (invoker='app', §9.4) rather than
-   * invoke_command.
-   */
-  private async applySystemOps(ops: BlockOp[]): Promise<void> {
-    const invoker: InvokerContext = { invoker: 'app' };
-    await this.ops.apply(ops, invoker);
+  private makeCommandErrorBuilder(): BuilderManifest {
+    return {
+      name: 'runtime.command_error',
+      version: '1.0.0',
+      owner: 'system',
+      inputs: [],
+      outputs: [COMMAND_ERROR_BLOCK],
+      cache_tier: 'volatile',
+      build: async (ctx: BuildContext): Promise<Block | null> => {
+        if (this.recent_errors.length === 0) return null;
+        const text = this.recent_errors.map((e) => e.text).join('\n');
+        return projectionBlock(ctx, COMMAND_ERROR_BLOCK, text);
+      },
+    };
   }
 
   /**
@@ -519,6 +774,24 @@ export class AgentRuntime {
   private stateKind(): AgentState['kind'] {
     return this.state.kind;
   }
+}
+
+/**
+ * projectionBlock — the Block a runtime bookkeeping builder renders for `name`.
+ * The id is content-addressed off the name (deterministic, no random UUID — INV #16)
+ * via the BuildContext's own substitute, so two builds with the same name yield a
+ * byte-identical block. A leaf node (no children); `content_text` carries the
+ * projected state. This is the ONLY thing the builders emit — the runtime never
+ * writes these blocks to the tree itself (B1).
+ */
+function projectionBlock(ctx: BuildContext, name: BlockName, text: string): Block {
+  return {
+    id: ctx.content_addressed_id(name),
+    name,
+    children: [],
+    content_text: text,
+    content_blob: null,
+  };
 }
 
 /**

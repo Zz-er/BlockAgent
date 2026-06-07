@@ -31,6 +31,8 @@ function mockConfig(dir: string): LauncherConfig {
       tools: { enabled: true },
       memory: { enabled: true },
       memory_letta: { enabled: false }, // needs an external server; off in tests
+      task: { enabled: true },
+      stats: { enabled: false },
     },
     storage_dir: dir,
   };
