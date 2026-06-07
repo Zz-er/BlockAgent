@@ -192,9 +192,13 @@ function assertMatchesSchema(
  * reserved full-names `core.find` / `core.read` / `core.create` / `core.update`
  * / `core.delete` / `core.move` (impl-core). Commands use a DOT and block names
  * a COLON, so `core.*` (commands) and `core:*` (any blocks) live in the same
- * reserved id. install() auto-renames any App that asks for a reserved id.
+ * reserved id. `runtime` is reserved for the runtime's own system blocks (e.g.
+ * `runtime:commands_only_feedback`, §3.1) which the runtime writes straight into
+ * the tree via `Operations.apply`; a third-party App with id `runtime` would
+ * shadow that system namespace. install() auto-renames any App that asks for a
+ * reserved id.
  */
-const RESERVED_APP_IDS: ReadonlySet<string> = new Set(['core']);
+const RESERVED_APP_IDS: ReadonlySet<string> = new Set(['core', 'runtime']);
 
 // ============================================================================
 // §3.1 — name helpers (namespace split for O(1) owner resolution)

@@ -266,6 +266,15 @@ describe('AppRegistry', () => {
     expect(reg.get('core_2')).not.toBeNull();
   });
 
+  it("reserves the 'runtime' id for the runtime's system blocks (auto-renames an App that asks for it)", () => {
+    const reg = new AppRegistry();
+    const r = reg.install(manifest({ id: 'runtime' }));
+    expect(r.installed_id).toBe('runtime_2'); // never plain 'runtime' (would shadow runtime:* system blocks)
+    expect(r.warnings[0]).toMatch(/reserved for the runtime core/);
+    expect(reg.get('runtime')).toBeNull(); // 'runtime' stays unoccupied
+    expect(reg.get('runtime_2')).not.toBeNull();
+  });
+
   it('resolves a command and routes it (CommandRegistry seam)', async () => {
     const reg = new AppRegistry();
     const cmd: CommandManifest = {
