@@ -26,6 +26,8 @@ function mockConfig(dir: string): LauncherConfig {
       tools: { enabled: true },
       memory: { enabled: true },
       memory_letta: { enabled: false },
+      task: { enabled: false },
+      stats: { enabled: false },
     },
     storage_dir: dir,
   };

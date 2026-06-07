@@ -117,12 +117,28 @@ async function main(): Promise<void> {
     {},
   ]);
 
-  // 6) Runtime, driving the real Operations + Renderer + provider directly.
+  // 6) Runtime, driving the real Operations + Renderer + provider directly. It takes
+  //    the registry handle (R-5) and, in its constructor, registers its two bookkeeping
+  //    system builders (`runtime:commands_only_feedback` / `runtime:command_error`, B1)
+  //    via registry.registerSystemBuilder — so they must exist BEFORE we seed (below).
   const runtime = new AgentRuntime({
     operations,
     renderer,
     provider,
+    registry,
   });
+
+  // 6b) Seed projection-block placeholders AFTER the runtime registered its system
+  //     builders (CM-5 order) and seed them under the runtime's actual tree root
+  //     (CM-4): registry.seedProjectionBlocks defaults `parent` to `core:root`, which
+  //     is NOT the empty-tree root (`root:root`) — passing runtime.root keeps the
+  //     bookkeeping blocks attached to the live root so they actually render. The
+  //     creates flow through Operations.apply({invoker:'app'}) — no chokepoint bypass.
+  await registry.seedProjectionBlocks(
+    (name) => operations.has(name),
+    (ops) => operations.apply(ops, { invoker: 'app' }),
+    runtime.root,
+  );
 
   // Subscribe a UI to the thinking channel (§4.3): thoughts are EMITTED here, never
   // written to the tree or fed back into the prompt. This is the only place they
@@ -132,8 +148,15 @@ async function main(): Promise<void> {
     console.log(`\n[thinking depth=${e.spawn_depth}] ${e.text}`);
   });
 
-  // Feed a "message" by waking the runtime, then run the loop.
-  const wake: WakeEvent = { kind: 'sync_message_arrived', msg_id: 'demo-1' };
+  // Feed a "message" by waking the runtime, then run the loop. WakeEvent is
+  // base-ified (A5): kind='app_event' + source/reason/ref (core never reads
+  // reason/ref); this demo stands in for the messages App's front-door wake.
+  const wake: WakeEvent = {
+    kind: 'app_event',
+    source: 'messages',
+    reason: 'message_arrived',
+    ref: 'demo-1',
+  };
 
   console.log('=== block-agent v3.0 demo boot ===');
   console.log(`installed fixture app: ${install.installed_id}`);

@@ -39,6 +39,7 @@ import type {
   RenderedPrompt,
 } from '../src/core/types.js';
 import type {
+  BuildContext,
   BuilderManifest,
   BuilderRegistry,
   Capability,
@@ -188,25 +189,40 @@ export class TestOperations implements Operations {
 // TestBuilderRegistry + TestRenderer — deterministic tier-segmented rendering
 // ============================================================================
 
-/** Minimal BuilderRegistry mapping a block name → its declared cache_tier. */
+/**
+ * Minimal BuilderRegistry mapping a block name → its declared cache_tier, plus the
+ * wave-2 `registerSystemBuilder` seam (R-5 / B1) so the AgentRuntime can register its
+ * own bookkeeping builders. A registered builder's outputs become resolvable, so
+ * `resolve_builder` / `tier_of` hit it and TestRenderer RUNS it (projecting runtime
+ * state). Tests that never register a builder behave exactly as before
+ * (resolve_builder → null; unmanaged blocks render straight from the snapshot).
+ */
 export class TestBuilderRegistry implements BuilderRegistry {
   private readonly tiers = new Map<BlockName, CacheTier>();
   private readonly builders: BuilderManifest[] = [];
+  /** Owner builder per output block name (registered via registerSystemBuilder). */
+  private readonly ownerByName = new Map<BlockName, BuilderManifest>();
 
   declareTier(name: BlockName, tier: CacheTier): void {
     this.tiers.set(name, tier);
   }
 
-  resolve_builder(_block_name: BlockName): BuilderManifest | null {
-    return null; // fixtures don't run builders; tiers are declared directly.
+  resolve_builder(block_name: BlockName): BuilderManifest | null {
+    return this.ownerByName.get(block_name) ?? null;
   }
 
   tier_of(block_name: BlockName): CacheTier | null {
-    return this.tiers.get(block_name) ?? null;
+    // A registered builder's declared tier wins; otherwise the directly-declared tier.
+    return this.ownerByName.get(block_name)?.cache_tier ?? this.tiers.get(block_name) ?? null;
   }
 
   list_builders(): BuilderManifest[] {
     return this.builders;
+  }
+
+  registerSystemBuilder(builder: BuilderManifest): void {
+    for (const out of builder.outputs) this.ownerByName.set(out, builder);
+    if (!this.builders.includes(builder)) this.builders.push(builder);
   }
 }
 
@@ -224,14 +240,43 @@ export class TestRenderer implements Renderer {
   constructor(private readonly builders: TestBuilderRegistry) {}
 
   async render(snapshot: BlockSnapshot): Promise<RenderedPrompt> {
-    const byTier = new Map<CacheTier, string[]>();
-    for (const tier of TIER_ORDER) byTier.set(tier, []);
-
+    // Collect (tier, line) entries in TREE ORDER (preserved across async builds via
+    // an index slot, so output stays deterministic regardless of build resolution
+    // order — byte-identical, INV #1). A block with a registered OWNER builder (a
+    // system builder, B1) is RENDERED BY THAT BUILDER: run it and use its projected
+    // block (null → render nothing), even if the snapshot node is an empty placeholder.
+    // A block with no owner falls back to its snapshot text (prior behavior — unmanaged
+    // blocks render straight from the snapshot).
+    const slots: Array<{ tier: CacheTier; line: string } | null> = [];
+    const builds: Array<Promise<void>> = [];
     walkSnapshot(snapshot.root, (b) => {
+      const builder = this.builders.resolve_builder(b.name);
+      if (builder) {
+        const idx = slots.length;
+        slots.push(null);
+        builds.push(
+          builder.build(makeBuildContext(snapshot)).then((built) => {
+            if (built === null || built.content_text === null) return;
+            slots[idx] = {
+              tier: builder.cache_tier,
+              line: `${built.name}\n${built.content_text}`,
+            };
+          }),
+        );
+        return;
+      }
       if (b.content_text === null) return;
       const tier = this.builders.tier_of(b.name) ?? 'volatile';
-      byTier.get(tier)!.push(`${b.name}\n${b.content_text}`);
+      slots.push({ tier, line: `${b.name}\n${b.content_text}` });
     });
+    await Promise.all(builds);
+
+    const byTier = new Map<CacheTier, string[]>();
+    for (const tier of TIER_ORDER) byTier.set(tier, []);
+    for (const slot of slots) {
+      if (slot === null) continue; // builder rendered nothing this turn
+      byTier.get(slot.tier)!.push(slot.line);
+    }
 
     const segments: RenderedPrompt['segments'] = [];
     const segment_hashes = new Map<string, string>();
@@ -245,6 +290,23 @@ export class TestRenderer implements Renderer {
 
     return { segments, snapshot_hash: snapshot.hash, segment_hashes };
   }
+}
+
+/**
+ * A deterministic BuildContext for the test renderer. Mirrors the real Renderer's
+ * sandbox enough for runtime projection builders: a content-addressed id (no random
+ * UUID), a fixed clock/random folded from the snapshot hash, empty config. Pure (no
+ * wall-clock / Math.random) so a build is byte-identical for a given snapshot.
+ */
+function makeBuildContext(snapshot: BlockSnapshot): BuildContext {
+  return {
+    snapshot,
+    read: (name: BlockName) => snapshot.get(name),
+    deterministic_clock: () => 0,
+    deterministic_random: () => 0,
+    content_addressed_id: (content: string) => `cid-${content}`,
+    config: {},
+  };
 }
 
 // ============================================================================

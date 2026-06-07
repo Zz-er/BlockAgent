@@ -14,6 +14,7 @@ import { PolicyEngine } from '../src/core/policy.js';
 import { MockProvider } from '../src/provider/mock.js';
 import {
   AgentRuntime,
+  COMMAND_ERROR_BLOCK,
   COMMANDS_ONLY_FEEDBACK_BLOCK,
   COMMANDS_ONLY_FEEDBACK_TEXT,
 } from '../src/runtime/agent_runtime.js';
@@ -27,7 +28,13 @@ import {
   makeEndTurnApp,
 } from './fixtures.js';
 
-const WAKE = { kind: 'sync_message_arrived', msg_id: 'm1' } as const;
+// WakeEvent is base-ified (A5): a message wake is an app_event with source/reason/ref.
+const WAKE = {
+  kind: 'app_event',
+  source: 'messages',
+  reason: 'message_arrived',
+  ref: 'm1',
+} as const;
 
 function wire(provider: MockProvider) {
   const tree = makeEmptyTree();
@@ -35,13 +42,50 @@ function wire(provider: MockProvider) {
   makeReplyApp(registry);
   const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
   const ops = new TestOperations(tree, policy, registry);
-  const renderer = new TestRenderer(new TestBuilderRegistry());
+  // The builder registry the renderer reads is ALSO the runtime's `registry` handle,
+  // so the runtime's bookkeeping system builders (B1) register into the same instance
+  // the renderer resolves against. The runtime registers them in its constructor.
+  const builders = new TestBuilderRegistry();
+  const renderer = new TestRenderer(builders);
   const runtime = new AgentRuntime({
     operations: ops,
     renderer,
     provider,
+    registry: builders,
   });
-  return { tree, ops, runtime };
+  return { tree, ops, runtime, builders, renderer };
+}
+
+/**
+ * Seed the runtime's bookkeeping projection-block placeholders into the tree, then
+ * render — exactly the boot order (registerSystemBuilder happened in the runtime
+ * ctor; seed reads the registry; the builder projects state). Seeds under the actual
+ * tree root via `runtime.root` (CM-4) so the placeholders are not orphaned. Returns
+ * the flattened rendered text so a test can assert what the agent would see.
+ */
+async function seedAndRenderText(
+  ops: TestOperations,
+  runtime: AgentRuntime,
+  builders: TestBuilderRegistry,
+  renderer: TestRenderer,
+): Promise<string> {
+  for (const builder of builders.list_builders()) {
+    for (const name of builder.outputs) {
+      if (ops.has(name)) continue;
+      await ops.apply(
+        [
+          {
+            kind: 'create',
+            parent: runtime.root,
+            block: { id: `seed-${name}`, name, children: [], content_text: null, content_blob: null },
+          },
+        ],
+        { invoker: 'app' },
+      );
+    }
+  }
+  const prompt = await renderer.render(ops.snapshot());
+  return prompt.segments.map((s) => (typeof s.rendered === 'string' ? s.rendered : '')).join('\n');
 }
 
 describe('commands-only', () => {
@@ -52,14 +96,17 @@ describe('commands-only', () => {
       { text: '你好，我直接聊天而不是用命令。' },
       {},
     ]);
-    const { tree, runtime } = wire(provider);
+    const { ops, runtime, builders, renderer } = wire(provider);
 
     await runtime.on_wake(WAKE);
 
-    // The feedback block must exist in the tree, carrying the exact §4.2 text.
-    const fb = tree.get(COMMANDS_ONLY_FEEDBACK_BLOCK);
-    expect(fb).not.toBeNull();
-    expect(fb?.content_text).toBe(COMMANDS_ONLY_FEEDBACK_TEXT);
+    // B1: the runtime no longer writes the feedback block to the tree — it sets state
+    // that its system builder PROJECTS. Seed the placeholders + render: the feedback
+    // text must appear in the rendered prompt (what the agent sees next turn), under
+    // the runtime:commands_only_feedback block.
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    expect(text).toContain(COMMANDS_ONLY_FEEDBACK_BLOCK);
+    expect(text).toContain(COMMANDS_ONLY_FEEDBACK_TEXT);
 
     // And the runtime is back to idle (it parked nowhere).
     expect(runtime.state.kind).toBe('idle');
@@ -108,15 +155,18 @@ describe('commands-only', () => {
       { tool_calls: [{ id: 't1', name: 'reply.say', args: { text: 'hi' } }] },
       {},
     ]);
-    const { tree, ops, runtime } = wire(provider);
+    const { tree, ops, runtime, builders, renderer } = wire(provider);
 
     await runtime.on_wake(WAKE);
 
     const reply = tree.get('reply:last');
     expect(reply?.content_text).toBe('hi');
     expect(ops.decisions).toContainEqual({ full_name: 'reply.say', kind: 'allow' });
-    // No feedback block, because the output WAS a command.
-    expect(tree.get(COMMANDS_ONLY_FEEDBACK_BLOCK)).toBeNull();
+    // No feedback, because the output WAS a command: the clean turn left
+    // pending_feedback null, so the feedback builder projects nothing (B1) — the
+    // feedback text never appears in the rendered prompt even after seeding.
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    expect(text).not.toContain(COMMANDS_ONLY_FEEDBACK_TEXT);
   });
 
   it('idle burns no tokens — no LLM call without processing an event', async () => {
@@ -144,11 +194,13 @@ describe('tool catalog advertisement (§4.2 / §11.1 native tool dispatch)', () 
     makeReplyApp(registry);
     const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
     const ops = new TestOperations(tree, policy, registry);
-    const renderer = new TestRenderer(new TestBuilderRegistry());
+    const builders = new TestBuilderRegistry();
+    const renderer = new TestRenderer(builders);
     const runtime = new AgentRuntime({
       operations: ops,
       renderer,
       provider,
+      registry: builders,
       tool_catalog: () => catalog,
     });
 
@@ -210,10 +262,12 @@ describe('end_turn (a reply-style command ends the turn, §8.1)', () => {
     makeEndTurnApp(registry);
     const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
     const ops = new TestOperations(tree, policy, registry);
+    const builders = new TestBuilderRegistry();
     const runtime = new AgentRuntime({
       operations: ops,
-      renderer: new TestRenderer(new TestBuilderRegistry()),
+      renderer: new TestRenderer(builders),
       provider,
+      registry: builders,
     });
 
     await runtime.on_wake(WAKE);
@@ -234,5 +288,123 @@ describe('end_turn (a reply-style command ends the turn, §8.1)', () => {
 
     expect(provider.turns_consumed).toBe(2); // looped to the 2nd (empty) turn, unlike end_turn
     expect(runtime.state.kind).toBe('idle');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1 — bookkeeping blocks are STATE → builder projections (no tree writes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire a runtime whose only command `boom.go` always THROWS, so each call drives the
+ * runtime's recordCommandError path. The throw propagates out of TestOperations.route
+ * into the runtime's invokeCommand catch (a non-policy error), exactly as a real
+ * command failure would. Shares the renderer's builder registry as the runtime's
+ * `registry` handle (so the B1 builders register into it).
+ */
+function wireFailing(provider: MockProvider) {
+  const tree = makeEmptyTree();
+  const registry = new TestCommandRegistry();
+  registry.register(
+    'boom.go',
+    { name: 'go', description: 'always throws (fixture)', capabilities: [], invoke: async () => ({ ok: true }) },
+    async () => {
+      throw new Error('kaboom');
+    },
+  );
+  const policy = new PolicyEngine({ capability_resolver: registry.capabilityResolver() });
+  const ops = new TestOperations(tree, policy, registry);
+  const builders = new TestBuilderRegistry();
+  const renderer = new TestRenderer(builders);
+  const runtime = new AgentRuntime({ operations: ops, renderer, provider, registry: builders });
+  return { tree, ops, runtime, builders, renderer };
+}
+
+describe('B1 bookkeeping projection (state → builder, no tree writes)', () => {
+  it('the feedback builder owns runtime:commands_only_feedback and is registered at construction', () => {
+    const { builders } = wire(new MockProvider([{}]));
+    // The runtime registered both system builders in its constructor (CM-5), so the
+    // registry resolves their owners — proving registerSystemBuilder was wired.
+    expect(builders.resolve_builder(COMMANDS_ONLY_FEEDBACK_BLOCK)?.name).toBe(
+      'runtime.commands_only_feedback',
+    );
+    expect(builders.resolve_builder(COMMAND_ERROR_BLOCK)?.name).toBe('runtime.command_error');
+    // Both are volatile (never poison the stable cache prefix).
+    expect(builders.tier_of(COMMANDS_ONLY_FEEDBACK_BLOCK)).toBe('volatile');
+    expect(builders.tier_of(COMMAND_ERROR_BLOCK)).toBe('volatile');
+  });
+
+  it('a violation is NOT written to the tree — only projected by the builder (INV#1 by construction)', async () => {
+    const provider = new MockProvider([{ text: 'plain chat, not a command' }, {}]);
+    const { tree, ops, runtime, builders, renderer } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+
+    // The runtime wrote NO bookkeeping node to the tree (the old upsert path is gone):
+    // the feedback block exists in the tree ONLY after the boot seeds its placeholder.
+    expect(tree.get(COMMANDS_ONLY_FEEDBACK_BLOCK)).toBeNull();
+
+    // After seeding + render the builder projects the pending feedback text.
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    expect(text).toContain(COMMANDS_ONLY_FEEDBACK_TEXT);
+  });
+
+  it('a clean turn projects nothing — the feedback builder returns null', async () => {
+    // No violation, no command: pending_feedback stays null → builder build()→null.
+    const provider = new MockProvider([{}]);
+    const { ops, runtime, builders, renderer } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    expect(text).not.toContain(COMMANDS_ONLY_FEEDBACK_TEXT);
+    // The seeded placeholder rendered nothing → no commands_only_feedback line at all.
+    expect(text).not.toContain(COMMANDS_ONLY_FEEDBACK_BLOCK);
+  });
+
+  it('command errors project into a single block, bounded recent-N, oldest→newest (CM-6)', async () => {
+    // 10 failing calls in one wake (each its own turn) — exceeds the recent-N bound
+    // (8). The command_error builder must project exactly the LAST 8, in order.
+    const failing = Array.from({ length: 10 }, (_v, i) => ({
+      tool_calls: [{ id: `t${i}`, name: 'boom.go', args: {} }],
+    }));
+    const provider = new MockProvider([...failing, {}]);
+    const { runtime, ops, builders, renderer } = wireFailing(provider);
+
+    await runtime.on_wake(WAKE);
+
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    // Recent-N bound = 8: the two oldest (call 0,1) fell off; calls 2..9 remain.
+    expect(text).toContain(COMMAND_ERROR_BLOCK);
+    expect(text).toContain('command boom.go failed: kaboom');
+    // Exactly 8 error lines in the projected block (one per retained failure).
+    const errorLines = text.split('\n').filter((l) => l === 'command boom.go failed: kaboom');
+    expect(errorLines).toHaveLength(8);
+  });
+
+  it('command_error builder projects nothing when there are no errors', async () => {
+    const provider = new MockProvider([{}]);
+    const { ops, runtime, builders, renderer } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+
+    const text = await seedAndRenderText(ops, runtime, builders, renderer);
+    expect(text).not.toContain(COMMAND_ERROR_BLOCK);
+  });
+
+  it('the seeded bookkeeping placeholders attach under the actual tree root (CM-4 guard)', async () => {
+    // The whole projection silently disappears if the seed parent ≠ the live root.
+    // After seeding under runtime.root, the placeholder must be REACHABLE in the tree
+    // (tree.get finds it), proving the parent was correct.
+    const provider = new MockProvider([{ text: 'violate' }, {}]);
+    const { tree, ops, runtime, builders, renderer } = wire(provider);
+
+    await runtime.on_wake(WAKE);
+    await seedAndRenderText(ops, runtime, builders, renderer);
+
+    // runtime.root must be the empty-tree root the fixture built.
+    expect(runtime.root).toBe('root:root');
+    // The seeded placeholder node now lives in the tree (reachable from root).
+    expect(tree.get(COMMANDS_ONLY_FEEDBACK_BLOCK)).not.toBeNull();
   });
 });

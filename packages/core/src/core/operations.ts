@@ -190,6 +190,55 @@ export class Operations implements OperationsContract {
     return { status: 'ok', result };
   }
 
+  /**
+   * invoke_query — a pure READ down the command path (R-3, C-API-9 / CM-1). Same
+   * front half as `invoke_command` — `PolicyEngine.check` FIRST (unbypassable),
+   * then resolve + route to the owning App — but it NEVER applies ops: it returns
+   * only the command's `CommandResult.data` and DROPS any `ops` the command
+   * produced. So a contract provider's `via` command can be pulled at render-time
+   * (consume-refresh) with byte-identical rendering (INVARIANT #1) guaranteed by
+   * MECHANISM, not convention: there is no `applyOps` call on this path at all.
+   *
+   * It is the query twin of `invoke_command`: deny/pending surface as `ok:false`
+   * with the same `data.policy` marker so a caller holding only the contract type
+   * can branch; a thrown command becomes an error result. The registry asserts a
+   * `provides.via` command is `readonly` at assemble time; this is the runtime arm
+   * that makes "readonly" true regardless of what the command's body returns.
+   */
+  async invoke_query(
+    full_name: string,
+    args: unknown,
+    invoker_ctx: InvokerContext,
+  ): Promise<CommandResult> {
+    const call: OperationCall = { full_name, args };
+
+    // (1) THE check — first, unbypassable (exactly as invoke_command).
+    const decision = this.policy.check(call, invoker_ctx);
+    if (decision.kind === 'deny')
+      return { ok: false, error: decision.reason, data: { policy: 'deny', reason: decision.reason } };
+    if (decision.kind === 'pending')
+      return { ok: false, error: 'approval pending', data: { policy: 'pending', token: decision.token } };
+
+    // (2) command must exist.
+    if (this.registry.resolve_command(full_name) === null) {
+      return { ok: false, error: `no such command: ${full_name}` };
+    }
+
+    // (3) route to the owning App (already authorized).
+    let result: CommandResult;
+    try {
+      result = await this.registry.route(full_name, args, invoker_ctx);
+    } catch (err) {
+      return { ok: false, error: error_message(err) };
+    }
+
+    // (4) A query NEVER writes the tree: we return only `data` and deliberately
+    //     drop any `ops` the command produced (the R-3 mechanism guarantee). A
+    //     self-reported failure passes through unchanged (still no apply).
+    if (!result.ok) return result;
+    return { ok: true, data: result.data };
+  }
+
   // ---- §4.2 system write primitive (owner-less blocks) --------------------
 
   /**

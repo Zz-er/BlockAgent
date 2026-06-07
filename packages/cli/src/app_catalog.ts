@@ -29,11 +29,12 @@ export interface BuiltinAppEntry {
 }
 
 /**
- * BUILTIN_APP_CATALOG — the full set of installable first-party apps (5 + 1).
+ * BUILTIN_APP_CATALOG — the full set of installable first-party apps (7).
  *
  * Order: four always-on apps first (agent_identity / messages / tools / memory),
- * then the one optional external-dep app (memory_letta). This mirrors the boot
- * install order in launch.ts and the DEFAULTS.apps key order.
+ * then the optional external-dep app (memory_letta), then the contract-model pair
+ * (task / stats). This mirrors the boot install order in launch.ts and the
+ * DEFAULTS.apps key order; `default_enabled` MUST match DEFAULTS.apps (tests assert it).
  */
 export const BUILTIN_APP_CATALOG: readonly BuiltinAppEntry[] = [
   {
@@ -61,5 +62,15 @@ export const BUILTIN_APP_CATALOG: readonly BuiltinAppEntry[] = [
     summary: '对接外部 Letta 服务器，实现跨会话持久化归档记忆与语义搜索。',
     default_enabled: false,
     requires: 'Letta server + LETTA_API_KEY',
+  },
+  {
+    id: 'task',
+    summary: '本地 JSONL 待办清单：增改删/完成/重开/归档，并按契约 task_count 对外提供未完成计数。',
+    default_enabled: true,
+  },
+  {
+    id: 'stats',
+    summary: '纯消费型概览：按契约汇总消息数（message_count）与待办数（task_count），默认隐藏，需开启并 show_block 才渲染。',
+    default_enabled: false,
   },
 ];
