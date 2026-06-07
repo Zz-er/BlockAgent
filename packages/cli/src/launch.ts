@@ -25,6 +25,7 @@ import { Operations } from '@block-agent/core/core/operations.js';
 import { PolicyEngine } from '@block-agent/core/core/policy.js';
 import { Renderer } from '@block-agent/core/core/renderer.js';
 import { AppRegistry } from '@block-agent/core/app/registry.js';
+import { MESSAGE_COUNT, TASK_COUNT } from '@block-agent/core/app/contracts.js';
 import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_runtime.js';
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
@@ -33,6 +34,8 @@ import { makeAgentIdentityApp } from '@block-agent/core/apps/agent_identity.js';
 import { MessagesApp } from '@block-agent/core/apps/messages.js';
 import { ToolsApp } from '@block-agent/core/apps/tools.js';
 import { MemoryApp } from '@block-agent/core/apps/memory.js';
+import { TaskApp } from '@block-agent/core/apps/task.js';
+import { StatsApp } from '@block-agent/core/apps/stats.js';
 import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
@@ -115,6 +118,16 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    subscribe to onReply (reply=Option B, §6). The boot path and any future hot
   //    install share this ONE mapping (no second wiring path to drift, design §6.3).
   const registry = new AppRegistry();
+
+  // 2a) Register the built-in scalar-count contracts (R-6) BEFORE installing any app,
+  //     so the assemble-time provides/consumes check can resolve each contract NAME to
+  //     its ContractDef (output_schema ⊨ via.result_schema, R-1) the moment a provider
+  //     (messages→message_count, task→task_count) or consumer (stats) installs. Register
+  //     before install or the check sees an unknown contract and the binding is silently
+  //     dropped. App-defined contracts (none built-in beyond these two) would register here too.
+  registry.registerContract(MESSAGE_COUNT);
+  registry.registerContract(TASK_COUNT);
+
   const base = appsBaseDir(config);
   const { messages } = installEnabledApps(config, registry, base);
 
@@ -153,6 +166,13 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     operations,
     renderer,
     provider,
+    // R-5/F1: hand the runtime the registry so it can register its own bookkeeping
+    // `system` builders (registry.registerSystemBuilder, B1 — done inside the ctor) and
+    // resolve get_app_context for the consume-refresh pass (P3). We never call
+    // registerSystemBuilder here; the runtime OWNS that. The two count contracts
+    // registered above are already live, so the consume-refresh hook (runtime-native,
+    // P3) activates as soon as a consumer (stats) is installed — no extra wiring.
+    registry,
     ...(config.max_turns_per_wake !== undefined
       ? { max_turns_per_wake: config.max_turns_per_wake }
       : {}),
@@ -192,7 +212,12 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   await registry.seedProjectionBlocks(
     (name) => operations.has(name),
     (ops) => operations.apply(ops, { invoker: 'app' }),
-    ROOT_NAME,
+    // CM-4: seed under the runtime's ACTUAL tree root (not seedProjectionBlocks's
+    // `core:root` default), so the runtime's bookkeeping blocks — registered during the
+    // AgentRuntime ctor above — attach to the live root and actually render. Here
+    // runtime.root === ROOT_NAME (the empty-tree `core:root`), but reading it off the
+    // runtime keeps seed correct if the root ever diverges (matches index.ts:141).
+    runtime.root,
   );
 
   // 8) Apply the launcher's non-file app-config overrides through the chokepoint as
@@ -307,6 +332,20 @@ function installEnabledApps(
     registry.install(
       new MemoryLettaApp(lettaOpts).manifest() as Parameters<typeof registry.install>[0],
     );
+  }
+  // task (built-in; core, zero dependency). Local jsonl store like memory, so
+  // seedProjectionBlocks covers its `task:*` block. It PROVIDES the `task_count`
+  // contract (manifest `provides`, via `count`) — registered above so the bind resolves.
+  if (config.apps.task.enabled) {
+    registry.install(new TaskApp({ dir: join(base, 'task'), configBase: base }).manifest());
+  }
+  // stats (built-in; core, default-disabled). A pure CONSUMER (no store): its manifest
+  // `consumes` message_count + task_count; the runtime's consume-refresh pass folds the
+  // merged counts into its state each render. Install order is irrelevant for binding
+  // (the registry derives the provider table over all installed manifests), but it
+  // installs LAST so the providers it consumes are already present at first refresh.
+  if (config.apps.stats.enabled) {
+    registry.install(new StatsApp({ configBase: base }).manifest());
   }
 
   return { messages };
@@ -425,6 +464,22 @@ async function applyAppConfigOverrides(
         { recall_limit: config.apps.memory_letta.recall_limit },
         user,
       )
+      .catch(() => undefined);
+  }
+
+  // task: the open-task projection cap. The CLI's `list_limit` knob maps to the app's
+  // user-only `task.set_config({list_limit})`; absent → the app's seed/default holds.
+  if (config.apps.task.enabled && config.apps.task.list_limit !== undefined) {
+    await operations
+      .invoke_command('task.set_config', { list_limit: config.apps.task.list_limit }, user)
+      .catch(() => undefined);
+  }
+
+  // stats: whether the `stats:summary` block renders at all. Pushed via the app's
+  // user-only `stats.set_config({show_block})`; absent → the app's seed/default holds.
+  if (config.apps.stats.enabled && config.apps.stats.show_block !== undefined) {
+    await operations
+      .invoke_command('stats.set_config', { show_block: config.apps.stats.show_block }, user)
       .catch(() => undefined);
   }
 }

@@ -37,6 +37,11 @@ export const DEFAULTS: LauncherConfig = {
     tools: { enabled: true },
     memory: { enabled: true },
     memory_letta: { enabled: false },
+    // task: local jsonl tracker, zero dependency → on by default like memory.
+    task: { enabled: true },
+    // stats: pure consumer (message_count + task_count); off by default (§4.4) so a
+    // default boot renders no `stats:summary` block unless the operator opts in.
+    stats: { enabled: false },
   },
   welcome: { cube: true },
 };
@@ -268,6 +273,11 @@ export function loadConfig(
   // never enable irrecoverable deletion. Not an env var (too easy to leave globally on).
   const allow_purge = pick(asBool(flags['allow-purge']), asBool(file['allow_purge'])) ?? false;
 
+  // contract_bindings: optional operator overrides (C-API-7). A top-level
+  // `Record<string,string>` in the file; absent / malformed → undefined (nothing in
+  // the default path reads it). Only string→string entries survive the narrowing.
+  const contract_bindings = resolveContractBindings(file['contract_bindings']);
+
   return {
     provider,
     apps: {
@@ -276,10 +286,13 @@ export function loadConfig(
       tools: resolveTools(flags, fileApps),
       memory: resolveMemory(flags, fileApps),
       memory_letta: resolveMemoryLetta(flags, fileApps, env),
+      task: resolveTask(flags, fileApps),
+      stats: resolveStats(flags, fileApps),
     },
     ...(storage_dir !== undefined ? { storage_dir } : {}),
     ...(max_turns_per_wake !== undefined ? { max_turns_per_wake } : {}),
     ...(allow_purge ? { allow_purge } : {}),
+    ...(contract_bindings !== undefined ? { contract_bindings } : {}),
     // The file `loadConfig` actually consulted — so `/app *` write-backs target it
     // (not a re-guessed default). Always defined here (default file name when no flag).
     config_path: configPath,
@@ -385,6 +398,65 @@ function resolveMemory(
     ...(user_char_limit !== undefined ? { user_char_limit } : {}),
     ...(recall_limit !== undefined ? { recall_limit } : {}),
   };
+}
+
+/**
+ * resolveTask — the built-in `task` app config (§4.2). Enabled by default
+ * (local jsonl store, zero dependency, offline). `--no-task` disables it.
+ * `list_limit` (the open-task projection cap) is a non-file override (flag > file);
+ * the app's own config seed + compiled defaults remain the fallback. The agent can
+ * never retune it at runtime (`task.set_config` is user-only), so the operator pins it.
+ */
+function resolveTask(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['task'] {
+  const f = pickObject(fileApps['task']);
+  const list_limit = pick(asNumber(flags['task-list-limit']), asNumber(f['list_limit']));
+  return {
+    enabled: appEnabled(flags, f, 'no-task'),
+    ...(list_limit !== undefined ? { list_limit } : {}),
+  };
+}
+
+/**
+ * resolveStats — the `stats` app config (§4.4). DISABLED by default: it is a pure
+ * consumer whose `stats:summary` block only renders when enabled AND `show_block` is
+ * true. Enable via `--stats` / file `apps.stats.enabled:true`; `--no-stats` forces off
+ * (an explicit no always wins). `show_block` resolves flag (`--stats-show-block`) >
+ * file; the app's own seed is the fallback.
+ */
+function resolveStats(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['stats'] {
+  const f = pickObject(fileApps['stats']);
+  // Default-disabled: enabled ONLY when a positive flag or file value says so;
+  // `--no-stats` also forces off (so an explicit no always wins).
+  const fileEnabled = asBool(f['enabled']) ?? false;
+  const flagOn = flags['stats'] === true || flags['stats'] === 'true';
+  const flagOff = flags['no-stats'] === true || flags['no-stats'] === 'true';
+  const enabled = flagOff ? false : flagOn || fileEnabled;
+  const show_block = pick(asBool(flags['stats-show-block']), asBool(f['show_block']));
+  return {
+    enabled,
+    ...(show_block !== undefined ? { show_block } : {}),
+  };
+}
+
+/**
+ * resolveContractBindings — narrow the file's optional top-level `contract_bindings`
+ * (C-API-7) into a `Record<string,string>` (string keys → string provider ids). A
+ * non-object, or one with any non-string value, yields `undefined` (the field drops
+ * out of the resolved config). No flag form in v1 — file-only.
+ */
+function resolveContractBindings(v: unknown): Record<string, string> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === 'string' && val.length > 0) out[k] = val;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**

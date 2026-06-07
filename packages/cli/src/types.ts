@@ -78,6 +78,36 @@ export interface ToolsConfig {
   enabled_tools?: string[];
 }
 
+/**
+ * `task` app config knobs (§4.2). Enabled by default (zero dependency, local jsonl
+ * store like `memory`). The agent can never retune these at runtime
+ * (`task.set_config` is user-only), so the operator pins them here / in the file.
+ */
+export interface TaskConfig {
+  enabled: boolean;
+  /**
+   * Max OPEN tasks the `task:list` projection renders (bounded window). Maps to the
+   * task app's own `list_limit` knob (retuned at runtime via the user-only
+   * `task.set_config`); a non-file override, the app's config seed is the fallback.
+   */
+  list_limit?: number;
+}
+
+/**
+ * `stats` app config knobs (§4.4). DISABLED by default: it is a pure consumer
+ * (message_count + task_count) whose `stats:summary` block is hidden until the
+ * operator turns it on AND `show_block` is true (the builder renders null otherwise).
+ */
+export interface StatsConfig {
+  enabled: boolean;
+  /**
+   * Whether `stats:summary` renders its block at all (the builder returns null when
+   * false — the §4.4 default). A non-file override; the app's own config seed is the
+   * fallback. User-only at runtime (`stats.set_config`).
+   */
+  show_block?: boolean;
+}
+
 /** Welcome screen config knobs (cube animation toggle). */
 export interface WelcomeConfig {
   /** When true (default), the rotating cube is rendered. `--no-cube` sets this to false. */
@@ -128,7 +158,20 @@ export interface LauncherConfig {
     tools: ToolsConfig;
     memory: MemoryConfig;
     memory_letta: MemoryLettaConfig;
+    /** §4.2 task tracker (local jsonl); enabled by default. */
+    task: TaskConfig;
+    /** §4.4 stats summary (pure consumer); DISABLED by default. */
+    stats: StatsConfig;
   };
+  /**
+   * OPTIONAL operator-supplied contract rebindings (C-API-7). The contract model
+   * binds consumers to providers by TYPE (the contract name) via the registry's
+   * derived provider table — no hand-written routes are required, so this is empty
+   * for every built-in boot. It exists as a forward seam: an operator could pin which
+   * provider satisfies a contract when several compete. `loadConfig` parses it
+   * defensively (a malformed entry drops out); nothing in the default path reads it.
+   */
+  contract_bindings?: Record<string, string>;
   /** Base dir for `.block-agent` storage (apps get an explicit dir); default cwd. */
   storage_dir?: string;
   /** Forwarded to AgentRuntime. */

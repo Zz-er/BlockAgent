@@ -470,6 +470,101 @@ describe('messages config (file seed + user-only set_config)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// §4.3 three-audience additions: chat / count / list + ingest AI-2 gate
+// ---------------------------------------------------------------------------
+
+describe('messages §4.3 command surface', () => {
+  const AGENT: InvokerContext = { invoker: 'agent', identity: 'main' };
+  const USER: InvokerContext = { invoker: 'user', identity: 'human' };
+  const APP: InvokerContext = { invoker: 'app', identity: 'ext:cli' };
+
+  /** Wire through the REAL Operations + default PolicyEngine (the gate). */
+  function wire() {
+    const app = new MessagesApp({ dir: join(dir, 'store'), configBase: dir });
+    const reg = new AppRegistry();
+    reg.install(app.manifest());
+    const root: Block = {
+      id: 'root', name: 'root:root', children: [], content_text: null, content_blob: null,
+    };
+    const tree = new BlockTree(root);
+    const ops = Operations.with_default_policy({ tree, registry: reg });
+    return { app, reg, ops };
+  }
+
+  it('chat appends an agent message + ends the turn (reply sugar)', async () => {
+    const { app, registry } = installApp();
+    const res = await registry.route('messages.chat', { content: 'hi user' }, { invoker: 'agent' });
+    expect(res.ok).toBe(true);
+    expect(res.end_turn).toBe(true);
+    expect((res.data as { reply_id: string }).reply_id).toMatch(/^agent_/);
+    expect(app.store.readHistory().at(-1)).toMatchObject({ role: 'agent', content: 'hi user' });
+    expect(app.store.outboxReplies.readAll()).toHaveLength(1);
+  });
+
+  it('chat pushes to onReply subscribers (no reply_to)', async () => {
+    const { app, registry } = installApp();
+    const seen: ReplyEvent[] = [];
+    app.onReply((e) => seen.push(e));
+    await registry.route('messages.chat', { content: 'spoke' }, { invoker: 'agent' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ content: 'spoke' });
+    expect(seen[0]).not.toHaveProperty('reply_to');
+  });
+
+  it('count returns a SCALAR number (recent count) and is readonly', async () => {
+    const { app, registry } = installApp();
+    app.ingest({ id: 'u1', content: 'a' });
+    app.ingest({ id: 'u2', content: 'b' });
+    const res = await registry.route('messages.count', {}, APP);
+    expect(res.ok).toBe(true);
+    expect(res.data).toBe(2); // bare number
+    const cmd = registry.resolve_command('messages.count');
+    expect(cmd?.readonly).toBe(true);
+    expect(cmd?.result_schema).toEqual({ type: 'number' });
+    expect(cmd?.allowed_invokers).toEqual(['app', 'user']);
+  });
+
+  it('list returns the recent messages as data for UIs', async () => {
+    const { app, registry } = installApp();
+    app.ingest({ id: 'u1', content: 'hello' });
+    const res = await registry.route('messages.list', {}, USER);
+    expect(res.ok).toBe(true);
+    expect((res.data as { messages: HistoryMessage[] }).messages).toHaveLength(1);
+    expect(registry.resolve_command('messages.list')?.allowed_invokers).toEqual(['user', 'app']);
+  });
+
+  it('provides the message_count contract via the bare `count` command', () => {
+    const { registry } = installApp();
+    expect(registry.get('messages')!.provides).toEqual([{ contract: 'message_count', via: 'count' }]);
+  });
+
+  it('AI-2: ingest is app/user-only — the agent is DENIED (cannot forge a user message)', async () => {
+    const { app, ops } = wire();
+    const res = await ops.invoke_command('messages.ingest', { content: 'forged' }, AGENT);
+    expect(res.ok).toBe(false);
+    expect(res.data).toMatchObject({ policy: 'deny' });
+    expect(app.store.readHistory()).toHaveLength(0); // handler never ran
+  });
+
+  it('AI-2: ingest declares allowed_invokers [user, app] on the manifest', () => {
+    const { registry } = installApp();
+    expect(registry.resolve_command('messages.ingest')?.allowed_invokers).toEqual(['user', 'app']);
+  });
+
+  it('ingest still works for user/app invokers (gate allows them)', async () => {
+    const { app, ops } = wire();
+    expect((await ops.invoke_command('messages.ingest', { content: 'real' }, USER)).ok).toBe(true);
+    expect(app.store.readHistory()).toHaveLength(1);
+  });
+
+  it('count/list are excluded from the agent tool catalog (DR-F) — denied via Operations', async () => {
+    const { ops } = wire();
+    expect((await ops.invoke_command('messages.count', {}, AGENT)).ok).toBe(false);
+    expect((await ops.invoke_command('messages.list', {}, AGENT)).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // §12.2 jsonl write rules (unchanged) + full durable log
 // ---------------------------------------------------------------------------
 

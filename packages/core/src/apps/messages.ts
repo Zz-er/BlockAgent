@@ -373,6 +373,9 @@ function ingestCommand(app: MessagesApp): CommandManifest<MessagesState> {
       },
     },
     capabilities: [{ name: 'block:write' }],
+    // AI-2: only the UI/external (user/app) may deliver an INBOUND USER message; the
+    // AGENT is denied so it can never forge a user message into its own history.
+    allowed_invokers: ['user', 'app'],
     invoke: async (args): Promise<CommandResult> => {
       const a = args as { id?: unknown; content?: unknown; from?: unknown } | undefined;
       if (typeof a?.content !== 'string')
@@ -437,6 +440,99 @@ function replyCommand(app: MessagesApp): CommandManifest<MessagesState> {
 }
 
 /**
+ * chat({ content }) — the agent's USER-FACING reply sugar (§4.3). Identical effect to
+ * `reply` (append an agent message to history + outbox + recent, push onReply, end the
+ * turn) but is the named "say something to the user" exit in the agent tool catalog,
+ * which reads more naturally than `reply` as the agent's speaking command. All invokers
+ * (the default). Sets `end_turn:true` — saying something to the user completes the
+ * agent's response for this wake (the loop goes idle), same as `reply`.
+ */
+function chatCommand(app: MessagesApp): CommandManifest<MessagesState> {
+  return {
+    name: 'chat',
+    description: 'Say something to the user. Put the message text in `content` (ends your turn).',
+    args_schema: {
+      type: 'object',
+      required: ['content'],
+      properties: {
+        content: { type: 'string', description: 'The message text to send to the user.' },
+      },
+    },
+    capabilities: [{ name: 'block:write' }],
+    invoke: async (args, ctx): Promise<CommandResult> => {
+      const a = args as { content?: unknown } | undefined;
+      if (typeof a?.content !== 'string')
+        return { ok: false, error: 'chat requires string `content`' };
+
+      const id = app.nextMessageId('agent');
+      const msg: HistoryMessage = { role: 'agent', id, content: a.content };
+      app.store.appendHistory(msg);
+      app.store.appendReply(id, '', a.content);
+      ctx.set_state((s) => app.appendToProjection(s as MessagesState, msg));
+      app.emitReply({ id, content: a.content });
+      return { ok: true, end_turn: true, data: { reply_id: id } };
+    },
+  };
+}
+
+/**
+ * count() — the `message_count` contract's `via` (§4.3). `readonly:true` +
+ * `result_schema:{type:'number'}` (matches the contract's output_schema, R-1).
+ * `allowed_invokers:['app','user']` so it never enters the agent tool catalog (DR-F).
+ * Returns a SCALAR number = the count of messages in the recent projection (the
+ * provider computes its own number from its OWN state, INV #11). Produces no ops.
+ */
+function countCommand(): CommandManifest<MessagesState> {
+  return {
+    name: 'count',
+    description: 'Return the message count (a scalar number). Contract via; app/user only.',
+    readonly: true,
+    allowed_invokers: ['app', 'user'],
+    result_schema: { type: 'number' },
+    args_schema: { type: 'object', properties: {} },
+    invoke: async (_args, ctx): Promise<CommandResult> => {
+      return { ok: true, data: ctx.state.recent.length };
+    },
+  };
+}
+
+/**
+ * list({ filter?, limit? }) — read-only history view for UIs (§4.3). Returns the recent
+ * projection messages (data) so a UI can render its own conversation view.
+ * `allowed_invokers:['user','app']` — NOT agent (the agent already reads bodies from the
+ * `messages:recent` block, so this stays out of the agent tool catalog, DR-F).
+ */
+function listCommand(): CommandManifest<MessagesState> {
+  return {
+    name: 'list',
+    description: 'List recent messages (data). For UIs; not in the agent tool catalog.',
+    readonly: true,
+    allowed_invokers: ['user', 'app'],
+    args_schema: {
+      type: 'object',
+      properties: {
+        filter: { type: 'object', properties: { role: { type: 'string' } } },
+        limit: { type: 'number' },
+      },
+    },
+    invoke: async (args, ctx): Promise<CommandResult> => {
+      const a = (typeof args === 'object' && args !== null ? args : {}) as {
+        filter?: { role?: unknown };
+        limit?: unknown;
+      };
+      let messages = ctx.state.recent;
+      if (a.filter?.role === 'user' || a.filter?.role === 'agent') {
+        const role = a.filter.role;
+        messages = messages.filter((m) => m.role === role);
+      }
+      const limit = typeof a.limit === 'number' && a.limit > 0 ? Math.floor(a.limit) : undefined;
+      if (limit !== undefined) messages = messages.slice(-limit);
+      return { ok: true, data: { messages, summary: ctx.state.summary } };
+    },
+  };
+}
+
+/**
  * peek({ count? }) — read-only: return the most-recent messages (verbatim bodies) plus
  * the current summary, so a caller can inspect the conversation without rendering.
  * Adapted to the history model (the old counts-only peek is gone).
@@ -445,6 +541,10 @@ function peekCommand(): CommandManifest<MessagesState> {
   return {
     name: 'peek',
     description: 'Return the recent conversation messages (bodies) and the current summary.',
+    readonly: true,
+    // §4.3: a read-only inspection surface for UIs; not in the agent tool catalog (the
+    // agent reads bodies from the messages:recent block, DR-F).
+    allowed_invokers: ['user', 'app'],
     args_schema: {
       type: 'object',
       properties: {
@@ -768,6 +868,9 @@ export class MessagesApp {
       id: APP_ID,
       version: '1.0.0',
       depends_on: [],
+      // §4.3: MessageApp provides the `message_count` contract via its app-facing
+      // readonly `count` command (the StatsApp consumes it identity-free, §3.2).
+      provides: [{ contract: 'message_count', via: 'count' }],
       tree_namespace: TREE_NAMESPACE,
       initial_state: { recent: [], summary: '', config: this.seedConfig },
       state_schema: STATE_SCHEMA,
@@ -775,7 +878,10 @@ export class MessagesApp {
       commands: [
         () => ingestCommand(app),
         () => replyCommand(app),
+        () => chatCommand(app),
         () => peekCommand(),
+        () => listCommand(),
+        () => countCommand(),
         () => ackCommand(),
         () => setConfigCommand(),
       ],
