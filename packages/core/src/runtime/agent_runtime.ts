@@ -44,6 +44,7 @@ import type {
   BuildContext,
   CommandResult,
 } from '../app/types.js';
+import { combineResults, validateAgainstSchema } from '../app/contracts.js';
 
 /**
  * ThinkingListener — a UI subscriber on the runtime's thinking channel (§4.3).
@@ -309,6 +310,16 @@ export class AgentRuntime {
    * no feedback (it is done).
    */
   private async runTurn(): Promise<boolean> {
+    // 0) Consume-refresh (§3.5 / R-4): BEFORE the snapshot, pull each consumer App's
+    //    declared contracts from their providers and fold the merged result into the
+    //    consumer's state[as]. It runs OUTSIDE the builder sandbox and BEFORE the
+    //    snapshot, so builders stay pure and rendering stays byte-identical (INV #1):
+    //    the only state it touches is App state via set_state, and it never writes the
+    //    tree (it pulls via Operations.invoke_query, which drops ops). The method holds
+    //    the three-layer guardrail (R-4/CM-2) and never throws, so it cannot crash the
+    //    turn even if a provider/validate/set_state misbehaves.
+    await this.consumeRefresh();
+
     // 1) Render the current snapshot into a prompt (§10). Byte-identical for a
     //    given (snapshot, tiers) — the runtime relies on Operations.snapshot()
     //    being a frozen COW capture (INV #1).
@@ -362,6 +373,153 @@ export class AgentRuntime {
     }
 
     return progressed;
+  }
+
+  /**
+   * consumeRefresh — the render-time consume-refresh lifecycle point (§3.5, R-4).
+   *
+   * BEFORE each turn's snapshot, for every installed consumer App C (those that
+   * declare `consumes`), pull each declared contract from its providers and fold the
+   * merged result into C's `state[as]`. Mechanically:
+   *   for each C in registry.consumers():
+   *     for each {contract, as} in C.consumes:
+   *       def       = registry.resolve_contract(contract)        // output_schema/combine
+   *       providers = registry.providers_of(contract)            // [{app_id, via}]
+   *       datas     = providers.map(p => ops.invoke_query(`${p.app_id}.${p.via}`, {},
+   *                                       {invoker:'app', identity:C.app_id}).data)  // CM-9
+   *                   each `data` validated against def.output_schema (R-2)
+   *       collect[as] = combineResults(datas, def.combine)        // sum / list / first
+   *     registry.get_app_context(C).set_state(s => ({...s, ...collect}))
+   *
+   * THREE-LAYER GUARDRAIL (R-4 / CM-2 — the red-team BLOCKER's resolution). The pull
+   * crosses an App boundary, validates untrusted data, and writes App state whose
+   * `set_state` UNLOADS the App on a schema breach; none of that may corrupt a
+   * consumer's state or crash the turn:
+   *   1. PER-ENTRY try/catch — each `{contract, as}` is computed in isolation
+   *      (invoke_query / validate / combineResults each may fail or throw); the first
+   *      failure marks the WHOLE consumer degraded and stops computing its entries.
+   *   2. PER-CONSUMER ATOMIC (all-or-nothing) — `collect` is assembled fully BEFORE any
+   *      write; if any entry failed, the consumer is left at its PREVIOUS state (no
+   *      set_state at all), never half-new/half-old (CM-2 — no mixed snapshot).
+   *   3. ONE set_state per consumer, itself guarded — a merged value that breaches the
+   *      `as` field's state_schema throws AppStateViolation (which would unload the
+   *      App); we catch it so a bad merge degrades that consumer instead of unloading it.
+   *   4. THE WHOLE METHOD is wrapped in try/catch — nothing bubbles out of
+   *      consumeRefresh, so a refresh fault can never crash the turn (it runs before
+   *      the snapshot; an uncaught throw here would abort `runTurn`).
+   *
+   * Seam-optional (additive): the registry's consume-refresh accessors and
+   * Operations.invoke_query are OPTIONAL on their interfaces, so a contract-less wiring
+   * (e.g. a test double, or a boot with no consumers) makes this a clean no-op. It
+   * touches NO tree (invoke_query drops ops) and NO builder, so INV #1 / the builder
+   * sandbox are intact.
+   */
+  private async consumeRefresh(): Promise<void> {
+    try {
+      const consumers = this.registry.consumers?.();
+      if (!consumers || consumers.length === 0) return; // no consumers ⇒ no-op
+
+      for (const consumer of consumers) {
+        // One bad consumer must never affect the others (defense in depth; the
+        // per-consumer body below is already guarded, this is the outer net). The
+        // `await` is REQUIRED: refreshOneConsumer awaits each provider pull, so without
+        // it consume-refresh would return before set_state ran and the snapshot would
+        // render STALE state (the refresh completing after the render) — defeating the
+        // "before snapshot" guarantee. Awaiting also lets this try/catch catch its
+        // rejection (a non-awaited async throw would escape it).
+        try {
+          await this.refreshOneConsumer(consumer);
+        } catch {
+          /* isolate a single consumer's failure */
+        }
+      }
+    } catch {
+      // Layer 4: NOTHING bubbles out of consume-refresh. It runs before the snapshot,
+      // so an uncaught throw here would abort the whole turn — which is exactly the
+      // crash R-4 forbids. Swallow it; the turn proceeds with last-good consumer state.
+    }
+  }
+
+  /**
+   * refreshOneConsumer — compute + commit the consume-refresh for ONE consumer App,
+   * with the per-entry (layer 1) and per-consumer-atomic (layer 2) + guarded-set_state
+   * (layer 3) guardrails. Split out of `consumeRefresh` so the control flow of "abandon
+   * this consumer on the first failed entry" is a single early-`return` rather than
+   * nested flags. Synchronous wrt. its own structure but `await`s each provider pull.
+   */
+  private async refreshOneConsumer(consumer: {
+    app_id: string;
+    consumes: { contract: string; as: string }[];
+  }): Promise<void> {
+    const ctx = this.registry.get_app_context?.(consumer.app_id);
+    if (!ctx) return; // App gone / no context seam ⇒ skip (no-op for this consumer)
+
+    // Assemble the full set of merged values BEFORE writing anything (layer 2).
+    const collect: Record<string, unknown> = {};
+    for (const { contract, as } of consumer.consumes) {
+      let merged: unknown;
+      try {
+        merged = await this.pullContract(contract, consumer.app_id);
+      } catch {
+        // Layer 1: this entry failed (resolve / pull / validate / combine). The whole
+        // consumer degrades to its previous state — abandon WITHOUT any set_state.
+        return;
+      }
+      collect[as] = merged;
+    }
+
+    // Layer 3: ONE set_state for the whole consumer, guarded. A merged value that
+    // breaches the `as` field's state_schema throws AppStateViolation (which would
+    // UNLOAD the App); we catch it so the consumer simply keeps its previous state.
+    try {
+      ctx.set_state((s) => ({ ...(s as Record<string, unknown>), ...collect }));
+    } catch {
+      /* schema breach (or any set_state fault) ⇒ keep previous state, do not unload */
+    }
+  }
+
+  /**
+   * pullContract — resolve ONE contract to its merged value for a consumer (§3.5).
+   * Resolves the ContractDef (for `output_schema` + `combine`), enumerates providers,
+   * pulls each via the READ-ONLY `Operations.invoke_query` under `invoker:'app'` tagged
+   * with the consumer's identity (CM-9), validates each provider's `data` against the
+   * contract's `output_schema` (R-2), then folds the validated outputs with
+   * `combineResults`. THROWS on any failure (unresolved contract, a failed/denied
+   * query, a schema-invalid datum, an empty `first`/`sum` misuse) — the caller's
+   * per-entry try/catch (layer 1) turns that into a graceful consumer degrade.
+   */
+  private async pullContract(contract: string, consumer_app_id: string): Promise<unknown> {
+    const def = this.registry.resolve_contract?.(contract);
+    if (!def) throw new Error(`consume-refresh: contract '${contract}' is not registered`);
+
+    const providers = this.registry.providers_of?.(contract) ?? [];
+    const invoker: InvokerContext = { invoker: 'app', identity: consumer_app_id };
+
+    const datas: unknown[] = [];
+    for (const provider of providers) {
+      const full_name = `${provider.app_id}.${provider.via}`;
+      // invoke_query is OPTIONAL on the Operations interface; absence ⇒ no pull path.
+      if (!this.ops.invoke_query) {
+        throw new Error('consume-refresh: Operations.invoke_query is unavailable');
+      }
+      const res = await this.ops.invoke_query(full_name, {}, invoker);
+      if (!res.ok) {
+        throw new Error(
+          `consume-refresh: query '${full_name}' failed: ${res.error ?? 'unknown error'}`,
+        );
+      }
+      const check = validateAgainstSchema(res.data, def.output_schema);
+      if (!check.ok) {
+        throw new Error(
+          `consume-refresh: '${full_name}' data violates contract '${contract}': ${check.error}`,
+        );
+      }
+      datas.push(res.data);
+    }
+
+    // combineResults throws on misuse (non-number sum, empty first); that surfaces as
+    // this contract entry failing → the consumer degrades (layer 1).
+    return combineResults(datas, def.combine);
   }
 
   /**

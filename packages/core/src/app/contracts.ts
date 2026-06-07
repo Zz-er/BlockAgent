@@ -174,6 +174,68 @@ function fail(where: string, expected: string, value: unknown): SchemaCheck {
   return { ok: false, error: `${where}: ${expected}, got ${describe(value)}` };
 }
 
+// ============================================================================
+// §3.2 — combine: fold many providers' outputs into the consumer's state[as]
+// ============================================================================
+
+/**
+ * combineResults — a PURE fold of the per-provider outputs of ONE contract into
+ * the single value the consumer places in `state[as]` (§3.2, R-4 consume-refresh).
+ * `results` is the list of provider outputs (each already `validateAgainstSchema`-d
+ * against the contract's `output_schema` by the caller, so this fold never has to
+ * re-validate). The `combine` mode is the ContractDef's `combine` field:
+ *   - `'sum'`   → every output must be a finite number; merged = their arithmetic
+ *                 sum (the count contracts). An empty list sums to `0` (the
+ *                 additive identity), so a contract with no providers yields `0`
+ *                 rather than throwing. A non-number / NaN / Infinity input throws
+ *                 (the caller's per-entry try/catch downgrades that consumer, B2);
+ *                 we DON'T silently coerce, which would mask a provider bug.
+ *   - `'list'`  → merged = the outputs collected into an array, in caller order
+ *                 (provider/manifest order — deterministic, INV #16). An empty list
+ *                 yields `[]`.
+ *   - `'first'` → merged = the first provider's output (pairs with cardinality
+ *                 'one'). An empty list throws — "first of nothing" has no value,
+ *                 so the caller downgrades rather than write `undefined` into state.
+ *   - `undefined` → treated as `'first'` (a contract that omits `combine` and has a
+ *                 single provider is the common case; same empty-list throw).
+ *
+ * PURE + deterministic + ZERO dependencies: no fs/clock/random, no mutation of the
+ * input array. It THROWS on a misuse (non-number sum input, empty first) instead of
+ * returning a sentinel — the consume-refresh caller wraps each entry in try/catch
+ * (R-4 layer 1) and downgrades the consumer to its previous state, so a throw here
+ * is the well-defined "this entry failed" signal, never a turn-crasher.
+ */
+export function combineResults(
+  results: unknown[],
+  combine: ContractDef['combine'],
+): unknown {
+  switch (combine) {
+    case 'sum': {
+      let total = 0;
+      for (const r of results) {
+        if (typeof r !== 'number' || Number.isNaN(r) || !Number.isFinite(r))
+          throw new Error(`combine 'sum' requires finite number outputs, got ${describe(r)}`);
+        total += r;
+      }
+      return total;
+    }
+    case 'list':
+      return [...results];
+    case 'first':
+    case undefined: {
+      if (results.length === 0)
+        throw new Error(`combine 'first' has no provider output to take`);
+      return results[0];
+    }
+    default: {
+      // An unknown combine mode is a manifest/contract bug — fail loudly so the
+      // caller downgrades this consumer rather than silently picking a default.
+      const exhaustive: never = combine;
+      throw new Error(`unknown combine mode '${String(exhaustive)}'`);
+    }
+  }
+}
+
 /** A compact, deterministic description of a value's runtime kind for errors. */
 function describe(value: unknown): string {
   if (value === null) return 'null';

@@ -32,6 +32,9 @@ import type {
   InvokerContext,
   WakeEvent,
 } from '../core/types.js';
+// Type-only import; erased at compile time, so the contracts.ts↔types.ts cycle is
+// purely structural (no runtime dependency edge, core's runtime closure unchanged).
+import type { ContractDef } from './contracts.js';
 
 // ============================================================================
 // §9 Capabilities (referenced by manifests; full ACL model lives in policy.ts)
@@ -514,4 +517,40 @@ export interface BuilderRegistry {
    * not already be owned by an installed App (INV #3).
    */
   registerSystemBuilder(builder: BuilderManifest): void;
+
+  // --------------------------------------------------------------------------
+  // Consume-refresh seam (R-4 / CM-2 / CM-9) — OPTIONAL on the interface.
+  // --------------------------------------------------------------------------
+  //
+  // The runtime holds the registry as `BuilderRegistry` and runs a render-time
+  // `consumeRefresh()` over these four accessors (AppRegistry implements all of
+  // them). They are OPTIONAL so test doubles that don't model the contract layer
+  // (e.g. TestBuilderRegistry in test/fixtures.ts) still satisfy the interface —
+  // adding them as REQUIRED would break every `implements BuilderRegistry` double
+  // and turn the baseline red. The runtime guards each call (and wraps the whole
+  // refresh in try/catch, R-4 layer 3), so an undefined member ⇒ refresh is a
+  // no-op for that registry, which is exactly right for a contract-less double.
+
+  /**
+   * Every INSTALLED App that declares `consumes`, as `{app_id, consumes}` pairs.
+   * `app_id` is the installed id (the key `get_app_context` expects). Apps with no
+   * `consumes` are omitted, so an empty result ⇒ consume-refresh is a no-op.
+   */
+  consumers?(): { app_id: string; consumes: { contract: string; as: string }[] }[];
+
+  /**
+   * The providers of a contract over the currently-installed Apps, as
+   * `[{app_id, via}]`. `app_id` is the installed id; the runtime calls each via
+   * `invoke_query(`${app_id}.${via}`, …)`. An unprovided contract yields `[]`.
+   */
+  providers_of?(contract: string): { app_id: string; via: string }[];
+
+  /** The `ContractDef` for a contract name (its `output_schema` / `combine`), or null. */
+  resolve_contract?(name: string): ContractDef | null;
+
+  /**
+   * The LIVE AppContext for an installed App (the `set_state` seam consume-refresh
+   * folds merged results through), or null if no such App is installed.
+   */
+  get_app_context?(app_id: string): AppContext | null;
 }

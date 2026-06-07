@@ -444,6 +444,30 @@ export interface Operations {
 
   /** Freeze a snapshot for rendering (delegates to the underlying BlockTree). */
   snapshot(): BlockSnapshot;
+
+  /**
+   * invoke_query — a PURE read down the command path (R-3, C-API-9 / CM-1): same
+   * front half as `invoke_command` (PolicyEngine.check FIRST, then resolve+route)
+   * but it NEVER applies ops — it returns only the command's `CommandResult.data`
+   * and DROPS any `ops`. Consume-refresh (R-4) pulls a contract provider's readonly
+   * `via` command through this, so render-time refresh cannot write the tree
+   * (byte-identical, INV #1, by MECHANISM not convention — there is no applyOps on
+   * this path).
+   *
+   * OPTIONAL on this contract by design: the concrete `Operations` class always
+   * implements it, but this interface is the MINIMAL cross-module surface and a
+   * test double (`TestOperations` in test/fixtures.ts) need not model the contract
+   * layer. Making it REQUIRED would break every `implements Operations` double and
+   * turn the baseline red (the established additive rule for this contract — the
+   * low-level `find`/`read`/… primitives are deliberately off it for the same
+   * reason). The consume-refresh caller guards the call and wraps the whole refresh
+   * in try/catch, so an Operations without it ⇒ refresh is a no-op.
+   */
+  invoke_query?(
+    full_name: string,
+    args: unknown,
+    invoker_ctx: InvokerContext,
+  ): Promise<CommandResult>;
 }
 
 /**

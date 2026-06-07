@@ -506,6 +506,61 @@ export class AppRegistry
   }
 
   /**
+   * consumers — enumerate every INSTALLED App that declares `consumes`, as
+   * `{app_id, consumes}` pairs (R-4 consume-refresh seam). The runtime's
+   * render-time `consumeRefresh()` walks this list: for each consumer it resolves
+   * each `{contract, as}` (`resolve_contract` → ContractDef.output_schema/combine),
+   * finds the providers (`deriveContractTable` over `list()`), pulls each via
+   * `Operations.invoke_query`, validates + combines, and folds the merged value
+   * into `state[as]` via `get_app_context(app_id).set_state` (CM-9).
+   *
+   * `app_id` is the INSTALLED id (post collision-rename), so it is the key
+   * `get_app_context` expects — NOT the raw manifest id. Apps with no `consumes`
+   * are omitted (an empty result ⇒ consume-refresh is a no-op, so a contract-less
+   * boot is unaffected). Deterministic order (by installed id, like `list()`), and
+   * each `consumes` array is a fresh copy so a caller can never mutate the live
+   * manifest. The registry stays the single owner of contract derivation (F3).
+   */
+  consumers(): { app_id: string; consumes: { contract: string; as: string }[] }[] {
+    const out: { app_id: string; consumes: { contract: string; as: string }[] }[] = [];
+    for (const id of [...this.apps.keys()].sort()) {
+      const consumes = this.apps.get(id)!.manifest.consumes;
+      if (consumes && consumes.length > 0) {
+        out.push({ app_id: id, consumes: consumes.map((c) => ({ ...c })) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * providers_of — resolve a contract NAME to its `[{app_id, via}]` provider list
+   * over the CURRENTLY-INSTALLED Apps (R-4 consume-refresh seam). This is the
+   * cohesive twin of `consumers()`: it derives the table from the live install set
+   * (`list()`) via `deriveContractTable` and returns the one contract's entry, so a
+   * caller never has to assemble the manifest list or hold the whole table. The
+   * registry stays the single owner of contract derivation (F3).
+   *
+   * `app_id` is the INSTALLED id (we read each install record's `id`, NOT the raw
+   * `manifest.id` — those differ after a collision rename, and only the installed
+   * id is routable). It is exactly the key `resolve_command` / `route` /
+   * `invoke_query` (`${app_id}.${via}`) expect; deriving via `list()` +
+   * `deriveContractTable` would instead emit the pre-rename `manifest.id` and break
+   * a renamed provider. `via` is the provider's bare command name. Deterministic
+   * order (by installed id, like `consumers()`). An unprovided contract yields `[]`
+   * (consume-refresh then `combine`s an empty fan-in: `sum`→0, `list`→[], `first`→
+   * downgrade — the caller decides).
+   */
+  providers_of(contract: string): { app_id: string; via: string }[] {
+    const out: { app_id: string; via: string }[] = [];
+    for (const id of [...this.apps.keys()].sort()) {
+      for (const { contract: c, via } of this.apps.get(id)!.manifest.provides ?? []) {
+        if (c === contract) out.push({ app_id: id, via });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Per-manifest `provides` validation (R-1 / R-3 / DR-F). All findings are
    * WARNINGS appended to the install's InstallResult (report-only — a contract
    * declaration problem degrades the binding, it does not abort the install). Three
