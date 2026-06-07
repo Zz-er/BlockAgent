@@ -383,7 +383,11 @@ function ingestCommand(app: MessagesApp): CommandManifest<MessagesState> {
         content: a.content,
         ...(typeof a.from === 'string' ? { from: a.from } : {}),
       });
-      return { ok: true, data: { msg_id: id, woke: event.kind } };
+      // A5/CM-7: WakeEvent is base-ified — `kind` is now always 'app_event', so the
+      // sync/async distinction lives in `reason`. Report `reason` (not `kind`) so the
+      // caller still sees the semantic ('message_arrived'); `kind` would be a constant.
+      const woke = event.kind === 'app_event' ? event.reason : event.kind;
+      return { ok: true, data: { msg_id: id, woke } };
     },
   };
 }
@@ -846,7 +850,15 @@ export class MessagesApp {
     // (2) projection + compaction via the schema-validated state machine.
     ctx.set_state((s) => this.appendToProjection(s as MessagesState, msg));
     // (3) wake the runtime (guarded — inert if no runtime is wired, §8.2 seam).
-    const event: WakeEvent = { kind: 'sync_message_arrived', msg_id: input.id };
+    // A5: WakeEvent is base-ified — core never interprets `reason`/`ref`. The
+    // messages App labels its own wake: source='messages', reason='message_arrived'
+    // (the former 'sync_message_arrived' semantic), ref=the message id (was msg_id).
+    const event: WakeEvent = {
+      kind: 'app_event',
+      source: 'messages',
+      reason: 'message_arrived',
+      ref: input.id,
+    };
     ctx.wake?.(event);
     return event;
   }

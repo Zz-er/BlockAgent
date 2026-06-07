@@ -117,8 +117,11 @@ describe('MessagesApp.ingest (§8.2 wake seam + history)', () => {
 
     const event = app.ingest({ id: 'u1', content: 'hello', from: 'alice' });
 
-    expect(event).toEqual({ kind: 'sync_message_arrived', msg_id: 'u1' });
-    expect(wakes).toEqual([{ kind: 'sync_message_arrived', msg_id: 'u1' }]);
+    // WakeEvent is base-ified (A5): the messages App raises an app_event labeled
+    // source='messages', reason='message_arrived', ref=the message id.
+    const expected = { kind: 'app_event', source: 'messages', reason: 'message_arrived', ref: 'u1' };
+    expect(event).toEqual(expected);
+    expect(wakes).toEqual([expected]);
 
     // Durable history holds the full message.
     expect(app.store.readHistory()).toEqual([{ role: 'user', id: 'u1', content: 'hello' }]);
@@ -154,7 +157,7 @@ describe('messages commands (history model)', () => {
     const { app, registry } = installApp();
     const res = await registry.route('messages.ingest', { content: 'hey' }, { invoker: 'user' });
     expect(res.ok).toBe(true);
-    expect(res.data).toMatchObject({ woke: 'sync_message_arrived' });
+    expect(res.data).toMatchObject({ woke: 'message_arrived' });
     expect(app.store.readHistory()).toHaveLength(1);
   });
 

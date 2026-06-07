@@ -503,4 +503,15 @@ export interface BuilderRegistry {
   tier_of(block_name: BlockName): CacheTier | null;
   /** All registered builders (e.g. for topo sort / cycle check at bootstrap). */
   list_builders(): BuilderManifest[];
+  /**
+   * Register a SYSTEM builder that belongs to no installed App (R-5 / B1). The
+   * runtime constructs a system builder (a closure over its own bookkeeping state)
+   * and registers it here AFTER construction (CM-5), so that `resolve_builder` /
+   * `tier_of` / `list_builders` and `seedProjectionBlocks` all see its outputs. The
+   * registry stays the single owner of `ownerByBlockName` (F3): core mutates builder
+   * ownership ONLY through this seam, never by touching the index directly. The
+   * builder's owner must be `system` (INV #4 — never `agent`); its output names must
+   * not already be owned by an installed App (INV #3).
+   */
+  registerSystemBuilder(builder: BuilderManifest): void;
 }

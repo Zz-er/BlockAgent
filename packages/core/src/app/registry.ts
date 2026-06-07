@@ -265,6 +265,16 @@ export class AppRegistry
    */
   private readonly ownerByBlockName = new Map<BlockName, BuilderManifest>();
 
+  /**
+   * System builders that belong to NO installed App (R-5 / B1): the runtime's own
+   * bookkeeping builder is registered here via `registerSystemBuilder`. Their outputs
+   * also live in `ownerByBlockName` (so `resolve_builder` / `tier_of` /
+   * `seedProjectionBlocks` see them); this array exists so `list_builders` can include
+   * them too (it otherwise enumerates only installed Apps). Insertion order is
+   * preserved and appended deterministically after the App builders.
+   */
+  private readonly systemBuilders: BuilderManifest[] = [];
+
   /** Per-App config injected into BuildContext.config in place of process.env. */
   private readonly configs = new Map<string, Readonly<Record<string, string>>>();
 
@@ -753,13 +763,50 @@ export class AppRegistry
     return this.ownerByBlockName.get(block_name)?.cache_tier ?? null;
   }
 
-  /** All registered builders, deterministically ordered by app_id then name. */
+  /**
+   * All registered builders: installed-App builders (deterministically ordered by
+   * app_id then declared order) followed by system builders (R-5 / B1) in
+   * registration order. System builders own no App so they cannot be enumerated via
+   * `this.apps`; they are appended last so existing App-only ordering is unchanged.
+   */
   list_builders(): BuilderManifest[] {
     const all: BuilderManifest[] = [];
     for (const id of [...this.apps.keys()].sort()) {
       all.push(...this.apps.get(id)!.builders);
     }
+    all.push(...this.systemBuilders);
     return all;
+  }
+
+  /**
+   * registerSystemBuilder (R-5 / B1) — register a builder that belongs to NO installed
+   * App. The runtime's bookkeeping builder (a closure over its `pending_feedback` /
+   * `recent_errors` state) is registered here AFTER the runtime is constructed (CM-5),
+   * so that `resolve_builder` / `tier_of` / `list_builders` hit it and
+   * `seedProjectionBlocks` (which reads `ownerByBlockName`) seeds its output names.
+   *
+   * The registry stays the SINGLE owner of `ownerByBlockName` (F3): system builders go
+   * through the same INV #4 (owner≠'agent') guard as App builders and the same INV #3
+   * (single owner per block name) check. A name already owned by an installed App or a
+   * previously registered system builder is a wiring bug → throw. Idempotent only for
+   * the exact same builder instance re-registering its own names (no-op), so a boot
+   * that runs twice in one process does not falsely trip INV #3.
+   */
+  registerSystemBuilder(builder: BuilderManifest): void {
+    // INV #4 (runtime arm): owner must be system/plugin/tool, never 'agent'. Reuse
+    // the same guard App builders pass; 'system:runtime' labels the synthetic owner.
+    this.assertLegalBuilder('system:runtime', builder);
+    // INV #3: claim each output name; reject a clash with a different owner.
+    for (const out of builder.outputs) {
+      const existing = this.ownerByBlockName.get(out);
+      if (existing && existing !== builder)
+        throw new AppManifestError(
+          `block name '${out}' already owned by builder '${existing.name}' (INV #3)`,
+          'system:runtime',
+        );
+      this.ownerByBlockName.set(out, builder);
+    }
+    if (!this.systemBuilders.includes(builder)) this.systemBuilders.push(builder);
   }
 
   // --------------------------------------------------------------------------

@@ -283,14 +283,22 @@ export type AgentState =
   | { kind: 'paused_for_approval'; gateway_token: string };
 
 /**
- * WakeEvent — the only things that move the runtime out of idle (§8.1). Delivered
- * by the messages App (sync/async), tasks App, a scheduler, a completed off-tree
- * builder, or a returning sub-agent.
+ * WakeEvent — the only things that move the runtime out of idle (§8.1).
+ *
+ * A5 base-ification (resolutions R-? / §3.7): core does NOT enumerate per-App wake
+ * reasons. App-originated wakes (a message arriving, a task arriving, any App-defined
+ * trigger) all collapse into a single `app_event`. The App that raised it stamps
+ * `source` (its app_id), and OPAQUELY-to-core `reason`/`ref` — core never branches on
+ * or interprets `reason`/`ref`; only the App that wrote them (or a UI) reads them.
+ * This keeps core app-agnostic: adding a new App (or a new wake reason within one)
+ * needs no change here.
+ *
+ * The remaining variants are core/infrastructure wakes, not App domain events:
+ * `scheduled_tick` (scheduler), `builder_completed` (a completed off-tree builder —
+ * the runtime itself owns this transition, §8.1), and `sub_agent_returned`.
  */
 export type WakeEvent =
-  | { kind: 'sync_message_arrived'; msg_id: string }
-  | { kind: 'async_message_arrived'; msg_id: string }
-  | { kind: 'task_arrived'; task_id: string }
+  | { kind: 'app_event'; source: string; reason?: string; ref?: string }
   | { kind: 'scheduled_tick'; cron_id: string }
   | { kind: 'builder_completed'; builder_id: string; output_block_id: string }
   | { kind: 'sub_agent_returned'; sub_id: string };

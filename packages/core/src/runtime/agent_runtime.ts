@@ -22,8 +22,8 @@
 
 import type {
   AgentState,
+  Block,
   BlockName,
-  BlockOp,
   InvokerContext,
   Operations,
   Renderer,
@@ -38,7 +38,12 @@ import type {
   SendOpts,
   ToolCall,
 } from '../provider/types.js';
-import type { CommandResult } from '../app/types.js';
+import type {
+  BuilderManifest,
+  BuilderRegistry,
+  BuildContext,
+  CommandResult,
+} from '../app/types.js';
 
 /**
  * ThinkingListener — a UI subscriber on the runtime's thinking channel (§4.3).
@@ -68,6 +73,15 @@ export interface AgentRuntimeOptions {
   operations: Operations;
   renderer: Renderer;
   provider: ModelProvider;
+  /**
+   * The App/Builder registry handle (R-5 / F1). The runtime uses it to register its
+   * own bookkeeping `system` builder (`registry.registerSystemBuilder`, B1) after
+   * construction, and is the seam through which it will reach `get_app_context` for
+   * the consume-refresh pass (P3). Held as the `BuilderRegistry` interface so the
+   * runtime stays decoupled from the concrete `AppRegistry` (core never imports the
+   * registry class — only its interfaces).
+   */
+  registry: BuilderRegistry;
   /** sub-agent recursion depth; 0 = main agent (§8.1). */
   spawn_depth?: number;
   /** Hard cap on turns within one wake, to bound a runaway tool-call loop. */
@@ -84,9 +98,15 @@ export interface AgentRuntimeOptions {
    */
   tool_catalog?: () => ToolCatalog;
   /**
-   * Parent block under which the runtime attaches its own bookkeeping blocks
-   * (commands-only feedback, command-error blocks) when they don't yet exist.
-   * Defaults to the empty-tree root `root:root`.
+   * The actual tree ROOT the boot built (CM-4). B1 no longer writes its bookkeeping
+   * blocks into the tree itself — the boot seeds their empty placeholders via
+   * `registry.seedProjectionBlocks(has, apply, parent)` and the system builders then
+   * project runtime state onto them each render. Those seeded placeholders MUST attach
+   * under the live tree root, or they are orphaned and never render (the bookkeeping
+   * silently disappears). `registry.seedProjectionBlocks` defaults its `parent` to
+   * `core:root`, which is NOT the empty-tree root (`root:root`); so the boot must pass
+   * THIS value (exposed via the `root` getter) as the seed parent. Defaults to the
+   * empty-tree root `root:root` (matches core/block.ts boot + fixtures + index.ts).
    */
   root_name?: BlockName;
 }
@@ -94,8 +114,18 @@ export interface AgentRuntimeOptions {
 /** The block name the runtime writes commands-only rejection feedback to (§4.2). */
 export const COMMANDS_ONLY_FEEDBACK_BLOCK: BlockName = 'runtime:commands_only_feedback';
 
+/** The block name the runtime projects recent command failures into (§8.1). */
+export const COMMAND_ERROR_BLOCK: BlockName = 'runtime:command_error';
+
 /** Default root block name (matches the empty-tree boot in core/block.ts). */
 const DEFAULT_ROOT_NAME: BlockName = 'root:root';
+
+/**
+ * Upper bound on the command-error ring the runtime keeps (CM-6, INV #16). Older
+ * failures fall off the front so `recent_errors` never grows unbounded; the
+ * `runtime:command_error` projection renders them oldest→newest deterministically.
+ */
+const MAX_RECENT_COMMAND_ERRORS = 8;
 
 /**
  * The exact feedback text written when an agent emits disallowed plain text (§4.2).
@@ -125,6 +155,8 @@ export class AgentRuntime {
   private readonly ops: Operations;
   private readonly renderer: Renderer;
   private readonly provider: ModelProvider;
+  /** Registry handle (R-5): registerSystemBuilder for B1 + future get_app_context. */
+  private readonly registry: BuilderRegistry;
   private readonly max_turns_per_wake: number;
   private readonly root_name: BlockName;
   private readonly tool_catalog: (() => ToolCatalog) | undefined;
@@ -135,17 +167,55 @@ export class AgentRuntime {
   /** UI/caller subscribers on the error channel (failed turns). */
   private readonly error_listeners = new Set<ErrorListener>();
 
-  /** Set when a turn produced commands-only-violating plain text (§4.2). */
+  /**
+   * Set when a turn produced commands-only-violating plain text (§4.2). The
+   * commands-only feedback system builder PROJECTS this into the tree (B1): when
+   * non-null the block renders the feedback text, when null it renders nothing.
+   * No longer written to the tree directly (the old `upsertBookkeepingBlock` path) —
+   * this state IS the source of truth and the builder is its only reader.
+   */
   private pending_feedback: string | null = null;
+
+  /**
+   * Recent non-policy command failures, oldest→newest, bounded to
+   * `MAX_RECENT_COMMAND_ERRORS` (CM-6). The command-error system builder (B1)
+   * projects these into a SINGLE `runtime:command_error` block; like
+   * `pending_feedback` they are state, never written to the tree directly. `id` is
+   * the failing tool_call id (kept for de-dup/debuggability); `text` is the rendered
+   * line. Replaces the old per-id `runtime:command_error.<id>` tree blocks.
+   */
+  private readonly recent_errors: { id: string; text: string }[] = [];
 
   constructor(opts: AgentRuntimeOptions) {
     this.ops = opts.operations;
     this.renderer = opts.renderer;
     this.provider = opts.provider;
+    this.registry = opts.registry;
     this.spawn_depth = opts.spawn_depth ?? 0;
     this.max_turns_per_wake = opts.max_turns_per_wake ?? DEFAULT_MAX_TURNS_PER_WAKE;
     this.root_name = opts.root_name ?? DEFAULT_ROOT_NAME;
     this.tool_catalog = opts.tool_catalog;
+
+    // B1 (CM-5): register the runtime's two bookkeeping system builders AFTER all
+    // state fields exist (the builders close over `this.pending_feedback` /
+    // `this.recent_errors`). They belong to no installed App, so they go through the
+    // registry's `registerSystemBuilder` seam (F3: the registry stays the single
+    // owner of builder ownership). Once registered, `seedProjectionBlocks` will seed
+    // their output names and the Renderer projects live runtime state each turn —
+    // no runtime block is ever written to the tree directly.
+    this.registry.registerSystemBuilder(this.makeFeedbackBuilder());
+    this.registry.registerSystemBuilder(this.makeCommandErrorBuilder());
+  }
+
+  /**
+   * The live tree root the runtime's bookkeeping placeholders must be seeded under
+   * (CM-4). The boot reads this to pass as `seedProjectionBlocks`' `parent`, instead
+   * of relying on that method's `core:root` default which does not match the
+   * empty-tree root. Exposing it keeps the authoritative root in ONE place (the
+   * runtime), so the seed parent can never silently drift from the real root.
+   */
+  get root(): BlockName {
+    return this.root_name;
   }
 
   /**
@@ -413,57 +483,84 @@ export class AgentRuntime {
   }
 
   /**
-   * writeCommandsOnlyFeedback — write/overwrite the feedback block (§4.2). Written
-   * with invoker='app' via the system primitive because no App owns a command for
-   * it. Becomes the agent's input next turn so it self-corrects.
+   * writeCommandsOnlyFeedback — record a commands-only violation (§4.2). B1: this no
+   * longer writes the tree — it just sets `pending_feedback` runtime state. The
+   * feedback system builder projects that state into `runtime:commands_only_feedback`
+   * on the NEXT render, so the agent sees it and self-corrects. `async` is kept (the
+   * call site `await`s it and a future variant may do async work); the body is sync.
    */
   private async writeCommandsOnlyFeedback(): Promise<void> {
     this.pending_feedback = COMMANDS_ONLY_FEEDBACK_TEXT;
-    await this.upsertBookkeepingBlock(
-      COMMANDS_ONLY_FEEDBACK_BLOCK,
-      COMMANDS_ONLY_FEEDBACK_TEXT,
-    );
   }
 
-  /** Record a non-policy command failure as a tree block the agent can read. */
+  /**
+   * recordCommandError — record a non-policy command failure (§8.1). B1: pushes a
+   * line onto the bounded `recent_errors` ring (oldest evicted past
+   * `MAX_RECENT_COMMAND_ERRORS`, CM-6) instead of writing a per-id tree block. The
+   * command-error system builder projects the ring into the single
+   * `runtime:command_error` block next render, so the agent reads its recent failures.
+   */
   private async recordCommandError(call: ToolCall, err: unknown): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
-    const target = `runtime:command_error.${call.id}` as BlockName;
-    await this.upsertBookkeepingBlock(target, `command ${call.name} failed: ${message}`);
+    this.recent_errors.push({
+      id: call.id,
+      text: `command ${call.name} failed: ${message}`,
+    });
+    // Bound the ring: drop the oldest entries so it never grows without limit.
+    while (this.recent_errors.length > MAX_RECENT_COMMAND_ERRORS) {
+      this.recent_errors.shift();
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // B1 — bookkeeping system builders (state → block projection, no tree writes)
+  // --------------------------------------------------------------------------
+
+  /**
+   * makeFeedbackBuilder — the `runtime:commands_only_feedback` system builder (B1).
+   * It is a CLOSURE over this runtime: each render it reads `this.pending_feedback`
+   * and projects the feedback text when a violation is pending, or returns `null`
+   * (render nothing) on a clean turn. owner='system' (INV #4 — never 'agent'), no
+   * `app_id` (it reads runtime state via the closure, not an AppContext), volatile
+   * tier so it never poisons the stable cache prefix. Deterministic: identical
+   * `pending_feedback` → byte-identical block (INV #1 / #16).
+   */
+  private makeFeedbackBuilder(): BuilderManifest {
+    return {
+      name: 'runtime.commands_only_feedback',
+      version: '1.0.0',
+      owner: 'system',
+      inputs: [],
+      outputs: [COMMANDS_ONLY_FEEDBACK_BLOCK],
+      cache_tier: 'volatile',
+      build: async (ctx: BuildContext): Promise<Block | null> =>
+        this.pending_feedback === null
+          ? null
+          : projectionBlock(ctx, COMMANDS_ONLY_FEEDBACK_BLOCK, this.pending_feedback),
+    };
   }
 
   /**
-   * upsertBookkeepingBlock — set `text` on a runtime-owned block, creating it under
-   * the root if absent and updating it in place otherwise. The block id is
-   * content-addressed off its name so the choice stays deterministic (no random
-   * UUID, INV #16). Applied with invoker='app' (§9.4).
+   * makeCommandErrorBuilder — the `runtime:command_error` system builder (B1). A
+   * closure over this runtime: each render it projects the bounded `recent_errors`
+   * ring (oldest→newest, CM-6 ordering) into ONE block, or returns `null` when there
+   * are no errors. Same discipline as the feedback builder (system owner, volatile,
+   * deterministic). Replaces the old per-id `runtime:command_error.<id>` blocks.
    */
-  private async upsertBookkeepingBlock(name: BlockName, text: string): Promise<void> {
-    const op: BlockOp = this.ops.has(name)
-      ? { kind: 'update', target: name, content_text: text }
-      : {
-          kind: 'create',
-          parent: this.root_name,
-          block: {
-            id: `runtime-${name}`,
-            name,
-            children: [],
-            content_text: text,
-            content_blob: null,
-          },
-        };
-    await this.applySystemOps([op]);
-  }
-
-  /**
-   * applySystemOps — apply runtime-owned ops with invoker='app'. Both the feedback
-   * block and command-error blocks are runtime bookkeeping, not agent-initiated
-   * commands, so they go through `apply` (invoker='app', §9.4) rather than
-   * invoke_command.
-   */
-  private async applySystemOps(ops: BlockOp[]): Promise<void> {
-    const invoker: InvokerContext = { invoker: 'app' };
-    await this.ops.apply(ops, invoker);
+  private makeCommandErrorBuilder(): BuilderManifest {
+    return {
+      name: 'runtime.command_error',
+      version: '1.0.0',
+      owner: 'system',
+      inputs: [],
+      outputs: [COMMAND_ERROR_BLOCK],
+      cache_tier: 'volatile',
+      build: async (ctx: BuildContext): Promise<Block | null> => {
+        if (this.recent_errors.length === 0) return null;
+        const text = this.recent_errors.map((e) => e.text).join('\n');
+        return projectionBlock(ctx, COMMAND_ERROR_BLOCK, text);
+      },
+    };
   }
 
   /**
@@ -519,6 +616,24 @@ export class AgentRuntime {
   private stateKind(): AgentState['kind'] {
     return this.state.kind;
   }
+}
+
+/**
+ * projectionBlock — the Block a runtime bookkeeping builder renders for `name`.
+ * The id is content-addressed off the name (deterministic, no random UUID — INV #16)
+ * via the BuildContext's own substitute, so two builds with the same name yield a
+ * byte-identical block. A leaf node (no children); `content_text` carries the
+ * projected state. This is the ONLY thing the builders emit — the runtime never
+ * writes these blocks to the tree itself (B1).
+ */
+function projectionBlock(ctx: BuildContext, name: BlockName, text: string): Block {
+  return {
+    id: ctx.content_addressed_id(name),
+    name,
+    children: [],
+    content_text: text,
+    content_blob: null,
+  };
 }
 
 /**

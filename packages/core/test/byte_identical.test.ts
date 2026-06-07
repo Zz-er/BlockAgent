@@ -99,5 +99,8 @@ function buildersView(b: TestBuilderRegistry) {
     resolve_builder: () => null,
     tier_of: (name: import('../src/core/types.js').BlockName) => b.tier_of(name),
     list_builders: () => [],
+    // wave-2 BuilderRegistry adds registerSystemBuilder (R-5 / B1). This view does
+    // not exercise system builders, so it is an inert stub.
+    registerSystemBuilder: () => undefined,
   };
 }
