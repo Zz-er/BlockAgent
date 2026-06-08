@@ -54,23 +54,48 @@ To write a capability of your own, see the [usage & development docs](./doc/READ
 npm install
 ```
 
-The API key is read only from the environment — never written to config, never committed. Put a gitignored `.env` at the repo root:
+The API key is read only from the environment — never written to a config file, never committed. There are two equivalent ways to start; take either.
+
+**Option 1: command-line flags** — handiest for a quick run or switching models on the fly. Set the key in your shell and start:
 
 ```bash
-# openai-compat providers (incl. DeepSeek / DashScope) all read OPENAI_API_KEY
+export OPENAI_API_KEY=sk-your-key   # openai-compat providers (incl. DeepSeek / DashScope) all read this variable
+npm start -- --provider openai-compat --model deepseek-chat --base-url https://api.deepseek.com
+```
+
+**Option 2: `.env` + a config file** — put both the key and the model in files, and starting is just `npm start`.
+
+① Drop the API key — create a gitignored `.env` at the repo root; it's loaded automatically at startup (and overrides shell variables of the same name):
+
+```bash
+# .env (repo root, ignored by .gitignore)
+# Note: openai-compat providers (incl. DeepSeek / DashScope) all read OPENAI_API_KEY
 OPENAI_API_KEY=sk-your-key
 ```
 
-Pick a model and start:
+② Pick DeepSeek — create `block-agent.config.json` at the repo root (also gitignored):
+
+```json
+{
+  "provider": {
+    "kind": "openai-compat",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com",
+    "thinking_format": "openai_reasoning"
+  }
+}
+```
+
+③ Run:
 
 ```bash
-npm start -- --provider openai-compat --model deepseek-chat --base-url https://api.deepseek.com
+npm start
 
 # No key, just want to see it run (offline, no network):
 npm start -- --dry-run
 ```
 
-You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help`, `/apps`). You can also pin configuration in `block-agent.config.json` at the repo root; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
+You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help` for the full list, `/apps` for the modules). The two ways mix freely; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
 
 ## What it buys you
 
