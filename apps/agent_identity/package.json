@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "license": "MIT",
-  "$exports_note": "Mirrors @block-agent/core / memory-letta: exports point at .ts SOURCE (no build step). Importers use '@block-agent/app-agent_identity/manifest.js'; NodeNext resolves it to ./src/manifest.ts via the workspace symlink. tsx runs the same source directly.",
+  "$exports_note": "Mirrors @block-agent/core / app-memory_letta: exports point at .ts SOURCE (no build step). Importers use '@block-agent/app-agent_identity/manifest.js'; NodeNext resolves it to ./src/manifest.ts via the workspace symlink. tsx runs the same source directly.",
   "exports": {
     "./*": "./src/*"
   },

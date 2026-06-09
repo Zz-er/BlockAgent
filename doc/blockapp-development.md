@@ -44,7 +44,7 @@ import type {
 } from '../app/types.js';            // 注意 NodeNext 要求 .js 扩展名
 import type { Block, BlockName, InvokerContext } from '../core/types.js';
 
-// app 在独立 npm 包内（像 packages/memory-letta，跨包）：
+// app 在独立 npm 包内（像 apps/memory_letta，跨包）：
 import type {
   AppManifest, AppContext, BuildContext, BuilderManifest,
   CommandManifest, CommandResult, JsonSchema,

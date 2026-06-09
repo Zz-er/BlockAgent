@@ -3,11 +3,11 @@
  * (architect-owned; single-writer seam for the two memory apps).
  *
  * This module is the one thing the built-in `memory` app (apps/memory.ts, in core) and
- * the external `memory_letta` app (packages/memory-letta, out-of-tree) BOTH depend on.
+ * the external `memory_letta` app (apps/memory_letta, out-of-tree) BOTH depend on.
  * It declares:
  *   1. `MemoryStore` — the narrow, passive storage backend contract (§6.4 "one Store
  *      interface + two bindings"): `JsonlMemoryStore` (in-process, in core) and
- *      `LettaMemoryStore` (out-of-process, by-value proxy, in packages/memory-letta).
+ *      `LettaMemoryStore` (out-of-process, by-value proxy, in apps/memory_letta).
  *   2. `MemoryRecord` / `MemoryProvenance` / `MemoryQuery` — the data shapes that cross
  *      that seam.
  *   3. `scanMemoryContent` (H1) — the write-injection / exfiltration scanner BOTH apps
@@ -111,7 +111,7 @@ export interface MemoryQuery {
  * TWO BINDINGS (§6.4 "one interface, two bindings"):
  *   - `JsonlMemoryStore`  — in-process, JSONL-backed, in @block-agent/core (apps/memory.ts).
  *     Zero dependency; calls are plain method calls (no copy needed for the app's own store).
- *   - `LettaMemoryStore`  — out-of-process Letta proxy, in packages/memory-letta. Crosses
+ *   - `LettaMemoryStore`  — out-of-process Letta proxy, in apps/memory_letta. Crosses
  *     an UNTRUSTED boundary, so `query`/`load` results are deep copies (by-value, INV #18),
  *     and `query` honors the `limit` cap (P3). The embedding/vector work lives entirely in
  *     the Letta server (DR-M3 / DR-21): this interface carries NO vector, NO embedder.
@@ -330,8 +330,8 @@ export function fenceRecalledContent(body: string): string {
 //       never the repo's real .block-agent), the messages.ts/tools.ts test pattern.
 //
 // ── impl-letta (task #4) ───────────────────────────────────────────────────
-//   OWNS  packages/memory-letta/* (NEW package) + its tests
-//     - package.json: name @block-agent/memory-letta, deps { "@letta-ai/letta-client",
+//   OWNS  apps/memory_letta/* + its tests
+//     - package.json: name @block-agent/app-memory_letta, deps { "@letta-ai/letta-client",
 //       "@block-agent/core": "*" }; the Letta SDK dependency lives ONLY here — it never
 //       enters @block-agent/core (DR-M4). tsconfig mirrors the cli package (NodeNext,
 //       strict, .js import extensions, verbatimModuleSyntax). Lazy-import the SDK inside

@@ -703,7 +703,7 @@ Independently verified green by the architect (full re-run).
   DR-21), four projection blocks `memory:pinned`(stable)/`memory:notes`(slow_changing)/
   `memory:user`(slow_changing)/`memory:recalled`(volatile, provenance-fenced). Commands
   remember/recall/pin/unpin/forget/set_config(user-only). 41 tests.
-- **`memory_letta` package** (impl-letta): NEW `packages/memory-letta/` — `LettaMemoryStore
+- **`memory_letta` app** (impl-letta): `apps/memory_letta/` — `LettaMemoryStore
   implements MemoryStore` wrapping `@letta-ai/letta-client` (lazy-imported, DR-M4), and the
   `memory_letta` app (`memory_letta:core` slow_changing / `:recalled` volatile; commands
   remember/recall/set_block[read_only refused]/set_config[user-only]). Semantic recall +
@@ -712,13 +712,13 @@ Independently verified green by the architect (full re-run).
 - **Integration** (architect): `packages/cli` `types.ts`(+`MemoryConfig`/`MemoryLettaConfig`)
   / `config.ts`(+`resolveMemory` enabled-by-default, `resolveMemoryLetta` DISABLED-by-default,
   `LETTA_BASE_URL` via config/env) / `launch.ts`(install both per config; `memory` via
-  `seedProjectionBlocks` like tools; `memory_letta` import from `@block-agent/memory-letta`,
-  core never imports it). cli `package.json` +`@block-agent/memory-letta` workspace dep;
-  memory-letta `package.json` +`exports` map (mirrors core's `./*`→`./src/*` source map).
+  `seedProjectionBlocks` like tools; `memory_letta` import from `@block-agent/app-memory_letta`,
+  core never imports it). cli `package.json` +`@block-agent/app-memory_letta` workspace dep;
+  app-memory_letta `package.json` +`exports` map (mirrors core's `./*`→`./src/*` source map).
 
 ### ② Verification (all EXIT 0)
 - `npm run typecheck` (all 3 workspaces) → 0.
-- core **167** · memory-letta **44** · cli **28** (launch.test +1: memory app installed +
+- core **167** · memory_letta **44** · cli **28** (launch.test +1: memory app installed +
   `memory.remember`/`memory.recall` in tool_catalog, `memory.set_config` filtered as user-only).
 - **Dependency isolation held**: `npm ls --omit=dev -w @block-agent/core` → closure is core
   only (no Letta); core source has NO `@letta-ai` import (only the string "Letta" in
@@ -802,7 +802,7 @@ verified green by the architect (full re-run).
 
 ### ② Verification (all EXIT 0)
 - `npm run typecheck` (all 3 workspaces) → 0.
-- core **181** (+14 app_lifecycle) · cli **58** (+30 app_lifecycle) · memory-letta **44** = 283.
+- core **181** (+14 app_lifecycle) · cli **58** (+30 app_lifecycle) · memory_letta **44** = 283.
 - **Dependency isolation held**: `npm ls --omit=dev -w @block-agent/core` → core-only closure.
 - **Headless hot-uninstall smoke** (`--dry-run`, temp storage): boot with tools enabled →
   `agent.hotUninstall('tools')` → ALL 11 assertions PASS: tools dropped from registry,

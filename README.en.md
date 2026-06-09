@@ -103,11 +103,11 @@ Flexible, because modules bind to contracts rather than identities. Safe, becaus
 
 ## Layout & docs
 
-`packages/core` (runtime + built-in modules, zero runtime dependencies) · `packages/cli` (the interactive terminal) · `packages/memory-letta` (external-memory integration, dependency-isolated) · `doc/` ([usage & development docs](./doc/README.md)). Stack: Node 24 · TypeScript · vitest.
+`packages/core` (runtime + built-in modules, zero runtime dependencies) · `packages/cli` (the interactive terminal) · `apps/*` (built-in BlockApps, including `apps/memory_letta` for dependency-isolated external-memory integration) · `doc/` ([usage & development docs](./doc/README.md)). Stack: Node 24 · TypeScript · vitest.
 
 ## Status
 
-In place: the core loop, the built-in modules, the interactive terminal, module discovery and (un)installation (including hot-uninstall), contract-based collaboration between modules (declared interfaces + a pre-render pull by contract), and external semantic-memory integration (verified against a live Letta / DashScope). Tests green: core 274 · cli 88 · memory-letta 44.
+In place: the core loop, the built-in modules, the interactive terminal, module discovery and (un)installation (including hot-uninstall), contract-based collaboration between modules (declared interfaces + a pre-render pull by contract), and external semantic-memory integration (verified against a live Letta / DashScope). Tests green: core 274 · cli 88 · memory_letta 44.
 
 ## License
 

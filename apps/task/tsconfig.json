@@ -1,5 +1,5 @@
 {
-  "$comment": "Mirrors packages/memory-letta: NodeNext/strict/.js extensions. Single-direction dependency on @block-agent/core via workspace symlink + NodeNext resolution. Build-free dev (no tsc -b step).",
+  "$comment": "Mirrors the app workspace pattern: NodeNext/strict/.js extensions. Single-direction dependency on @block-agent/core via workspace symlink + NodeNext resolution. Build-free dev (no tsc -b step).",
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": ".",
