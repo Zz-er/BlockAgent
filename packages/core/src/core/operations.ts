@@ -103,6 +103,10 @@ export class Operations implements OperationsContract {
     const policy = new PolicyEngine({
       capability_resolver: (full_name) => declared_capabilities(deps.registry, full_name),
       allowed_invokers_resolver: (full_name) => declared_allowed_invokers(deps.registry, full_name),
+      // Authoritative sandboxed-lane input (UH-2 §3.8): resolve the owning App's
+      // declared trust so an untrusted App is gated by the tightened row even if a
+      // caller forgets to stamp InvokerContext.trust (fail-closed).
+      trust_resolver: (full_name) => deps.registry.trust_of(full_name),
     });
     return new Operations(deps.tree, policy, deps.registry);
   }
@@ -174,8 +178,46 @@ export class Operations implements OperationsContract {
     // A command may report its own failure; if so, do NOT apply its ops.
     if (!result.ok) return { status: 'ok', result };
 
-    // (4) apply the authorized ops to the tree as one logical change (rolls back
-    //     on a bad op rather than leaving a half-applied tree).
+    // (3.5) For a SANDBOXED command, RE-GATE the ops it actually RETURNED, per op
+    //     (UH-2 §3.8). The check at (1) only authorized the command by its DECLARED
+    //     capabilities (full_name → resolver). The ops a command returns are its real
+    //     write, and for an untrusted app "declared" is not trustworthy: it can
+    //     declare only `block:write` yet return a physical-delete / pinned-modify /
+    //     credential op — the cap-set check at (1) never sees it. So for a sandboxed
+    //     command we re-check every returned op under its own `core.*` primitive name,
+    //     the same gate `apply()` uses, BEFORE touching the tree. This turns the
+    //     "declared" gate into a "behavior" gate (closes the result.ops bypass).
+    //
+    //     Scope: ONLY when the owning command resolves to `sandboxed` (the stricter
+    //     of registry trust and any caller stamp). A trusted app, the agent, and the
+    //     user keep the EXACT prior path — no per-op re-check, no added cost or blast
+    //     radius — because for them "declared = behavior" is a trusted assumption
+    //     (the agent's own ops are already gated at (1)/(2) by its row).
+    //
+    //     Trust threading: the op names are reserved `core.*` primitives with NO
+    //     owning app, so `trust_of('core.delete')` is undefined — a per-op check
+    //     keyed off the op name alone would drop the sandboxed floor. We stamp the
+    //     resolved `sandboxed` trust onto the per-op ctx so the sandboxed row +
+    //     structural floor (physical/pinned/cred) apply to the ops exactly as if the
+    //     command itself had declared them.
+    if (
+      result.ops &&
+      result.ops.length > 0 &&
+      this.policy.effective_trust_for(full_name, ctx) === 'sandboxed'
+    ) {
+      const op_ctx: InvokerContext = { ...ctx, trust: 'sandboxed' };
+      for (const op of result.ops) {
+        const decision = this.policy.check(
+          { full_name: primitive_for(op), args: op_policy_args(op) },
+          op_ctx,
+        );
+        if (decision.kind === 'deny') return { status: 'denied', reason: decision.reason };
+        if (decision.kind === 'pending') return { status: 'pending', token: decision.token };
+      }
+    }
+
+    // (4) apply the (now per-op authorized) ops to the tree as one logical change
+    //     (rolls back on a bad op rather than leaving a half-applied tree).
     if (result.ops && result.ops.length > 0) {
       try {
         this.tree.applyOps(result.ops);

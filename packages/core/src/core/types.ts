@@ -215,6 +215,18 @@ export interface InvokerContext {
   invoker: 'user' | 'agent' | 'app';
   /** Authenticated identity, set by the entry-membrane ChannelAdapter. */
   identity?: string;
+  /**
+   * Trust level of the invoking principal, stamped by the entry membrane from the
+   * app manifest's `trust` field (UH-2 §3.8). Absent ⇒ `'trusted'`: every existing
+   * caller (user/agent/in-process trusted app) keeps its current treatment, so this
+   * is purely additive (zero regression). The PolicyEngine only diverges when an
+   * `invoker:'app'` arrives carrying `trust:'sandboxed'` — then it routes through
+   * the tightened sandboxed row instead of the full-trust `app` row. The
+   * `ChildProcessHost`, which bridges untrusted cross-process apps, MUST stamp
+   * `{ invoker:'app', trust:'sandboxed' }` so it cannot reclaim the app lane's full
+   * grants.
+   */
+  trust?: 'trusted' | 'sandboxed';
 }
 
 /**

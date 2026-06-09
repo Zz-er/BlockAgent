@@ -39,6 +39,7 @@ import type {
   RenderedPrompt,
 } from '../src/core/types.js';
 import type {
+  AppTrust,
   BuildContext,
   BuilderManifest,
   BuilderRegistry,
@@ -92,6 +93,17 @@ export class TestCommandRegistry implements CommandRegistry {
 
   resolve_command(full_name: string): CommandManifest | null {
     return this.commands.get(full_name) ?? null;
+  }
+
+  /**
+   * CommandRegistry.trust_of (UH-2 §3.8): this fixture does not model per-App trust,
+   * so it reports `undefined` ("no authored sandboxed floor") for every command —
+   * the engine treats that as `'trusted'`, preserving the fixtures' prior full-trust
+   * `app` behavior. A test that needs the sandboxed lane stamps
+   * `InvokerContext.trust` directly (see policy_ceiling.test.ts).
+   */
+  trust_of(): AppTrust | undefined {
+    return undefined;
   }
 
   async route(

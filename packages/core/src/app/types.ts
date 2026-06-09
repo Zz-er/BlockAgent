@@ -520,6 +520,17 @@ export interface CommandRegistry {
   /** Look up a command's manifest by full name; null if unknown. */
   resolve_command(full_name: string): CommandManifest | null;
   /**
+   * Resolve the AUTHORED trust of the App that owns a command (`<app_id>.<cmd>`),
+   * straight from its `AppManifest.trust` (UH-2 §3.8). The PolicyEngine consults
+   * this so the sandboxed/full-trust lane decision is keyed off the App's OWN
+   * declaration — not off whether a caller remembered to stamp
+   * `InvokerContext.trust` — making the capability ceiling fail-closed. Returns the
+   * owning App's `trust` (or `undefined`/`'trusted'` when the App declared none, or
+   * when the command is unknown — the default). Pure + O(1) (a map lookup), so the
+   * engine stays IO-free (INV #19) and core never imports the registry class.
+   */
+  trust_of(full_name: string): AppTrust | undefined;
+  /**
    * Execute an already-authorized command, dispatching to its owning App's
    * AppContext. Returns the command's result (ops + data). Implementations must
    * assume the PolicyEngine has already allowed this call.
