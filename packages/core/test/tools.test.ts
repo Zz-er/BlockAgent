@@ -43,7 +43,7 @@ import {
   TOOLS_APP_ID,
   ToolsApp,
   type ToolsState,
-} from '../src/apps/tools.js';
+} from '@block-agent/app-tools/manifest.js';
 
 // ---------------------------------------------------------------------------
 // Harness: install tools (temp storage) into a real registry + policy, and

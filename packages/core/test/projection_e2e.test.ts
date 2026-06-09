@@ -24,8 +24,8 @@ import { BlockTree } from '../src/core/block.js';
 import { Operations } from '../src/core/operations.js';
 import { Renderer } from '../src/core/renderer.js';
 import { AppRegistry } from '../src/app/registry.js';
-import { MessagesApp, RECENT_BLOCK as MSG_RECENT } from '../src/apps/messages.js';
-import { ToolsApp, RECENT_BLOCK as TOOLS_RECENT } from '../src/apps/tools.js';
+import { MessagesApp, RECENT_BLOCK as MSG_RECENT } from '@block-agent/app-messages/manifest.js';
+import { ToolsApp, RECENT_BLOCK as TOOLS_RECENT } from '@block-agent/app-tools/manifest.js';
 import {
   makeAgentIdentityApp,
   BLOCK_IDENTITY,

@@ -48,7 +48,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 
-import type { Block, BlockName, InvokerContext, WakeEvent } from '../core/types.js';
+import type { Block, BlockName, InvokerContext, WakeEvent } from '@block-agent/core/core/types.js';
 import type {
   AppContext,
   AppManifest,
@@ -58,8 +58,8 @@ import type {
   CommandManifest,
   CommandResult,
   JsonSchema,
-} from '../app/types.js';
-import { APPS_DIR, readAppConfig } from './_app_config.js';
+} from '@block-agent/core/app/types.js';
+import { APPS_DIR, readAppConfig } from '@block-agent/core/apps/_app_config.js';
 
 // ============================================================================
 // Identity & block names

@@ -25,7 +25,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AppRegistry } from '../src/app/registry.js';
 import { BlockTree } from '../src/core/block.js';
 import { Operations } from '../src/core/operations.js';
-import { StatsApp, STATS_SUMMARY_BLOCK, type StatsState } from '../src/apps/stats.js';
+import { StatsApp, STATS_SUMMARY_BLOCK, type StatsState } from '@block-agent/app-stats/manifest.js';
 import type { Block, InvokerContext } from '../src/core/types.js';
 import type { AppContext, BuildContext, BuilderManifest } from '../src/app/types.js';
 

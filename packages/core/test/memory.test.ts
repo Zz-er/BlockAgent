@@ -32,7 +32,7 @@ import {
   RECALLED_BLOCK,
   type MemoryEntry,
   type MemoryState,
-} from '../src/apps/memory.js';
+} from '@block-agent/app-memory/manifest.js';
 import { MEMORY_CONTEXT_OPEN, MEMORY_CONTEXT_CLOSE } from '../src/apps/memory_store.js';
 
 // ---------------------------------------------------------------------------

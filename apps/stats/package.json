@@ -1,0 +1,35 @@
+{
+  "name": "@block-agent/app-stats",
+  "version": "1.0.0",
+  "description": "stats BlockApp: a pure consumer that folds message_count + task_count into a one-line overview (default-disabled; end-to-end contract verifier).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-stats/manifest.js'.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "stats",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": false,
+    "summary": "概览：按契约汇总消息数与待办数，默认隐藏。",
+    "provides": [],
+    "consumes": ["message_count", "task_count"],
+    "requires": null
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
