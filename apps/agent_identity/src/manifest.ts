@@ -1,5 +1,5 @@
 /**
- * apps/agent_identity.ts — the `agent_identity` BlockApp (impl-identity owned).
+ * apps/agent_identity — the `agent_identity` BlockApp.
  *
  * Pins the agent's identity + operating constraints at the very FRONT of the
  * prompt's stable segment, so every turn's cache prefix carries them (§6.1, §4.6,
@@ -18,19 +18,24 @@
  *   - one builder `IdentityBlockBuilder` (owner `system`) → block
  *     `agent_identity:identity`, cache_tier `stable` (renders first, U-shape head).
  *
+ * Trust/host (unified-host UH-1): a trusted, in-process app (the manifest omits
+ * `trust`, so it defaults to `'trusted'` → `host:'in-process'`). It writes its own
+ * deterministic builder; it is NOT a sandboxed/declarative-projection app.
+ *
+ * Migration note (apps-folder UH-1): this App moved out of `@block-agent/core` into
+ * its own workspace `@block-agent/app-agent_identity` (the unified `apps/` layout,
+ * VSCode `extensions/`-style). Its only edit vs the in-core version is the two
+ * import lines now resolving `@block-agent/core/*` instead of relative `../*`.
+ *
  * House style (§0.5): block-world nouns get the `Block` prefix
  * (`IdentityBlockBuilder`); the extension unit is a BlockApp whose satellites stay
- * short (`AppManifest`/`AppContext`). Block name uses a COLON (`agent_identity:identity`);
- * the §6.1 path `/identity/agent_identity` maps to this namespaced name.
+ * short (`AppManifest`/`AppContext`). Block name uses a COLON (`agent_identity:identity`).
  *
  * Determinism (INV #1 / #16): `build` is a pure function of App state — no clock,
- * no random, no env. The same state renders byte-identical bytes every turn, which
- * is exactly what keeps the stable cache prefix hot.
- *
- * Authoritative design: ai_com/block-agent-architecture-v3.1.md §6.1 / §4.6 / §10.
+ * no random, no env. The same state renders byte-identical bytes every turn.
  */
 
-import type { Block, BlockName, InvokerContext } from '../core/types.js';
+import type { Block, BlockName, InvokerContext } from '@block-agent/core/core/types.js';
 import type {
   AppContext,
   AppManifest,
@@ -39,7 +44,7 @@ import type {
   CommandManifest,
   CommandResult,
   JsonSchema,
-} from '../app/types.js';
+} from '@block-agent/core/app/types.js';
 
 // ============================================================================
 // State
