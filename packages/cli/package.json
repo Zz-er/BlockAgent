@@ -25,7 +25,7 @@
     "@block-agent/app-memory": "*",
     "@block-agent/app-task": "*",
     "@block-agent/app-stats": "*",
-    "@block-agent/memory-letta": "*",
+    "@block-agent/app-memory_letta": "*",
     "ink": "^5.1.0",
     "react": "^18.3.1"
   },

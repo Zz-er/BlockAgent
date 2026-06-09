@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [core, cli, memory-letta]
+        package: [core, cli, app-memory_letta]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +36,29 @@ jobs:
 
       - name: Test
         run: npm run test -w @block-agent/${{ matrix.package }}
+
+  apps-typecheck:
+    # The 6 trusted built-in apps under apps/ (UH-1 layout) have no own tests
+    # (`test` is `--passWithNoTests`); core/cli give them transitive typecheck, but this
+    # job typechecks every workspace directly so a broken app surfaces on its own. One
+    # job over all workspaces (--workspaces --if-present) — cheaper than a job per app.
+    name: apps typecheck (all workspaces)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install (workspace root)
+        run: npm ci
+
+      - name: Typecheck all workspaces
+        run: npm run typecheck --workspaces --if-present
 
   core-closure-check:
     # core must stay runtime-dependency-free (architectural invariant: Letta/Ink/React never enter core).
@@ -64,7 +87,7 @@ jobs:
           # that 'letta' never appears anywhere in the closure.
           npm ls --omit=dev -w @block-agent/core
           if npm ls --omit=dev -w @block-agent/core 2>&1 | grep -qi 'letta'; then
-            echo "::error::core runtime closure contains 'letta' — Letta SDK must stay isolated in packages/memory-letta."
+            echo "::error::core runtime closure contains 'letta' — Letta SDK must stay isolated in apps/memory_letta."
             exit 1
           fi
           echo "ok: core runtime closure is clean."
