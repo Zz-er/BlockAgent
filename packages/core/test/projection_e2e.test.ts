@@ -30,7 +30,7 @@ import {
   makeAgentIdentityApp,
   BLOCK_IDENTITY,
   type IdentityState,
-} from '../src/apps/agent_identity.js';
+} from '@block-agent/app-agent_identity/manifest.js';
 import type { Block, BlockName, InvokerContext } from '../src/core/types.js';
 
 const USER: InvokerContext = { invoker: 'user', identity: 'kendrick' };

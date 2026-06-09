@@ -30,7 +30,7 @@ import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
 import { MockProvider } from '@block-agent/core/provider/mock.js';
-import { makeAgentIdentityApp } from '@block-agent/core/apps/agent_identity.js';
+import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
 import { MessagesApp } from '@block-agent/core/apps/messages.js';
 import { ToolsApp } from '@block-agent/core/apps/tools.js';
 import { MemoryApp } from '@block-agent/core/apps/memory.js';
@@ -40,7 +40,7 @@ import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
-import type { IdentityState } from '@block-agent/core/apps/agent_identity.js';
+import type { IdentityState } from '@block-agent/app-agent_identity/manifest.js';
 import type { LauncherConfig, LaunchedAgent, ProviderKind, HotUninstallResult } from './types.js';
 import { MISSING_PROVIDER_KEY_CODE } from './types.js';
 

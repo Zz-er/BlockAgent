@@ -23,7 +23,7 @@ import {
   makeAgentIdentityApp,
   BLOCK_IDENTITY,
   type IdentityState,
-} from '../src/apps/agent_identity.js';
+} from '@block-agent/app-agent_identity/manifest.js';
 import type { Block, BlockName, BlockSnapshot, InvokerContext } from '../src/core/types.js';
 import type { AppContext, BuildContext } from '../src/app/types.js';
 

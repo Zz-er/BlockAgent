@@ -1,0 +1,36 @@
+{
+  "name": "@block-agent/app-agent_identity",
+  "version": "1.0.0",
+  "description": "agent_identity BlockApp: pins the agent's identity + operating constraints at the head of the stable cache prefix; user-only `set` (anti-jailbreak).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "Mirrors @block-agent/core / memory-letta: exports point at .ts SOURCE (no build step). Importers use '@block-agent/app-agent_identity/manifest.js'; NodeNext resolves it to ./src/manifest.ts via the workspace symlink. tsx runs the same source directly.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "agent_identity",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": true,
+    "summary": "agent 的身份与操作约束；user-only set，agent 改不了自己（防越狱）。",
+    "provides": [],
+    "requires": null
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

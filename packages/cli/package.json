@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@block-agent/core": "*",
+    "@block-agent/app-agent_identity": "*",
     "@block-agent/memory-letta": "*",
     "ink": "^5.1.0",
     "react": "^18.3.1"
