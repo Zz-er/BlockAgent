@@ -36,7 +36,7 @@ import { ToolsApp } from '@block-agent/app-tools/manifest.js';
 import { MemoryApp } from '@block-agent/app-memory/manifest.js';
 import { TaskApp } from '@block-agent/app-task/manifest.js';
 import { StatsApp } from '@block-agent/app-stats/manifest.js';
-import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
+import { MemoryLettaApp } from '@block-agent/app-memory_letta/memory_letta_app.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
@@ -322,7 +322,7 @@ function installEnabledApps(
     registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
   }
   // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
-  // @block-agent/memory-letta — core never imports it (DR-M4). base_url comes from
+  // @block-agent/app-memory_letta — core never imports it (DR-M4). base_url comes from
   // config; the API key is read from LETTA_API_KEY env inside the store, never here.
   if (config.apps.memory_letta.enabled) {
     const lettaOpts =
