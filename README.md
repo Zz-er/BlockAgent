@@ -103,11 +103,11 @@ npm start -- --dry-run
 
 ## 结构与文档
 
-`packages/core`（核心 + 内置模块，零运行时依赖）· `packages/cli`（交互式终端）· `packages/memory-letta`（外部记忆对接，依赖隔离）· `doc/`（[使用与开发文档](./doc/README.md)）。技术栈：Node 24 · TypeScript · vitest。
+`packages/core`（核心 + 内置模块，零运行时依赖）· `packages/cli`（交互式终端）· `apps/*`（内置 BlockApp，含 `apps/memory_letta` 外部记忆对接、依赖隔离）· `doc/`（[使用与开发文档](./doc/README.md)）。技术栈：Node 24 · TypeScript · vitest。
 
 ## 状态
 
-已实现：核心闭环、内置模块、交互式终端、模块的发现与装卸（含热卸载）、模块间按契约协作（声明接口 + 每轮渲染前按契约取数）、外部语义记忆对接（真实 Letta / 百炼 DashScope 跑通）。测试全绿：core 274 · cli 88 · memory-letta 44。
+已实现：核心闭环、内置模块、交互式终端、模块的发现与装卸（含热卸载）、模块间按契约协作（声明接口 + 每轮渲染前按契约取数）、外部语义记忆对接（真实 Letta / 百炼 DashScope 跑通）。测试全绿：core 274 · cli 88 · memory_letta 44。
 
 ## License
 
