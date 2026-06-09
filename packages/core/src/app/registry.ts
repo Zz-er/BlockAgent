@@ -32,6 +32,7 @@ import type {
   AppEvent,
   AppManifest,
   AppRegistry as AppRegistryContract,
+  AppTrust,
   Builder,
   BuilderManifest,
   BuilderRegistry,
@@ -44,18 +45,32 @@ import type {
   TokenBudget,
 } from './types.js';
 import type { ContractDef } from './contracts.js';
+import { effectiveTrust } from './host.js';
 
 // ============================================================================
 // Capability ceiling (INV #19 — O(1) set-membership, injected seam)
 // ============================================================================
 
 /**
- * Trust level of an App's authorship — drives the capability ceiling. v1 only
- * ever produces 'trusted' (built-in + audited npm packages installed in-process,
- * the only form v1 supports). 'agent_authored' is reserved for the follow-up
- * out-of-process sandbox lane (§5b) and never appears in v1.
+ * Trust level of an App's authorship — drives the capability ceiling. `'trusted'`
+ * is the built-in + audited in-process lane (the ceiling is the full capability
+ * set; built-ins all pass). `'agent_authored'` is the untrusted cross-process
+ * sandbox lane (UH-2, §5b / §3.8): its ceiling EXCLUDES the escalation caps
+ * (cred:read_blob / block:delete_physical / block:modify_pinned), so a sandboxed
+ * App that declares one is REJECTED at install (no longer report-only).
  */
 export type AppTrustLevel = 'trusted' | 'agent_authored';
+
+/**
+ * Map a manifest's `AppTrust` (`'trusted'|'sandboxed'`) to the authorship
+ * `AppTrustLevel` (`'trusted'|'agent_authored'`) the ceiling reasons about: a
+ * `sandboxed` (untrusted, cross-process) App is `agent_authored`; everything else
+ * (including an absent trust) is `trusted`. Centralized so the one place that wires
+ * the two trust vocabularies together is auditable (UH-2 §3.8).
+ */
+function ceilingTrustLevel(trust: AppTrust | undefined): AppTrustLevel {
+  return effectiveTrust(trust) === 'sandboxed' ? 'agent_authored' : 'trusted';
+}
 
 // ============================================================================
 // Errors (§5.2 / DR-25)
@@ -83,6 +98,26 @@ export class AppManifestError extends Error {
   constructor(message: string, readonly app_id: string) {
     super(`AppManifestError[${app_id}]: ${message}`);
     this.name = 'AppManifestError';
+  }
+}
+
+/**
+ * Thrown by install() when an UNTRUSTED (sandboxed / `agent_authored`) App declares
+ * a capability outside its ceiling (UH-2 §3.8 — the ceiling is now REAL, not
+ * report-only). A trusted App never trips this (its ceiling is the full set); the
+ * destructive trio (cred:read_blob / block:delete_physical / block:modify_pinned)
+ * is exactly what the sandboxed ceiling excludes and what makes the install fail
+ * closed — an untrusted App that asks for escalation does not load at all.
+ */
+export class AppCapabilityCeilingError extends Error {
+  constructor(
+    message: string,
+    readonly app_id: string,
+    /** The declared capability names that fell outside the ceiling. */
+    readonly violations: readonly string[],
+  ) {
+    super(`AppCapabilityCeilingError[${app_id}]: ${message}`);
+    this.name = 'AppCapabilityCeilingError';
   }
 }
 
@@ -343,16 +378,30 @@ export class AppRegistry
 
     const instance = this.instantiate(installed_id, manifest, warnings);
 
-    // Capability ceiling check (INV #19 — report-only in v1; seam built for future
-    // agent_authored lane to tighten to reject). Skipped when ceiling_resolver is
-    // not injected, so all existing tests are unaffected.
+    // Capability ceiling check (INV #19 — UH-2 §3.8 made it REAL). We resolve the
+    // ceiling against the manifest's ACTUAL authorship trust (not a hardcoded
+    // 'trusted'): a `sandboxed` manifest maps to `agent_authored`, whose ceiling
+    // excludes the escalation trio. Enforcement is split by trust:
+    //   - trusted     → report-only (warnings). Built-in apps' ceiling is the full
+    //                   set, so they never even trip a warning; the channel stays
+    //                   for an auditable trusted-app cap surface.
+    //   - agent_authored (sandboxed) → REJECT: any out-of-ceiling cap throws
+    //                   AppCapabilityCeilingError, so an untrusted App that asks for
+    //                   escalation does not load at all (fail-closed, §3.8). The
+    //                   throw fires BEFORE apps.set/indexBuilders below, so a
+    //                   rejected install leaves zero registry/index state behind.
+    // Skipped entirely when ceiling_resolver is not injected (current behavior
+    // preserved → existing tests unaffected).
     if (this.ceiling_resolver) {
-      const allowed = this.ceiling_resolver('trusted'); // v1: all apps are 'trusted'
+      const level = ceilingTrustLevel(manifest.trust);
+      const allowed = this.ceiling_resolver(level);
+      const violations: string[] = [];
       for (const cmd of instance.commands.values()) {
         for (const cap of cmd.capabilities ?? []) {
           if (!allowed.has(cap.name)) {
+            violations.push(cap.name);
             warnings.push(
-              `App '${installed_id}' command '${cmd.name}' declares capability '${cap.name}' outside the ceiling (report-only)`,
+              `App '${installed_id}' command '${cmd.name}' declares capability '${cap.name}' outside the ${level} ceiling`,
             );
           }
         }
@@ -360,11 +409,19 @@ export class AppRegistry
       for (const builder of instance.builders) {
         for (const cap of builder.capabilities ?? []) {
           if (!allowed.has(cap.name)) {
+            violations.push(cap.name);
             warnings.push(
-              `App '${installed_id}' builder '${builder.name}' declares capability '${cap.name}' outside the ceiling (report-only)`,
+              `App '${installed_id}' builder '${builder.name}' declares capability '${cap.name}' outside the ${level} ceiling`,
             );
           }
         }
+      }
+      if (level !== 'trusted' && violations.length > 0) {
+        throw new AppCapabilityCeilingError(
+          `untrusted app declares capability(ies) outside its ceiling: ${[...new Set(violations)].join(', ')}`,
+          installed_id,
+          violations,
+        );
       }
     }
 
@@ -774,6 +831,22 @@ export class AppRegistry
   resolve_command(full_name: string): CommandManifest | null {
     const { app_id, command } = splitCommandName(full_name);
     return this.apps.get(app_id)?.commands.get(command) ?? null;
+  }
+
+  /**
+   * Resolve the AUTHORED trust of the App that owns a command (UH-2 §3.8). The
+   * PolicyEngine consults this (via the injected `trust_resolver`) so the
+   * sandboxed/full-trust lane is keyed off the App's OWN `manifest.trust` — the
+   * authoritative floor — rather than off whether a caller remembered to stamp
+   * `InvokerContext.trust`. That makes the ceiling fail-closed: an untrusted App is
+   * gated even if the stamp is forgotten or forged. Returns the owning App's `trust`
+   * (or `undefined` when the App declared none, or the command is unknown — both
+   * mean "no sandboxed floor from the registry", and the engine treats undefined as
+   * `'trusted'`). Pure + O(1) (a map lookup), keeping the engine IO-free (INV #19).
+   */
+  trust_of(full_name: string): AppTrust | undefined {
+    const { app_id } = splitCommandName(full_name);
+    return this.apps.get(app_id)?.manifest.trust;
   }
 
   /**

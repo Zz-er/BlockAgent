@@ -22,9 +22,9 @@ import { join } from 'node:path';
 
 import { BlockTree } from '@block-agent/core/core/block.js';
 import { Operations } from '@block-agent/core/core/operations.js';
-import { PolicyEngine } from '@block-agent/core/core/policy.js';
+import { PolicyEngine, CAP } from '@block-agent/core/core/policy.js';
 import { Renderer } from '@block-agent/core/core/renderer.js';
-import { AppRegistry } from '@block-agent/core/app/registry.js';
+import { AppRegistry, type AppTrustLevel } from '@block-agent/core/app/registry.js';
 import { MESSAGE_COUNT, TASK_COUNT } from '@block-agent/core/app/contracts.js';
 import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_runtime.js';
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
@@ -119,6 +119,17 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    install share this ONE mapping (no second wiring path to drift, design §6.3).
   const registry = new AppRegistry();
 
+  // 2-ceiling) Inject the REAL capability ceiling (UH-2 §3.8 — prerequisite-2). The
+  //   resolver maps an authorship trust LEVEL to the capability NAMES that level may
+  //   declare; install() checks every declared cap against it and, for an untrusted
+  //   (agent_authored / sandboxed) app, REJECTS an out-of-ceiling cap (throws). This
+  //   MUST be set before installEnabledApps below so the boot's own installs are
+  //   checked too. Built-in (trusted) apps get the FULL set → zero regression; the
+  //   sandboxed ceiling excludes the escalation trio (cred:read_blob /
+  //   block:delete_physical / block:modify_pinned), matching the PolicyEngine
+  //   `sandboxed` row's denied set (policy.ts) so install-time and run-time agree.
+  registry.ceiling_resolver = capabilityCeilingFor;
+
   // 2a) Register the built-in scalar-count contracts (R-6) BEFORE installing any app,
   //     so the assemble-time provides/consumes check can resolve each contract NAME to
   //     its ContractDef (output_schema ⊨ via.result_schema, R-1) the moment a provider
@@ -131,17 +142,37 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   const base = appsBaseDir(config);
   const { messages } = installEnabledApps(config, registry, base);
 
-  // 3) PolicyEngine wired to the command capabilities + allowed_invokers, then
-  //    Operations (the single mutation chokepoint, with the engine inside).
+  // 3) PolicyEngine wired to the command capabilities + allowed_invokers + the
+  //    AUTHORED trust of the owning App, then Operations (the single mutation
+  //    chokepoint, with the engine inside).
+  //    trust_resolver is the RUN-TIME half of the UH-2 ceiling (§3.8): it resolves a
+  //    command's owning-App trust from the registry (`trust_of`), so a sandboxed App
+  //    is gated by the tightened policy row even when the in-process router does NOT
+  //    stamp `InvokerContext.trust` (fail-closed). Without it the boot path would
+  //    enforce the ceiling only at INSTALL time and leave the run-time sandboxed lane
+  //    keyed solely off a caller stamp — exactly the escape this prerequisite closes.
+  //    Mirrors Operations.with_default_policy (operations.ts) so boot + that factory agree.
   const policy = new PolicyEngine({
     capability_resolver: (full_name) => registry.resolve_command(full_name)?.capabilities ?? [],
     allowed_invokers_resolver: (full_name) =>
       registry.resolve_command(full_name)?.allowed_invokers ?? null,
+    trust_resolver: (full_name) => registry.trust_of(full_name),
   });
   const operations = new Operations(tree, policy, registry);
 
   // Route cross-app invoke_command through Operations so it re-enters PolicyEngine
-  // (INV #11), exactly as a full boot wires it.
+  // (INV #11), exactly as a full boot wires it. The `invoker` arrives already stamped
+  // by the calling AppContext (registry.makeContext → `{invoker:'app', identity:app_id}`);
+  // Operations re-checks policy on it, so we pass it through untouched.
+  //
+  // UH-2 trust seam: when a sandboxed (cross-process) app's command crosses the
+  // boundary, its InvokerContext must carry `trust:'sandboxed'` so PolicyEngine.row()
+  // selects the tightened lane (policy.ts). In THIS slice every app is in-process
+  // trusted, so the stamp is correctly absent (⇒ full-trust `app` row, zero
+  // regression). The `trust` stamp will be applied by the ChildProcessHost when it
+  // turns a child-process command frame into an invoke_command — NOT here: this
+  // in-process router must never fabricate a `sandboxed` tag (that would wrongly
+  // tighten a trusted in-process app). Left as a documented seam (UH-2 §3.8 / §3.9).
   registry.commandRouter = (full_name, args, invoker) =>
     operations.invoke_command(full_name, args, invoker);
 
@@ -349,6 +380,38 @@ function installEnabledApps(
   }
 
   return { messages };
+}
+
+/**
+ * The full capability set a TRUSTED app may declare — the built-in capability
+ * vocabulary (policy.ts `CAP`). Trusted (built-in / audited in-process) apps face
+ * no real ceiling, so this is the whole set and they never trip an install warning.
+ */
+const TRUSTED_CEILING: ReadonlySet<string> = new Set(Object.values(CAP));
+
+/**
+ * The capability set an UNTRUSTED (agent_authored / sandboxed, cross-process) app
+ * may declare (UH-2 §3.8 / §5b.6). It EXCLUDES the escalation trio — credential
+ * plaintext, physical delete, pinned modify — so a sandboxed app that declares one
+ * is rejected at install. The included caps mirror the PolicyEngine `sandboxed`
+ * row's granted ∪ needs_approval (block:write granted; dangerous + net:http to
+ * approval), so the install-time ceiling and the run-time policy agree exactly: an
+ * untrusted app can only ever DECLARE caps it could also exercise (gated).
+ */
+const SANDBOXED_CEILING: ReadonlySet<string> = new Set([
+  CAP.block_write,
+  CAP.net_http,
+  CAP.dangerous,
+]);
+
+/**
+ * capabilityCeilingFor — the `AppRegistry.ceiling_resolver` (UH-2 §3.8). Maps an
+ * authorship trust LEVEL to its allowed capability NAME set. Pure + O(1) (returns a
+ * prebuilt Set), so it preserves INV #19. `agent_authored` is the untrusted lane;
+ * any other level (`trusted`) gets the full set.
+ */
+function capabilityCeilingFor(level: AppTrustLevel): ReadonlySet<string> {
+  return level === 'agent_authored' ? SANDBOXED_CEILING : TRUSTED_CEILING;
 }
 
 /**

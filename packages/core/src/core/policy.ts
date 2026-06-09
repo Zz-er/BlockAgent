@@ -22,7 +22,7 @@
  * House style: PolicyEngine is an actor → role name, no `Block` prefix.
  */
 
-import type { Capability } from '../app/types.js';
+import type { AppTrust, Capability } from '../app/types.js';
 import type {
   InvokerContext,
   OperationCall,
@@ -99,6 +99,22 @@ export type AllowedInvokersResolver = (
   full_name: string,
 ) => readonly InvokerContext['invoker'][] | null | undefined;
 
+/**
+ * A trust lookup the engine consults to learn the AUTHORED trust of the App that
+ * owns a command (from its `AppManifest.trust`). Operations wires this to the
+ * registry. This is the AUTHORITATIVE source for the sandboxed/full-trust lane
+ * decision (UH-2 §3.8): the engine never trusts the caller to volunteer that an
+ * `invoker:'app'` is sandboxed — it resolves the owning app's own declaration, so
+ * a forgotten `InvokerContext.trust` stamp can NEVER fail open into the full-trust
+ * `app` row. `InvokerContext.trust`, if present, can only TIGHTEN (the strict-er of
+ * the two wins; see `effective_trust`), never relax this. Returns the manifest's
+ * `trust` (or `undefined`/`'trusted'` when not declared — the default). Injected as
+ * a pure O(1) lookup so PolicyEngine never imports the registry (core↔app
+ * decoupling, INV #19). Unset ⇒ falls back to `InvokerContext.trust` alone (prior
+ * behavior, before the resolver was wired).
+ */
+export type TrustResolver = (full_name: string) => AppTrust | undefined;
+
 /** Per-invoker grant table: which capability names this invoker is allowed to exercise. */
 export interface InvokerPolicy {
   /** Capability names granted by default (an allowlist). */
@@ -118,6 +134,15 @@ export interface PolicyTable {
   user: InvokerPolicy;
   agent: InvokerPolicy;
   app: InvokerPolicy;
+  /**
+   * The tightened lane for untrusted (cross-process) apps (UH-2 §3.8). Selected
+   * ONLY when an `invoker:'app'` call carries `trust:'sandboxed'`; a plain `app`
+   * call (the default, in-process trusted app) still reads the full-trust `app`
+   * row, so this is purely additive. Unlike `app`, this row denies the destructive
+   * trio (physical delete / pinned modify / credential plaintext) and routes
+   * dangerous + net:http to approval, while ordinary block:write stays granted.
+   */
+  sandboxed: InvokerPolicy;
 }
 
 // ----------------------------------------------------------------------------
@@ -174,6 +199,24 @@ export function default_policy_table(): PolicyTable {
       needs_approval: new Set<string>(),
       denied: new Set<string>(),
     },
+    // sandboxed — untrusted cross-process app (UH-2 §3.8, prerequisite-2). The
+    // real capability ceiling: a sandboxed app gets ordinary block:write, but the
+    // host-destructive trio is flatly DENIED (physical delete / pinned modify /
+    // credential plaintext — the agent's INV #5 floor applies to untrusted apps
+    // too), and the two high-blast-radius capabilities (dangerous, net:http) go to
+    // approval rather than silent allow. Any capability not listed here is neither
+    // granted nor approval-gated, so precedence step (4) DENIES it — i.e. an
+    // unknown/unexpected capability fails closed, not open (the opposite of the
+    // full-trust `app` row, which grants everything).
+    sandboxed: {
+      granted: new Set([CAP.block_write]),
+      needs_approval: new Set([CAP.dangerous, CAP.net_http]),
+      denied: new Set([
+        CAP.block_delete_physical,
+        CAP.block_modify_pinned,
+        CAP.cred_read_blob,
+      ]),
+    },
   };
 }
 
@@ -196,6 +239,16 @@ export interface PolicyEngineOptions {
    * BEFORE any capability check.
    */
   allowed_invokers_resolver?: AllowedInvokersResolver;
+  /**
+   * Resolve the AUTHORED trust of the App owning a command (UH-2 §3.8). This is the
+   * authoritative input for the sandboxed-lane decision: with it wired, an
+   * `invoker:'app'` whose owning App declared `trust:'sandboxed'` ALWAYS routes
+   * through the tightened `sandboxed` row, regardless of whether the caller
+   * remembered to stamp `InvokerContext.trust` — so the ceiling cannot fail open on
+   * a forgotten stamp. Defaults to "unknown" (`undefined`), which falls back to
+   * `InvokerContext.trust` alone (the pre-resolver behavior, zero regression).
+   */
+  trust_resolver?: TrustResolver;
   /**
    * Decide if a live block name is pinned. Pure + O(1) (a Set lookup). Defaults
    * to "nothing is pinned". The owning layer (AppRegistry/Operations) supplies it.
@@ -224,6 +277,7 @@ export class PolicyEngine implements PolicyEngineContract {
   private readonly table: PolicyTable;
   private readonly resolve_caps: CapabilityResolver;
   private readonly resolve_allowed_invokers: AllowedInvokersResolver;
+  private readonly resolve_trust: TrustResolver;
   private readonly is_pinned: (name: string) => boolean;
   private readonly private_owner: (name: string) => string | null;
   private readonly mint_token: (call: OperationCall, ctx: InvokerContext) => string;
@@ -241,6 +295,7 @@ export class PolicyEngine implements PolicyEngineContract {
     this.table = opts.table ?? default_policy_table();
     this.resolve_caps = opts.capability_resolver ?? (() => []);
     this.resolve_allowed_invokers = opts.allowed_invokers_resolver ?? (() => null);
+    this.resolve_trust = opts.trust_resolver ?? (() => undefined);
     this.is_pinned = opts.is_pinned ?? (() => false);
     this.private_owner = opts.private_owner ?? (() => null);
     this.mint_token =
@@ -259,8 +314,30 @@ export class PolicyEngine implements PolicyEngineContract {
    *   4. ungranted (but not denied) capability → deny
    *   5. otherwise                          → allow
    */
+  /**
+   * Resolve the effective trust for a command full-name under a given invoker
+   * context: the STRICTER of the App's authored trust (resolved from the registry)
+   * and any `InvokerContext.trust` the caller stamped. Exposed (UH-2 §3.8) so
+   * Operations can resolve the OWNING COMMAND's trust once and then stamp it onto
+   * the per-op re-check of the ops that command returns — the ops carry reserved
+   * `core.*` primitive names that have NO owning app, so `trust_of('core.delete')`
+   * is `undefined` and a per-op check keyed only off the op name would lose the
+   * sandboxed floor (the bypass: a command declares only `block:write` but returns
+   * a physical-delete op). Pure + O(1).
+   */
+  effective_trust_for(full_name: string, ctx: InvokerContext): AppTrust {
+    return effective_trust(this.resolve_trust(full_name), ctx.trust);
+  }
+
   check(call: OperationCall, ctx: InvokerContext): PolicyDecision {
-    const policy = this.row(ctx.invoker);
+    // Resolve the effective trust ONCE per check: the stricter of the App's
+    // authored trust (resolved from the owning command — the authoritative floor)
+    // and any `InvokerContext.trust` the caller stamped (an optional tightening
+    // override). A sandboxed verdict from EITHER side wins — so a sandboxed App can
+    // never escape the tightened row by a forgotten/forged caller stamp (UH-2 §3.8).
+    const trust = this.effective_trust_for(call.full_name, ctx);
+    const sandboxed = ctx.invoker === 'app' && trust === 'sandboxed';
+    const policy = this.row(ctx, sandboxed);
 
     // (0) invoker-allowlist gate ("who, not what"). A command may restrict which
     //     invokers run it (e.g. agent_identity.set is user-only). Absent list ⇒ no
@@ -286,7 +363,7 @@ export class PolicyEngine implements PolicyEngineContract {
     }
 
     // (2) structural checks tied to the target block (pinned / private / cred).
-    const structural = this.structural_decision(call, ctx);
+    const structural = this.structural_decision(call, ctx, sandboxed);
     if (structural.kind !== 'allow') return structural;
 
     // (3) any capability needing approval → pending (park the runtime, §8.1).
@@ -311,9 +388,22 @@ export class PolicyEngine implements PolicyEngineContract {
 
   // ---- internals (all O(1) / pure) ----------------------------------------
 
-  private row(invoker: InvokerContext['invoker']): InvokerPolicy {
-    // The union is closed; this is exhaustive.
-    return this.table[invoker];
+  private row(ctx: InvokerContext, sandboxed: boolean): InvokerPolicy {
+    // An untrusted app (effective trust `sandboxed`) reads the tightened
+    // `sandboxed` row instead of the full-trust `app` row (UH-2 §3.8). The
+    // `sandboxed` flag is precomputed in `check` from the stricter of the resolved
+    // app trust and the caller stamp. Every other case — and a plain `app` call
+    // resolving to `trusted` — reads its own row, so existing behavior is
+    // unchanged. The invoker union is closed; this is exhaustive.
+    //
+    // Backstop (defense-in-depth): a custom `table` injected via the options bag is
+    // not compile-time checked, so it could lack `sandboxed`. Rather than crash on
+    // `undefined.denied` (which would NOT be fail-closed), fall back to the default
+    // sandboxed row — a sandboxed caller is then still tightly gated, never fully
+    // granted. `is_policy_table` already rejects 3-row tables for the positional
+    // form; this covers the options-bag form too.
+    if (sandboxed) return this.table.sandboxed ?? default_policy_table().sandboxed;
+    return this.table[ctx.invoker];
   }
 
   /**
@@ -351,29 +441,51 @@ export class PolicyEngine implements PolicyEngineContract {
   private structural_decision(
     call: OperationCall,
     ctx: InvokerContext,
+    sandboxed: boolean,
   ): PolicyDecision {
     const target = target_name(call.args);
 
-    // Credential subtree: `*:credentials*`. Reading plaintext (read-blob) is
-    // user/app only; the agent may resolve an alias (plain read) but never the
-    // blob. We approximate "read-blob" as the read primitive against a credential
-    // name carrying a `read_blob: true` arg.
+    // Whether this caller is held to the restricted structural floor. The agent
+    // always is (§9.4 / §9.6); an untrusted (sandboxed) app is too (UH-2 §3.8) —
+    // primitive-based mutations (`core.update`/`core.delete`) imply only
+    // `block:write`, NOT the pinned/cred capability tokens, so without this the
+    // capability-set denial of those tokens would not catch a raw primitive write
+    // against a pinned/credential block. Trusted user/app keep the prior pass.
+    const restricted = ctx.invoker === 'agent' || sandboxed;
+
+    // Credential subtree: `*:credentials*`. Reading plaintext (read-blob) is for
+    // full-trust user/app only; a restricted caller (agent / sandboxed app) may
+    // resolve an alias (plain read) but never the blob. We approximate "read-blob"
+    // as the read primitive against a credential name carrying a `read_blob: true`
+    // arg.
     if (target && is_credential_name(target)) {
-      if (ctx.invoker === 'agent' && wants_read_blob(call)) {
-        return deny(`agent may not read credential plaintext ('${target}')`);
+      if (restricted && wants_read_blob(call)) {
+        return deny(`invoker '${ctx.invoker}' may not read credential plaintext ('${target}')`);
+      }
+      // A SANDBOXED app must not WRITE a credential block either (UH-2 §3.8): the
+      // `cred:read_blob` ceiling protects credential plaintext, but an untrusted app
+      // overwriting/poisoning a stored credential (e.g. update `x:credentials` →
+      // attacker value) is the write-side of the same threat. The cap-set only
+      // implies `block:write` for a mutation, so without this an untrusted app could
+      // tamper with any credential block. Scoped to `sandboxed` (not the agent) so
+      // existing agent credential-write behavior is unchanged (zero regression);
+      // trusted user/app keep full credential access.
+      if (sandboxed && is_mutating(call.full_name)) {
+        return deny(`sandboxed app may not write credential block '${target}'`);
       }
     }
 
-    // Pinned blocks: agent may not modify (§9.4 / §9.6). user/app may.
-    if (target && ctx.invoker === 'agent' && is_mutating(call.full_name) && this.is_pinned(target)) {
-      return deny(`agent may not modify pinned block '${target}'`);
+    // Pinned blocks: a restricted caller may not modify (§9.4 / §9.6). Trusted
+    // user/app may.
+    if (target && restricted && is_mutating(call.full_name) && this.is_pinned(target)) {
+      return deny(`invoker '${ctx.invoker}' may not modify pinned block '${target}'`);
     }
 
-    // Private blocks: agent may only touch its own private subtree.
-    if (target && ctx.invoker === 'agent') {
+    // Private blocks: a restricted caller may only touch its own private subtree.
+    if (target && restricted) {
       const owner = this.private_owner(target);
       if (owner !== null && owner !== ctx.identity) {
-        return deny(`agent '${ctx.identity ?? '<anon>'}' may not access private block '${target}' owned by '${owner}'`);
+        return deny(`invoker '${ctx.invoker}' '${ctx.identity ?? '<anon>'}' may not access private block '${target}' owned by '${owner}'`);
       }
     }
 
@@ -390,9 +502,31 @@ function deny(reason: string): PolicyDecision {
 }
 
 /**
+ * Combine the App's authored trust (from the `TrustResolver`) with any
+ * `InvokerContext.trust` the caller stamped, taking the STRICTER of the two: if
+ * EITHER says `'sandboxed'`, the result is `'sandboxed'`. This is what makes the
+ * ceiling fail-closed (UH-2 §3.8) — a sandboxed App cannot be relaxed to full
+ * trust by a missing resolver result, a missing caller stamp, OR a forged
+ * `trust:'trusted'` stamp. Absent on both sides ⇒ `'trusted'` (the default), so
+ * every existing caller is unaffected. Mirrors `app/host.ts effectiveTrust`'s
+ * "absent means trusted" rule, generalized to two optional inputs.
+ */
+function effective_trust(
+  resolved: AppTrust | undefined,
+  stamped: AppTrust | undefined,
+): AppTrust {
+  return resolved === 'sandboxed' || stamped === 'sandboxed' ? 'sandboxed' : 'trusted';
+}
+
+/**
  * Discriminate a positional `PolicyTable` from the `PolicyEngineOptions` bag in
- * the constructor: a table has the three invoker rows, each an `InvokerPolicy`
- * with a `granted` Set. The options bag never has a `user.granted` shape.
+ * the constructor: a table has ALL FOUR invoker rows (user/agent/app/sandboxed),
+ * each an `InvokerPolicy` with a `granted` Set. The options bag never has a
+ * `user.granted` shape. We require `sandboxed` too (UH-2 §3.8): a 3-row object
+ * shaped like the pre-UH-2 table would otherwise be accepted as a `PolicyTable`,
+ * leaving `table.sandboxed === undefined` so a sandboxed-app check crashes on
+ * `.denied.has` (a runtime throw — NOT fail-closed). Requiring the row here forces
+ * a custom table to carry it; `row()` also guards defensively as a backstop.
  */
 function is_policy_table(arg: PolicyTable | PolicyEngineOptions): arg is PolicyTable {
   const maybe = arg as Partial<PolicyTable>;
@@ -400,6 +534,7 @@ function is_policy_table(arg: PolicyTable | PolicyEngineOptions): arg is PolicyT
     !!maybe.user &&
     !!maybe.agent &&
     !!maybe.app &&
+    !!maybe.sandboxed &&
     maybe.user.granted instanceof Set
   );
 }

@@ -19,7 +19,6 @@
 
 import { BlockTree } from './core/block.js';
 import { Operations } from './core/operations.js';
-import { PolicyEngine } from './core/policy.js';
 import { Renderer } from './core/renderer.js';
 import { AppRegistry } from './app/registry.js';
 import { MockProvider } from './provider/mock.js';
@@ -95,13 +94,14 @@ async function main(): Promise<void> {
   const registry = new AppRegistry();
   const install = registry.install(echoApp());
 
-  // 3) PolicyEngine wired to the command capabilities + Operations (the door).
-  const policy = new PolicyEngine({
-    capability_resolver: (full_name) => registry.resolve_command(full_name)?.capabilities ?? [],
-    allowed_invokers_resolver: (full_name) =>
-      registry.resolve_command(full_name)?.allowed_invokers ?? null,
-  });
-  const operations = new Operations(tree, policy, registry);
+  // 3) Operations with the default PolicyEngine — the canonical factory wires the
+  //    capability / allowed_invokers / trust resolvers off the registry in one place
+  //    (operations.ts with_default_policy), so this demo harness stays consistent with
+  //    the production boot (cli/launch.ts) and the UH-2 sandboxed-trust lane is honored
+  //    here too. (This harness only installs a trusted fixture app, so the lane never
+  //    triggers — but using the factory means index.ts can't drift into a missing-
+  //    resolver footgun if it is ever copied as a template.)
+  const operations = Operations.with_default_policy({ tree, registry });
 
   // 4) Renderer over the BuilderRegistry seam (positional ctor per contract).
   //    Wire the LIVE App-context provider so state-driven projection builders
