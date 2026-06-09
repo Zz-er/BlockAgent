@@ -25,6 +25,11 @@
   "dependencies": {},
   "$devDependencies_note": "Apps that moved out of core into the apps/ workspaces are devDeps here ONLY for core's integration/app tests (test/agent_identity.test.ts, projection_e2e.test.ts). They are dev-only, so core's RUNTIME closure (npm ls --omit=dev) stays empty — CI core-closure check unaffected.",
   "devDependencies": {
-    "@block-agent/app-agent_identity": "*"
+    "@block-agent/app-agent_identity": "*",
+    "@block-agent/app-messages": "*",
+    "@block-agent/app-tools": "*",
+    "@block-agent/app-memory": "*",
+    "@block-agent/app-task": "*",
+    "@block-agent/app-stats": "*"
   }
 }

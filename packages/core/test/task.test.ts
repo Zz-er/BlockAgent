@@ -30,7 +30,7 @@ import {
   type Task,
   type TaskAppOptions,
   type TaskState,
-} from '../src/apps/task.js';
+} from '@block-agent/app-task/manifest.js';
 import type { Block, BlockName, InvokerContext, WakeEvent } from '../src/core/types.js';
 import type { AppContext, BuildContext, BuilderManifest } from '../src/app/types.js';
 

@@ -31,11 +31,11 @@ import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
 import { MockProvider } from '@block-agent/core/provider/mock.js';
 import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
-import { MessagesApp } from '@block-agent/core/apps/messages.js';
-import { ToolsApp } from '@block-agent/core/apps/tools.js';
-import { MemoryApp } from '@block-agent/core/apps/memory.js';
-import { TaskApp } from '@block-agent/core/apps/task.js';
-import { StatsApp } from '@block-agent/core/apps/stats.js';
+import { MessagesApp } from '@block-agent/app-messages/manifest.js';
+import { ToolsApp } from '@block-agent/app-tools/manifest.js';
+import { MemoryApp } from '@block-agent/app-memory/manifest.js';
+import { TaskApp } from '@block-agent/app-task/manifest.js';
+import { StatsApp } from '@block-agent/app-stats/manifest.js';
 import { MemoryLettaApp } from '@block-agent/memory-letta/memory_letta_app.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';

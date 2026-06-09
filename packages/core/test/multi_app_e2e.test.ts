@@ -40,9 +40,9 @@ import { AppRegistry } from '../src/app/registry.js';
 import { AgentRuntime } from '../src/runtime/agent_runtime.js';
 import { MockProvider } from '../src/provider/mock.js';
 import { MESSAGE_COUNT, TASK_COUNT } from '../src/app/contracts.js';
-import { MessagesApp } from '../src/apps/messages.js';
-import { TaskApp } from '../src/apps/task.js';
-import { makeStatsApp } from '../src/apps/stats.js';
+import { MessagesApp } from '@block-agent/app-messages/manifest.js';
+import { TaskApp } from '@block-agent/app-task/manifest.js';
+import { makeStatsApp } from '@block-agent/app-stats/manifest.js';
 import type { MockTurn } from '../src/provider/mock.js';
 import type { InvokerContext } from '../src/core/types.js';
 

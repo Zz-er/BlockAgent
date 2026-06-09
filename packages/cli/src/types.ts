@@ -22,7 +22,7 @@ import type { Operations, Renderer, InvokerContext, AgentState } from '@block-ag
 import type { AppRegistry } from '@block-agent/core/app/registry.js';
 import type { AgentRuntime } from '@block-agent/core/runtime/agent_runtime.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
-import type { MessagesApp } from '@block-agent/core/apps/messages.js';
+import type { MessagesApp } from '@block-agent/app-messages/manifest.js';
 
 // ============================================================================
 // LauncherConfig — the single source of truth `launch()` consumes (design §3)

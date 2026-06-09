@@ -33,7 +33,7 @@ import {
   type MessagesAppOptions,
   type MessagesState,
   type ReplyEvent,
-} from '../src/apps/messages.js';
+} from '@block-agent/app-messages/manifest.js';
 import type { Block, BlockName, InvokerContext, WakeEvent } from '../src/core/types.js';
 import type { AppContext, BuildContext, BuilderManifest } from '../src/app/types.js';
 
