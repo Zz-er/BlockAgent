@@ -248,6 +248,24 @@ export type CommandManifestFactory<TState = unknown> = (
 // ============================================================================
 
 /**
+ * AppTrust — a BlockApp's trust level (§ unified-host UH-1). `'trusted'` is the
+ * default when a manifest omits it (every first-party App today): runs in-process,
+ * full capability ceiling. `'sandboxed'` is untrusted code (third-party / agent-
+ * authored): runs isolated and under a tightened ceiling. Kept a bare union (not
+ * branded) so a manifest field stays cheap to set. See app/host.ts `resolveHost`.
+ */
+export type AppTrust = 'trusted' | 'sandboxed';
+
+/**
+ * AppHostKind — where a BlockApp's command/state code runs (§ unified-host UH-1).
+ * `'in-process'` = a direct reference inside the runtime (today's behavior, zero
+ * overhead). `'child-process'` = an isolated OS process bridged by an RPC-proxied
+ * AppContext (the carrier for sandboxed Apps; wired in UH-2). The AppContext
+ * interface is identical for both — "interface orthogonal to carrier".
+ */
+export type AppHostKind = 'in-process' | 'child-process';
+
+/**
  * AppManifest — what the runtime reads when installing a BlockApp (§5.1).
  * Declares identity, the subtree it occupies, dependencies, its builders and
  * commands, its initial state, and (INVARIANT #14) the schema that constrains
@@ -295,6 +313,26 @@ export interface AppManifest<TState = unknown> {
    * fields `string` (C-API-4). Optional + additive.
    */
   consumes?: { contract: string; as: string }[];
+
+  /**
+   * Trust level (§ unified-host UH-1). Decides the default host carrier and the
+   * capability ceiling applied to this App's commands. Optional + additive:
+   * absent ⇒ `'trusted'` (every built-in / first-party App today), so existing
+   * manifests are unchanged. `'sandboxed'` marks untrusted code (third-party /
+   * agent-authored) that must run isolated (see `host` below + app/host.ts
+   * `resolveHost`). See ai_com/design/blockapp-unified-host-architecture.md §4.1.
+   */
+  trust?: AppTrust;
+  /**
+   * Host carrier (§ unified-host UH-1). Where this App runs. Optional: absent ⇒
+   * derived from `trust` (`'trusted'`→`'in-process'`, `'sandboxed'`→`'child-process'`)
+   * via `resolveHost`. An operator may override within the legal range, but a
+   * `trust:'sandboxed'` App may NOT be downgraded to `'in-process'` (security
+   * invariant — `resolveHost` throws). "Interface is orthogonal to carrier": the
+   * AppContext signature is identical either way (direct ref vs RPC proxy). Only
+   * `'in-process'` is wired today (UH-1); `'child-process'` lands in UH-2.
+   */
+  host?: AppHostKind;
 
   /** Subtree root this App owns, e.g. `/memory` (block names use the bare id prefix). */
   tree_namespace: string;

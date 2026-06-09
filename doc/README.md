@@ -22,7 +22,8 @@ block-agent 是一个通用的 agent 运行时。它把"进入模型的那段上
 
 | 文档 | 讲什么 | 适合谁 |
 |---|---|---|
-| [blockapp-development.md](./blockapp-development.md) | **怎么开发一个 BlockApp**：从心智模型到一个能跑的最小例子——你的模块怎么持有状态、怎么把状态呈现进上下文、怎么暴露受约束的操作、怎么和别的模块按契约协作 | 想写自己模块的开发者 |
+| [blockapp-development.md](./blockapp-development.md) | **怎么开发一个 BlockApp**（可信 trusted app）：从心智模型到一个能跑的最小例子——你的模块怎么持有状态、怎么把状态呈现进上下文、怎么暴露受约束的操作、怎么和别的模块按契约协作 | 想写自己模块的开发者 |
+| [blockapp-sandboxed-development.md](./blockapp-sandboxed-development.md) | **统一模型下写可信 / 沙箱 app**：`trust`/`host` 决定同进程还是子进程；沙箱 app 不写 builder、声明式投影、`emit` 当失效门铃（[DESIGNED]，UH-2 落地） | 想写第三方 / 不可信扩展的开发者 |
 | [blockapp-lifecycle.md](./blockapp-lifecycle.md) | **一个 BlockApp 的一生**：怎么被发现、安装、更换、卸载；CLI 里 `/apps` 与 `/app` 怎么用；为什么 agent 永远装不了也卸不了模块；卸载为什么默认不删数据 | 想装卸、管理模块的使用者 |
 | [builtin-apps.md](./builtin-apps.md) | **内置模块介绍**：身份、对话、工具、记忆、待办、概览各自做什么、怎么配；尤其把外部语义记忆 `memory_letta` 的接法讲透 | 想用内置能力、想接长期记忆的人 |
 
