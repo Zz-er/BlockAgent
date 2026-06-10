@@ -493,7 +493,21 @@ export interface InstallResult {
  */
 export interface AppRegistry {
   install(manifest: AppManifest): InstallResult;
+  /**
+   * Three-in-one teardown (graceful hook + index drop + entry removal) for
+   * non-carrier callers. The hot-uninstall orchestrator instead uses the split
+   * `dispose_app` (hook, via the AppHost carrier) + `forget` (index drop), so
+   * teardown crosses the carrier without the hook recursing back through here.
+   */
   uninstall(app_id: string): void;
+  /**
+   * Run an App's graceful teardown through its AppHost carrier (runs `on_uninstall`;
+   * for a child-process carrier also terminates the process). Paired with `forget`:
+   * the orchestrator calls `dispose_app` first (hook), then `forget` (index drop).
+   */
+  dispose_app(app_id: string): Promise<void>;
+  /** Drop an App's registry footprint (index + record) only — does NOT run the hook. */
+  forget(app_id: string): void;
   list(): AppManifest[];
   get(app_id: string): AppManifest | null;
 }

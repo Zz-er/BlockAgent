@@ -266,8 +266,11 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //      b) set `mutating` so wakeHook parks new wakes for the duration;
   //      c) unseedProjectionBlocks → soft-delete the app's projection nodes through
   //         Operations (chokepoint, invoker=app — no bypass, INV #5 archival delete);
-  //      d) registry.uninstall → drop the builder index + run on_uninstall (graceful
-  //         teardown only; never deletes durable data, INV #5);
+  //      d) dispose_app → run on_uninstall THROUGH the AppHost carrier (graceful
+  //         teardown only; never deletes durable data, INV #5), THEN forget → drop
+  //         the builder index + install record. Split so the hook runs via the
+  //         carrier and the index drop is a separate step — no uninstall→dispose→
+  //         uninstall recursion (UH-1 AppHost, impl-spec §3.2/§4);
   //      e) rebuild currentToolCatalog so the agent stops seeing the app's commands;
   //      f) clear `mutating` and replay any parked wakes.
   const hotUninstall = async (app_id: string): Promise<HotUninstallResult> => {
@@ -287,8 +290,11 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
         // through the chokepoint); required by apply()'s fail-closed default (task#10).
         (ops) => operations.apply(ops, { invoker: 'app', trust: 'trusted' }),
       );
-      // (d) drop the registry index + run on_uninstall (graceful teardown).
-      registry.uninstall(app_id);
+      // (d) run on_uninstall through the carrier (AppHost.dispose), THEN drop the
+      //     registry index + record. Two steps, never registry.uninstall, so the
+      //     carrier teardown cannot recurse into an index-dropping path.
+      await registry.dispose_app(app_id);
+      registry.forget(app_id);
       // (e) rebuild the advertised command catalog (app's commands now gone).
       currentToolCatalog = buildToolCatalog(registry);
       return { ok: true, removed_blocks: removed };

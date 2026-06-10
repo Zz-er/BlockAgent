@@ -46,6 +46,8 @@ import type {
 } from './types.js';
 import type { ContractDef } from './contracts.js';
 import { effectiveTrust } from './host.js';
+import type { AppHost } from './app_host.js';
+import { InProcessHost } from './in_process_host.js';
 
 // ============================================================================
 // Capability ceiling (INV #19 — O(1) set-membership, injected seam)
@@ -265,6 +267,16 @@ interface AppInstance {
   readonly manifest: AppManifest;
   /** Live runtime handle handed to builders/commands/lifecycle hooks. */
   readonly ctx: AppContext;
+  /**
+   * Carrier abstraction owning this App's AppContext (UH-1 AppHost, impl-spec §3.2).
+   * For the in-process carrier `host.current_context()` returns this same `ctx`
+   * synchronously — so `get_app_context` (and thus the render path) is unchanged.
+   * Holding the host here lets `get_app_context` resolve through the carrier without
+   * the registry branching on kind; a future child-process carrier (UH-2/SS3) slots
+   * in here unchanged. `ctx` is retained as a direct field because in-process
+   * install/uninstall/route paths legitimately reference the live instance directly.
+   */
+  readonly host: AppHost;
   /** Mutable backing store for `ctx.state`. */
   state: unknown;
   /** Built CommandManifests, keyed by bare command name. */
@@ -444,16 +456,69 @@ export class AppRegistry
     return this.apps.has(app_id) || RESERVED_APP_IDS.has(app_id);
   }
 
+  /**
+   * Three-in-one teardown (hook + index drop + entry removal), RETAINED for
+   * non-host callers and backward compatibility. The HotMutator no longer routes
+   * through this — it uses the split path `dispose_app()` (hook, via the carrier) +
+   * `forget()` (index drop + delete), so teardown crosses the AppHost (impl-spec
+   * §3.2/§4) without `dispose()` ever recursing back into `uninstall`. Kept so any
+   * existing direct caller (tests, non-carrier flows) sees an unchanged contract.
+   */
   uninstall(app_id: string): void {
+    if (!this.apps.has(app_id)) return;
+    this.runUninstallHook(app_id);
+    this.forget(app_id);
+  }
+
+  /**
+   * Drop an App's registry footprint ONLY — its builder index entries + the install
+   * record — WITHOUT running its `on_uninstall` hook. The index half of teardown,
+   * split out so the HotMutator can run the hook through the carrier (`dispose_app`
+   * → AppHost.dispose) FIRST, then `forget()` here. Separating the two is what makes
+   * the carrier path non-recursive: the hook never re-enters an index-dropping path.
+   * Single-writer-clean: touches only in-memory registry state, never the tree
+   * (projection nodes are the HotMutator's `unseedProjectionBlocks` job). Idempotent
+   * on a missing id.
+   */
+  forget(app_id: string): void {
     const instance = this.apps.get(app_id);
     if (!instance) return;
-    void instance.manifest.on_uninstall?.(instance.ctx);
     for (const builder of instance.builders) {
       for (const out of builder.outputs) {
         if (this.ownerByBlockName.get(out) === builder) this.ownerByBlockName.delete(out);
       }
     }
     this.apps.delete(app_id);
+  }
+
+  /**
+   * Run an App's graceful teardown THROUGH ITS CARRIER (AppHost.dispose, impl-spec
+   * §3.2/§4): for in-process this runs `on_uninstall` via the host's injected
+   * hook-only closure; for a child-process carrier (UH-2/SS3) it will additionally
+   * terminate the process + reclaim the channel. The HotMutator calls this BEFORE
+   * `forget()` so the hook sees a still-indexed app and the index drop is a separate,
+   * later step — no `uninstall→dispose→uninstall` recursion. Async because carrier
+   * teardown is async. Idempotent on a missing id (no-op).
+   */
+  async dispose_app(app_id: string): Promise<void> {
+    await this.apps.get(app_id)?.host.dispose();
+  }
+
+  /**
+   * Run ONLY an App's graceful-teardown hook (`on_uninstall`), nothing else — no
+   * index drop, no `apps.delete`. This is the single place the hook fires: called by
+   * `uninstall()` and (via the host's injected closure) by `AppHost.dispose()`
+   * (impl-spec §3.2/§4 teardown). Keeping it hook-ONLY is the safety boundary Atlas
+   * flagged: a carrier `dispose()` must NOT recurse into `uninstall()` / `forget()`,
+   * or the HotMutator path that routes teardown through `dispose()` would either loop
+   * or double-fire the hook. Registry stays single-writer-clean (the hook itself
+   * touches neither tree nor index). Idempotent on a missing id; fire-and-forget
+   * (`void`) exactly as the prior inline call was.
+   */
+  private runUninstallHook(app_id: string): void {
+    const instance = this.apps.get(app_id);
+    if (!instance) return;
+    void instance.manifest.on_uninstall?.(instance.ctx);
   }
 
   list(): AppManifest[] {
@@ -479,9 +544,20 @@ export class AppRegistry
    * copy) is intentional: `ctx.state` is a read-through getter over the App's mutable
    * cell, so the Renderer always sees the latest committed state (builders only READ
    * it; they never mutate, INV #16).
+   *
+   * UH-1 (impl-spec §3.2): the lookup now resolves through the App's `AppHost` via
+   * its SYNCHRONOUS `current_context()` accessor — NOT the async `activate()` — so
+   * the render hot path (`app_context_provider`, index.ts:111 / launch.ts:182) and
+   * consume-refresh fold (agent_runtime.ts:454) keep their exact synchronous,
+   * byte-deterministic (INV #1) timing. For the in-process carrier this returns the
+   * SAME live `ctx` instance as before (zero behavior change); a child-process
+   * carrier (UH-2/SS3) returns the live proxy iff already active, else null — and a
+   * null then means "read the core-side cell" (impl-spec §3.6 pull-from-cache),
+   * never "block the render to fork a process". The external signature and
+   * return-timing are unchanged.
    */
   get_app_context(app_id: string): AppContext | null {
-    return this.apps.get(app_id)?.ctx ?? null;
+    return this.apps.get(app_id)?.host.current_context() ?? null;
   }
 
   // --------------------------------------------------------------------------
@@ -973,10 +1049,20 @@ export class AppRegistry
       builders.push(builder);
     }
 
+    // UH-1 carrier (impl-spec §3.2): wrap the live ctx in an in-process AppHost. The
+    // dispose hook is the HOOK-ONLY runner (never `uninstall`) so a future teardown
+    // path through `host.dispose()` cannot recurse into `uninstall`. The closure
+    // captures the id and resolves the instance lazily, so there is no construction-
+    // order dependency on the not-yet-returned instance.
+    const host: AppHost = new InProcessHost(installed_id, ctx, () =>
+      this.runUninstallHook(installed_id),
+    );
+
     return {
       id: installed_id,
       manifest,
       ctx,
+      host,
       state: cell.state,
       commands,
       builders,
