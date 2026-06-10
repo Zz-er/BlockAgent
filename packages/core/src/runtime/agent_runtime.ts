@@ -144,6 +144,16 @@ export const COMMANDS_ONLY_FEEDBACK_TEXT =
 const DEFAULT_MAX_TURNS_PER_WAKE = 16;
 
 /**
+ * Per-provider deadline for a consume-refresh pull (UH-2 §3.7). A slow/hung provider
+ * (e.g. a cross-process sandboxed app whose pull degenerates to a sync RPC) must not
+ * hijack the snapshot: each provider query is raced against this deadline, and a
+ * timeout is treated exactly like any other provider failure — it fails the contract
+ * entry, which the existing per-consumer layer-1 degrade catches (the consumer keeps
+ * its previous state). 200ms matches the RPC channel's default deadline (rpc/channel).
+ */
+const CONSUME_PULL_DEADLINE_MS = 200;
+
+/**
  * AgentRuntime — the §8.1 state machine + the §4.2 commands-only main loop.
  *
  * The agent itself never sees `state` directly (it is exposed to Apps via
@@ -419,20 +429,20 @@ export class AgentRuntime {
       const consumers = this.registry.consumers?.();
       if (!consumers || consumers.length === 0) return; // no consumers ⇒ no-op
 
-      for (const consumer of consumers) {
-        // One bad consumer must never affect the others (defense in depth; the
-        // per-consumer body below is already guarded, this is the outer net). The
-        // `await` is REQUIRED: refreshOneConsumer awaits each provider pull, so without
-        // it consume-refresh would return before set_state ran and the snapshot would
-        // render STALE state (the refresh completing after the render) — defeating the
-        // "before snapshot" guarantee. Awaiting also lets this try/catch catch its
-        // rejection (a non-awaited async throw would escape it).
-        try {
-          await this.refreshOneConsumer(consumer);
-        } catch {
-          /* isolate a single consumer's failure */
-        }
-      }
+      // Refresh all consumers IN PARALLEL (§3.7). Each consumer writes its OWN cell and
+      // is fully isolated (its own try/catch below), so concurrency is safe — and we
+      // still `await` the whole batch so EVERY set_state lands BEFORE the snapshot (the
+      // "before snapshot" guarantee R-4; a non-awaited batch would render stale state).
+      // `Promise.all` over a `.catch`-guarded map means one consumer's failure neither
+      // aborts the batch nor escapes here. No cross-consumer ordering dependency exists
+      // (distinct cells), so parallelizing does not affect determinism.
+      await Promise.all(
+        consumers.map((consumer) =>
+          this.refreshOneConsumer(consumer).catch(() => {
+            /* isolate a single consumer's failure */
+          }),
+        ),
+      );
     } catch {
       // Layer 4: NOTHING bubbles out of consume-refresh. It runs before the snapshot,
       // so an uncaught throw here would abort the whole turn — which is exactly the
@@ -495,27 +505,46 @@ export class AgentRuntime {
     const providers = this.registry.providers_of?.(contract) ?? [];
     const invoker: InvokerContext = { invoker: 'app', identity: consumer_app_id };
 
-    const datas: unknown[] = [];
-    for (const provider of providers) {
-      const full_name = `${provider.app_id}.${provider.via}`;
-      // invoke_query is OPTIONAL on the Operations interface; absence ⇒ no pull path.
-      if (!this.ops.invoke_query) {
-        throw new Error('consume-refresh: Operations.invoke_query is unavailable');
-      }
-      const res = await this.ops.invoke_query(full_name, {}, invoker);
-      if (!res.ok) {
-        throw new Error(
-          `consume-refresh: query '${full_name}' failed: ${res.error ?? 'unknown error'}`,
-        );
-      }
-      const check = validateAgainstSchema(res.data, def.output_schema);
-      if (!check.ok) {
-        throw new Error(
-          `consume-refresh: '${full_name}' data violates contract '${contract}': ${check.error}`,
-        );
-      }
-      datas.push(res.data);
+    // invoke_query is OPTIONAL on the Operations interface; absence ⇒ no pull path.
+    if (!this.ops.invoke_query) {
+      throw new Error('consume-refresh: Operations.invoke_query is unavailable');
     }
+    const invoke_query = this.ops.invoke_query.bind(this.ops);
+
+    // Pull every provider IN PARALLEL with a per-provider deadline (§3.7): a slow/hung
+    // provider can no longer serialize the wait or hijack the snapshot. A timeout, a
+    // failed query, or a schema-invalid datum each REJECT this provider's promise →
+    // `Promise.all` rejects → the caller's layer-1 catch degrades the WHOLE consumer to
+    // its previous state (preserving the per-consumer-atomic R-4 guarantee for timeouts
+    // exactly as for data errors — no half-new partial combine).
+    //
+    // DETERMINISM (§3.7 / INV #1): `Promise.all` resolves to results in INPUT order, and
+    // `providers` is in `deriveContractTable`'s manifest-stable order, so `datas` folds
+    // through `combineResults` (position-based) byte-identically regardless of which
+    // provider's RPC returned first. We MUST NOT collect by arrival order (no
+    // `Promise.race` / push-on-resolve) — that would break byte-determinism.
+    const datas = await Promise.all(
+      providers.map(async (provider) => {
+        const full_name = `${provider.app_id}.${provider.via}`;
+        const res = await withTimeout(
+          invoke_query(full_name, {}, invoker),
+          CONSUME_PULL_DEADLINE_MS,
+          `consume-refresh: query '${full_name}' exceeded ${CONSUME_PULL_DEADLINE_MS}ms`,
+        );
+        if (!res.ok) {
+          throw new Error(
+            `consume-refresh: query '${full_name}' failed: ${res.error ?? 'unknown error'}`,
+          );
+        }
+        const check = validateAgainstSchema(res.data, def.output_schema);
+        if (!check.ok) {
+          throw new Error(
+            `consume-refresh: '${full_name}' data violates contract '${contract}': ${check.error}`,
+          );
+        }
+        return res.data;
+      }),
+    );
 
     // combineResults throws on misuse (non-number sum, empty first); that surfaces as
     // this contract entry failing → the consumer degrades (layer 1).
@@ -774,6 +803,29 @@ export class AgentRuntime {
   private stateKind(): AgentState['kind'] {
     return this.state.kind;
   }
+}
+
+/**
+ * withTimeout — race a promise against a deadline (UH-2 §3.7). Resolves/rejects with
+ * the wrapped promise if it settles within `ms`; otherwise REJECTS with a timeout error.
+ * The timer is cleared on settle so a slow-but-eventually-resolving pull leaves no
+ * dangling handle. Pure wrt the runtime closure (only `node:`-global setTimeout). Used
+ * to bound each consume-refresh provider pull so one hung provider can't hijack the turn.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
