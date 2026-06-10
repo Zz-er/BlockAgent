@@ -133,10 +133,14 @@ async function main(): Promise<void> {
   //     (CM-4): registry.seedProjectionBlocks defaults `parent` to `core:root`, which
   //     is NOT the empty-tree root (`root:root`) — passing runtime.root keeps the
   //     bookkeeping blocks attached to the live root so they actually render. The
-  //     creates flow through Operations.apply({invoker:'app'}) — no chokepoint bypass.
+  //     creates flow through Operations.apply({invoker:'app', trust:'trusted'}) — no
+  //     chokepoint bypass. The explicit `trust:'trusted'` is required by apply()'s
+  //     fail-closed default (task#10): this is a TRUSTED system seed (it writes pinned
+  //     system blocks), so it opts into full trust explicitly; an unstamped app call
+  //     would now be gated to the sandboxed lane.
   await registry.seedProjectionBlocks(
     (name) => operations.has(name),
-    (ops) => operations.apply(ops, { invoker: 'app' }),
+    (ops) => operations.apply(ops, { invoker: 'app', trust: 'trusted' }),
     runtime.root,
   );
 

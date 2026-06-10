@@ -180,7 +180,7 @@ describe('AppRegistry.seedProjectionBlocks (empty-tree boot is non-empty)', () =
     const { reg, ops, renderer, tree } = bootEmpty();
     const seeded = await reg.seedProjectionBlocks(
       (name) => ops.has(name),
-      (sOps) => ops.apply(sOps, { invoker: 'app' }),
+      (sOps) => ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
     );
     // The apps' declared builder outputs are now live nodes in the tree.
     expect(seeded).toContain(BLOCK_IDENTITY);
@@ -200,7 +200,7 @@ describe('AppRegistry.seedProjectionBlocks (empty-tree boot is non-empty)', () =
     const { reg, ops, renderer, tree, msgs } = bootEmpty();
     await reg.seedProjectionBlocks(
       (name) => ops.has(name),
-      (sOps) => ops.apply(sOps, { invoker: 'app' }),
+      (sOps) => ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
     );
     await ops.invoke_command('messages.ingest', { content: 'please cut the release' }, USER);
     const text = await renderText(renderer, tree);
@@ -212,12 +212,12 @@ describe('AppRegistry.seedProjectionBlocks (empty-tree boot is non-empty)', () =
     const { reg, ops } = bootEmpty();
     const first = await reg.seedProjectionBlocks(
       (name) => ops.has(name),
-      (sOps) => ops.apply(sOps, { invoker: 'app' }),
+      (sOps) => ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
     );
     expect(first.length).toBeGreaterThan(0);
     const second = await reg.seedProjectionBlocks(
       (name) => ops.has(name),
-      (sOps) => ops.apply(sOps, { invoker: 'app' }),
+      (sOps) => ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
     );
     expect(second).toHaveLength(0); // everything already present → nothing re-seeded
   });

@@ -42,7 +42,7 @@ import type {
   // `Operations`; the class `implements` the alias.
   Operations as OperationsContract,
 } from './types.js';
-import { BlockTree, BlockTreeError, is_valid_block_name } from './block.js';
+import { BlockTree, BlockTreeError, is_valid_block_name, owner_app_id } from './block.js';
 import { PolicyEngine, PRIMITIVE_COMMANDS } from './policy.js';
 
 // ============================================================================
@@ -205,6 +205,37 @@ export class Operations implements OperationsContract {
       result.ops.length > 0 &&
       this.policy.effective_trust_for(full_name, ctx) === 'sandboxed'
     ) {
+      // (3.5a) NAMESPACE-OWNERSHIP gate (cross-ns write isolation, task#12). The
+      //     per-op capability re-check below catches the destructive trio
+      //     (physical/pinned/cred), but an ordinary `block:write` op that targets a
+      //     DIFFERENT app's namespace (`create victimapp:injected`, `update
+      //     victimapp:data`) is granted to the sandboxed lane — yet it writes into
+      //     another App's subtree. block.ts enforces single-owner-per-name (INV #3)
+      //     but no "writer app_id == target namespace" ACL. This is a DIFFERENT axis
+      //     from the capability ceiling (ceiling = which operation classes; this =
+      //     which OBJECTS): an untrusted App may only write blocks IT OWNS. We resolve
+      //     the writer authoritatively from the OWNING COMMAND's app_id (the part
+      //     before the first `.` of `full_name`) — not from `ctx.identity`, which on a
+      //     cross-App call is the CALLER, not the App whose command body produced these
+      //     ops — and require every block name the op references (the object it writes
+      //     PLUS the parent/destination it writes under) to live in that namespace.
+      //     This also subsumes the `credentials_new`/`credentials2` naming seam: such a
+      //     block is in the victim's namespace, so the cross-ns deny fires regardless of
+      //     the `is_credential_name` pattern. Trusted user/app never reach this branch.
+      const writer = command_app_id(full_name);
+      for (const op of result.ops) {
+        const foreign = foreign_namespace_target(op, writer);
+        if (foreign !== null) {
+          return {
+            status: 'denied',
+            reason:
+              `sandboxed app '${writer}' may not write block '${foreign}' outside its own ` +
+              `namespace '${writer}:' (cross-namespace write isolation)`,
+          };
+        }
+      }
+
+      // (3.5b) per-op capability/structural re-check (the destructive-trio gate).
       const op_ctx: InvokerContext = { ...ctx, trust: 'sandboxed' };
       for (const op of result.ops) {
         const decision = this.policy.check(
@@ -286,14 +317,41 @@ export class Operations implements OperationsContract {
   /**
    * Apply raw BlockOps under an invoker tag, STILL through PolicyEngine (§9.1: no
    * bypass). This is the runtime's door for owner-less system writes — the
-   * commands-only feedback block (§4.2) — typically with
-   * `invoker:'app'` (which the §9.4 table does not gate on capability, but the
-   * chokepoint stays uniform). It carries ops, not free text, so it is not a back
-   * door. Returns the PolicyDecision; on `allow` the ops are applied (atomically),
-   * on deny/pending nothing is written.
+   * commands-only feedback block (§4.2) — and for projection-block seed/unseed
+   * (launch.ts). It carries ops, not free text, so it is not a back door. Returns
+   * the PolicyDecision; on `allow` the ops are applied (atomically), on deny/pending
+   * nothing is written.
+   *
+   * FAIL-CLOSED DEFAULT (UH-2 §3.8, task#10). The ops here carry reserved `core.*`
+   * primitive names that have NO owning app, so the PolicyEngine's `trust_resolver`
+   * (`trust_of('core.delete')` → undefined) cannot recover a sandboxed floor from the
+   * op name. That left `apply()` keyed on `invoker_ctx.trust` ALONE, whose absence
+   * fell back to the full-trust `app` row — a fail-OPEN footgun: any caller that
+   * reached `apply()` with `{invoker:'app'}` and no trust stamp (or a future refactor
+   * that routed sandboxed work here) would get physical-delete / pinned-modify /
+   * credential writes silently granted.
+   *
+   * We flip the default to fail-CLOSED: an `invoker:'app'` call that does NOT carry an
+   * explicit `trust` is treated as `sandboxed` (the strict lane) for the per-op check.
+   * Full trust is now an explicit OPT-IN: the trusted system callers (index.ts seed,
+   * launch.ts seed/unseed) stamp `trust:'trusted'` and keep their full-power writes
+   * (seed pinned/system blocks) unchanged. The security property no longer rests on
+   * the unenforced assumption "no app can reach apply()" (task#13) — a forgotten stamp
+   * on a NEW caller now fails closed by default instead of opening the floor. Only the
+   * unstamped `app` lane is affected; user/agent and explicitly-stamped calls are
+   * unchanged (zero regression for every existing stamped caller).
    */
   async apply(ops: BlockOp[], invoker_ctx: InvokerContext): Promise<PolicyDecision> {
     if (ops.length === 0) return { kind: 'allow' };
+
+    // Fail-closed: an unstamped `app` call defaults to the strict `sandboxed` lane.
+    // (`effective_trust` takes the STRICTER of resolved-app-trust and the stamp, so an
+    // explicit `trust:'trusted'` here still resolves to trusted — full power — while an
+    // absent stamp now resolves to sandboxed instead of the old fail-open trusted.)
+    const ctx: InvokerContext =
+      invoker_ctx.invoker === 'app' && invoker_ctx.trust === undefined
+        ? { ...invoker_ctx, trust: 'sandboxed' }
+        : invoker_ctx;
 
     // Gate EVERY op under its own primitive full-name so the §9.4 structural and
     // capability checks (physical delete, pinned, private) each apply. The batch
@@ -302,7 +360,7 @@ export class Operations implements OperationsContract {
     for (const op of ops) {
       const decision = this.policy.check(
         { full_name: primitive_for(op), args: op_policy_args(op) },
-        invoker_ctx,
+        ctx,
       );
       if (decision.kind !== 'allow') return decision;
     }
@@ -479,6 +537,62 @@ function declared_allowed_invokers(
   full_name: string,
 ): readonly InvokerContext['invoker'][] | null {
   return registry.resolve_command(full_name)?.allowed_invokers ?? null;
+}
+
+/**
+ * The owning App id of a command full-name (`<app_id>.<cmd>`, DOT-delimited per
+ * §0.5). This is the AUTHORITATIVE writer for the cross-namespace gate: the ops a
+ * command returns were produced by that App's command body, regardless of who
+ * CALLED it (a cross-App call stamps the caller in `ctx.identity`, not the owner).
+ * Command names use a dot; block names use a colon — they never collide.
+ */
+function command_app_id(full_name: string): string {
+  const dot = full_name.indexOf('.');
+  return dot < 0 ? full_name : full_name.slice(0, dot);
+}
+
+/**
+ * If a write op references ANY block name outside `writer`'s namespace, return the
+ * first such name; otherwise null. "References" = every name the op WRITES (the
+ * object it creates/mutates) AND every name it writes UNDER (parent / new_parent),
+ * because appending a child into another App's block, or moving a node under it, is
+ * also a write into that App's subtree. The owner of a block name is the part before
+ * its first colon (`owner_app_id`, INV #15); a malformed name has no owner and is
+ * treated as foreign (fail-closed). Pure + O(1) per op.
+ */
+function foreign_namespace_target(op: BlockOp, writer: string): string | null {
+  const names: string[] = [];
+  switch (op.kind) {
+    case 'create':
+      names.push(op.parent, op.block.name);
+      break;
+    case 'append':
+      names.push(op.target, op.child.name);
+      break;
+    case 'update':
+      names.push(op.target);
+      break;
+    case 'delete':
+      names.push(op.target);
+      break;
+    case 'move':
+      names.push(op.target, op.new_parent);
+      break;
+    default: {
+      const _never: never = op;
+      return String(_never);
+    }
+  }
+  for (const name of names) {
+    if (!owns_namespace(name, writer)) return name;
+  }
+  return null;
+}
+
+/** True iff block `name`'s owner namespace (before the first colon) equals `writer`. */
+function owns_namespace(name: string, writer: string): boolean {
+  if (!is_valid_block_name(name)) return false; // malformed → not owned (fail-closed)
+  return owner_app_id(name) === writer;
 }
 
 /** The reserved `core.*` primitive full-name that matches a BlockOp's kind. */

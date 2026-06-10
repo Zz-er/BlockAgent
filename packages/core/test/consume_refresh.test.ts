@@ -309,7 +309,7 @@ async function seedAndRenderText(w: Wired): Promise<string> {
 async function seedViews(w: Wired): Promise<void> {
   await w.reg.seedProjectionBlocks(
     (name) => w.ops.has(name),
-    (sOps) => w.ops.apply(sOps, { invoker: 'app' }),
+    (sOps) => w.ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
   );
 }
 

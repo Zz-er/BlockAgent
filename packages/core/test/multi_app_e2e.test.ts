@@ -127,7 +127,7 @@ function boot(script: MockTurn[]): Boot {
 async function seed(b: Boot): Promise<void> {
   await b.reg.seedProjectionBlocks(
     (name) => b.ops.has(name),
-    (ops) => b.ops.apply(ops, { invoker: 'app' }),
+    (ops) => b.ops.apply(ops, { invoker: 'app', trust: 'trusted' }),
     b.runtime.root,
   );
 }
