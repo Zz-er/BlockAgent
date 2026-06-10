@@ -43,6 +43,7 @@ import type {
   Operations as OperationsContract,
 } from './types.js';
 import { BlockTree, BlockTreeError, is_valid_block_name, owner_app_id } from './block.js';
+import { current_chain_trust, run_in_chain, stricter_trust } from './taint.js';
 import { PolicyEngine, PRIMITIVE_COMMANDS } from './policy.js';
 
 // ============================================================================
@@ -167,10 +168,20 @@ export class Operations implements OperationsContract {
       return { status: 'error', error: `no such command: ${full_name}` };
     }
 
-    // (3) route to the owning App (already authorized).
+    // (3) route to the owning App (already authorized). Wrap the route in the taint
+    //     chain: the subtree's trust is the STRICTER of the inherited chain trust and
+    //     THIS call's effective trust (sandbox-taint propagation, SS3). So a nested
+    //     `ctx.invoke_command` inside the handler — even one targeting a TRUSTED app —
+    //     inherits the sandboxed floor and cannot launder the taint (the hole this
+    //     fixes). A top-level trusted call sets a `trusted` chain (no-op floor); a
+    //     top-level sandboxed call (or any sandboxed ancestor) pins `sandboxed`.
+    const chain_trust = stricter_trust(
+      current_chain_trust(),
+      this.policy.effective_trust_for(full_name, ctx),
+    );
     let result: CommandResult;
     try {
-      result = await this.registry.route(full_name, args, ctx);
+      result = await run_in_chain(chain_trust, () => this.registry.route(full_name, args, ctx));
     } catch (err) {
       return { status: 'error', error: error_message(err) };
     }
@@ -200,11 +211,15 @@ export class Operations implements OperationsContract {
     //     resolved `sandboxed` trust onto the per-op ctx so the sandboxed row +
     //     structural floor (physical/pinned/cred) apply to the ops exactly as if the
     //     command itself had declared them.
-    if (
-      result.ops &&
-      result.ops.length > 0 &&
-      this.policy.effective_trust_for(full_name, ctx) === 'sandboxed'
-    ) {
+    //     Taint (SS3): the re-gate also fires when the CHAIN is sandboxed even if THIS
+    //     command resolves trusted — a trusted intermediary executing inside a
+    //     sandboxed chain must not emit destructive ops under full trust. We fold the
+    //     inherited chain trust into the decision (stricter wins).
+    const effective_with_chain = stricter_trust(
+      current_chain_trust(),
+      this.policy.effective_trust_for(full_name, ctx),
+    );
+    if (result.ops && result.ops.length > 0 && effective_with_chain === 'sandboxed') {
       // (3.5a) NAMESPACE-OWNERSHIP gate (cross-ns write isolation, task#12). The
       //     per-op capability re-check below catches the destructive trio
       //     (physical/pinned/cred), but an ordinary `block:write` op that targets a
@@ -348,10 +363,21 @@ export class Operations implements OperationsContract {
     // (`effective_trust` takes the STRICTER of resolved-app-trust and the stamp, so an
     // explicit `trust:'trusted'` here still resolves to trusted — full power — while an
     // absent stamp now resolves to sandboxed instead of the old fail-open trusted.)
-    const ctx: InvokerContext =
+    //
+    // Taint (SS3, team-lead ④): also fold the CURRENT CHAIN trust in (stricter wins),
+    // so an `apply()` reached from inside a sandboxed chain is gated under the
+    // sandboxed floor EVEN IF this ctx was stamped `trusted` (a trusted intermediary
+    // writing on behalf of a sandboxed ancestor cannot use full power). A top-level
+    // trusted writer (no sandboxed ancestor) keeps full trust — zero regression.
+    const chain_trust = current_chain_trust();
+    const base: InvokerContext =
       invoker_ctx.invoker === 'app' && invoker_ctx.trust === undefined
         ? { ...invoker_ctx, trust: 'sandboxed' }
         : invoker_ctx;
+    const ctx: InvokerContext =
+      chain_trust === undefined
+        ? base
+        : { ...base, trust: stricter_trust(base.trust, chain_trust) };
 
     // Gate EVERY op under its own primitive full-name so the §9.4 structural and
     // capability checks (physical delete, pinned, private) each apply. The batch
