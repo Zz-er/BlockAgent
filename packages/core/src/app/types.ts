@@ -629,4 +629,28 @@ export interface BuilderRegistry {
    * folds merged results through), or null if no such App is installed.
    */
   get_app_context?(app_id: string): AppContext | null;
+
+  /**
+   * Pull-from-cache verdict for a contract provider (UH-2 §3.6), encoding HOW
+   * consume-refresh must resolve it so the IRON RULE holds: the consume/render path NEVER
+   * forks or RPCs into a child process. Three modes:
+   *   - `{ mode: 'route' }`        — IN-PROCESS provider (or unknown app): take the normal
+   *      `invoke_query`/route path (synchronous against the live cell, no RPC — zero
+   *      regression for every built-in today).
+   *   - `{ mode: 'cell', value }`  — CHILD-PROCESS provider that pushed the contract's
+   *      scalar into the CONVENTION cell slot `state.__contracts__[<contract>]`: use
+   *      `value`, read SYNCHRONOUSLY from the core-side cell (the child pushed it via
+   *      set_state while active for its own reasons). No fork/activate/RPC (INV #1:
+   *      already committed). A convention, not a manifest field (A-minimal).
+   *   - `{ mode: 'degrade' }`      — CHILD-PROCESS provider with no usable cached value
+   *      (the convention slot is absent/undefined because the child never activated/pushed).
+   *      Consume-refresh must NOT route it (a sync cross-process RPC on the render path is
+   *      forbidden) — it degrades to last-good (per-consumer-atomic, SS4d).
+   * Optional on the interface (a contract-less double omits it ⇒ caller treats absence as
+   * `'route'`, preserving prior behavior). Pure + synchronous (host-kind + map + cell read).
+   */
+  pull_cached_contract?(
+    app_id: string,
+    contract: string,
+  ): { mode: 'route' } | { mode: 'cell'; value: unknown } | { mode: 'degrade' };
 }
