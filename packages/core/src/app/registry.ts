@@ -46,6 +46,7 @@ import type {
 } from './types.js';
 import type { ContractDef } from './contracts.js';
 import { effectiveTrust, resolveHost } from './host.js';
+import { assertStateWithinQuota } from './state_quota.js';
 import type { AppHost } from './app_host.js';
 import { InProcessHost } from './in_process_host.js';
 import { current_chain_trust } from '../core/taint.js';
@@ -584,14 +585,19 @@ export class AppRegistry
    * AppContext getter / projection / pull read, so the next render sees it (§3.6: the
    * core-side cell is the authoritative pull source, not the child's local copy).
    *
-   * TODO(SS4/task#16): the set_state byte quota (前置3) hooks HERE — clip/reject an
-   * oversized `next` before commit. SS3c only wires the write path + schema gate.
+   * SS4a / task#16 (前置3): the set_state BYTE quota hooks here — a sandboxed child
+   * framing back an oversized state is REJECTED (throws, cell untouched) the same as
+   * the in-process `set_state` path, so the quota holds regardless of carrier. The
+   * caller (HostDeps.write_cell, in child_process_host) surfaces the throw as a failed
+   * write-back; the child's local copy is its problem, the authoritative cell does not
+   * grow. Trusted apps never reach this path (they have no child write-back).
    */
   write_app_cell(app_id: string, next: unknown): void {
     const instance = this.apps.get(app_id);
     if (!instance) return; // unknown / uninstalled — no-op (idempotent)
     assertJsonSerializable(next, app_id, '', new WeakSet());
     assertMatchesSchema(next, instance.manifest.state_schema, app_id);
+    assertStateWithinQuota(app_id, instance.manifest.trust, next);
     instance.cell.state = next; // authoritative live write (what get_app_context reads)
   }
 
@@ -1239,6 +1245,11 @@ export class AppRegistry
         // plus a shallow schema required-key check.
         assertJsonSerializable(next, app_id, '', new WeakSet());
         assertMatchesSchema(next, manifest.state_schema, app_id);
+        // SS4a / 前置3: a SANDBOXED app's state is the projection source — gate its
+        // BYTE size (the schema check is shape, not size). REJECT over-quota so the
+        // cell stays at its previous value (a sandboxed app can't bloat the prompt /
+        // poison the cache prefix). No-op for a trusted app (unmetered, zero regression).
+        assertStateWithinQuota(app_id, manifest.trust, next);
         cell.state = next;
       },
 
