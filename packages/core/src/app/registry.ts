@@ -280,6 +280,15 @@ interface AppInstance {
   readonly host: AppHost;
   /** Mutable backing store for `ctx.state`. */
   state: unknown;
+  /**
+   * The LIVE state cell the AppContext's `state` getter / `set_state` read & write
+   * (the same object closed over in `makeContext`). Held here so the registry can
+   * authoritatively write it for a CHILD-PROCESS app (which has no in-process
+   * set_state proxy): `write_app_cell` validates + assigns `cell.state`, and the
+   * render/pull path reading `get_app_context(id).state` sees it. (`state` above is a
+   * one-time snapshot at construction; `cell.state` is the live value.)
+   */
+  readonly cell: { state: unknown };
   /** Built CommandManifests, keyed by bare command name. */
   readonly commands: Map<string, CommandManifest>;
   /** Built BuilderManifests this App owns. */
@@ -559,6 +568,42 @@ export class AppRegistry
    */
   get_app_context(app_id: string): AppContext | null {
     return this.apps.get(app_id)?.host.current_context() ?? null;
+  }
+
+  /**
+   * write_app_cell — AUTHORITATIVELY write a child-process App's state cell from a
+   * `set_state` framed back by its sandboxed child (UH-2/SS3c, 补强①). HOST/SYSTEM
+   * WRITE PATH, NOT app-facing: only the launcher-injected `HostDeps.write_cell` calls
+   * it (an app holds an AppContext, never the registry — so this is unreachable from
+   * app code and does not widen the app surface).
+   *
+   * The child is UNTRUSTED: its own (child-side) schema check is only a fail-fast hint,
+   * so we RE-VALIDATE here against the App's `state_schema` (the same `assertMatchesSchema`
+   * the in-process set_state proxy runs) BEFORE committing — a schema breach throws and
+   * the cell is left untouched (INV #14). On success we mutate the LIVE `cell` the
+   * AppContext getter / projection / pull read, so the next render sees it (§3.6: the
+   * core-side cell is the authoritative pull source, not the child's local copy).
+   *
+   * TODO(SS4/task#16): the set_state byte quota (前置3) hooks HERE — clip/reject an
+   * oversized `next` before commit. SS3c only wires the write path + schema gate.
+   */
+  write_app_cell(app_id: string, next: unknown): void {
+    const instance = this.apps.get(app_id);
+    if (!instance) return; // unknown / uninstalled — no-op (idempotent)
+    assertJsonSerializable(next, app_id, '', new WeakSet());
+    assertMatchesSchema(next, instance.manifest.state_schema, app_id);
+    instance.cell.state = next; // authoritative live write (what get_app_context reads)
+  }
+
+  /**
+   * dispatch_app_event — deliver an `emit` event framed back by a child-process App
+   * (UH-2/SS3c, §3.5 invalidation doorbell). HOST/SYSTEM path (the launcher-injected
+   * `HostDeps.dispatch_event` calls it), the public twin of the private `dispatchEvent`
+   * that `AppContext.emit` uses in-process. Carries NO render data — just the event +
+   * payload to subscribers. Not app-reachable (apps hold an AppContext, not the registry).
+   */
+  dispatch_app_event(topic: string, payload: unknown): void {
+    this.dispatchEvent(topic, { topic, payload });
   }
 
   // --------------------------------------------------------------------------
@@ -1119,6 +1164,7 @@ export class AppRegistry
       ctx,
       host,
       state: cell.state,
+      cell, // the LIVE cell (write_app_cell mutates this for a child-process app)
       commands,
       builders,
       subscriptions,
