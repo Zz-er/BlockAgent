@@ -80,16 +80,19 @@ function stubCtx(app_id: string): AppContext {
 // InProcessHost — unit
 // ===========================================================================
 
+// A stub run_command closure for the InProcessHost unit tests (the 4th ctor arg).
+const stubRun = async () => ({ ok: true } as const);
+
 describe('InProcessHost', () => {
   it('reports kind=in-process and is always active', () => {
-    const host = new InProcessHost('a', stubCtx('a'), () => undefined);
+    const host = new InProcessHost('a', stubCtx('a'), () => undefined, stubRun);
     expect(host.kind).toBe('in-process');
     expect(host.active).toBe(true);
   });
 
   it('current_context() (sync) and activate() (async) both return the SAME live ctx', async () => {
     const ctx = stubCtx('a');
-    const host = new InProcessHost('a', ctx, () => undefined);
+    const host = new InProcessHost('a', ctx, () => undefined, stubRun);
     expect(host.current_context()).toBe(ctx); // sync door: never null for in-process
     await expect(host.activate()).resolves.toBe(ctx); // async door: same instance
     expect(host.current_context()).toBe(ctx); // idempotent
@@ -97,9 +100,17 @@ describe('InProcessHost', () => {
 
   it('dispose() runs the injected (hook-only) teardown closure exactly once', async () => {
     const run = vi.fn();
-    const host = new InProcessHost('a', stubCtx('a'), run);
+    const host = new InProcessHost('a', stubCtx('a'), run, stubRun);
     await host.dispose();
     expect(run).toHaveBeenCalledOnce();
+  });
+
+  it('route_command delegates to the injected run_command closure', async () => {
+    const run = vi.fn(async () => ({ ok: true, data: { ran: true } }));
+    const host = new InProcessHost('a', stubCtx('a'), () => undefined, run);
+    const res = await host.route_command('cmd', { x: 1 }, { invoker: 'app', identity: 'a' });
+    expect(run).toHaveBeenCalledWith('cmd', { x: 1 }, { invoker: 'app', identity: 'a' });
+    expect(res).toEqual({ ok: true, data: { ran: true } });
   });
 });
 

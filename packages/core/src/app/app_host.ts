@@ -34,8 +34,9 @@
  * inside @block-agent/core's empty runtime closure (CI core-closure).
  */
 
-import type { AppContext } from './types.js';
+import type { AppContext, CommandResult } from './types.js';
 import type { AppHostKind } from './types.js';
+import type { InvokerContext } from '../core/types.js';
 
 export interface AppHost {
   /** Installed app id (post collision-rename) — the key the registry indexes by. */
@@ -43,6 +44,17 @@ export interface AppHost {
 
   /** Which carrier this host is — reuses the existing union (types.ts:266). */
   readonly kind: AppHostKind;
+
+  /**
+   * Run one of THIS app's commands and return its CommandResult (ops/data) — the
+   * carrier-polymorphic seam `AppRegistry.route` calls so the registry NEVER branches on
+   * `kind`. InProcessHost runs `manifest.invoke(args, ctx, invoker)` locally (today's
+   * behavior, byte-identical); ChildProcessHost frames it to the child process and
+   * returns the by-value result. The caller (Operations) applies any returned ops
+   * through the chokepoint — route_command itself never applies / never re-policies.
+   * `command` is the BARE command name (registry splits `<app_id>.<command>`).
+   */
+  route_command(command: string, args: unknown, invoker: InvokerContext): Promise<CommandResult>;
 
   /**
    * Whether the app is currently activated. The registry reads this to decide

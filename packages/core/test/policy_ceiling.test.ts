@@ -30,6 +30,11 @@ import { PolicyEngine, CAP } from '../src/core/policy.js';
 import { AppRegistry, AppCapabilityCeilingError } from '../src/app/registry.js';
 import type { AppManifest } from '../src/app/types.js';
 import type { Block, BlockName, BlockOp, InvokerContext } from '../src/core/types.js';
+import {
+  APP_CONTEXT_WHITELIST,
+  allMemberNames,
+  assertAppContextWhitelist,
+} from './_support/appcontext_whitelist.js';
 
 // The two app lanes under test.
 const SANDBOXED: InvokerContext = { invoker: 'app', trust: 'sandboxed', identity: 'evil' };
@@ -747,17 +752,6 @@ function minimalApp(): AppManifest {
   };
 }
 
-/** Collect every member NAME reachable on an object including its prototype chain. */
-function allMemberNames(obj: object): Set<string> {
-  const names = new Set<string>();
-  let cur: object | null = obj;
-  while (cur && cur !== Object.prototype) {
-    for (const k of Object.getOwnPropertyNames(cur)) names.add(k);
-    cur = Object.getPrototypeOf(cur);
-  }
-  return names;
-}
-
 describe('INVARIANT — sandboxed app cannot reach bare Operations.apply()', () => {
   it('the live AppContext exposes invoke_command but NO apply / Operations handle', () => {
     const registry = new AppRegistry();
@@ -768,48 +762,19 @@ describe('INVARIANT — sandboxed app cannot reach bare Operations.apply()', () 
     const members = allMemberNames(ctx as object);
     // The policed write door IS present...
     expect(members.has('invoke_command')).toBe(true);
-    // ...but the bare chokepoint primitive is NOT (any name, any casing).
-    expect(members.has('apply')).toBe(false);
-    for (const name of members) {
-      expect(name.toLowerCase()).not.toBe('apply');
-    }
-
-    // And no member VALUE is an Operations instance (no `.operations` backdoor that
-    // would re-expose apply()). Probe own+proto members defensively (getters may throw).
-    for (const name of members) {
-      let value: unknown;
-      try {
-        value = (ctx as unknown as Record<string, unknown>)[name];
-      } catch {
-        continue; // a throwing getter exposes nothing usable
-      }
-      expect(value).not.toBeInstanceOf(Operations);
-    }
+    // ...but the bare chokepoint primitive is NOT, and no member is an Operations
+    // instance. Uses the SHARED whitelist helper so the in-process and cross-process
+    // (AppContextProxy, SS3b) surfaces are pinned by ONE source of truth.
+    assertAppContextWhitelist(ctx as object, (v) => v instanceof Operations);
   });
 
   it('the AppContext write surface is exactly the by-name whitelist (no apply added)', () => {
-    // Pin the EXACT set of members an app holds. If a future change adds a member,
-    // this fails and forces a conscious review — specifically it would catch an
-    // `apply`/Operations leak. (app_id + state are data; the rest are the methods.)
+    // The exact-own-member-set arm of the shared assertion (a future added member fails
+    // it and forces a conscious review — catches an `apply`/Operations leak).
     const registry = new AppRegistry();
     registry.install(minimalApp());
     const ctx = registry.get_app_context('mini')!;
-    const own = new Set(Object.keys(ctx)); // enumerable own members handed to the app
-    const expected = new Set([
-      'app_id',
-      'state',
-      'set_state',
-      'list_commands',
-      'list_builders',
-      'list_blocks',
-      'invoke_command',
-      'read',
-      'on',
-      'emit',
-      'spawn_system_agent',
-      'wake',
-    ]);
-    expect(own).toEqual(expected);
+    expect(new Set(Object.keys(ctx))).toEqual(new Set(APP_CONTEXT_WHITELIST));
   });
 });
 

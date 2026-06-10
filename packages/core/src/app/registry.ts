@@ -942,13 +942,12 @@ export class AppRegistry
     const instance = this.apps.get(app_id);
     if (!instance)
       return { ok: false, error: `unknown App '${app_id}' for command '${full_name}'` };
-    const manifest = instance.commands.get(command);
-    if (!manifest) return { ok: false, error: `unknown command '${full_name}'` };
-    try {
-      return await manifest.invoke(args, instance.ctx, invoker);
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
-    }
+    // Carrier-polymorphic (UH-2/SS3b): delegate to the App's AppHost so the registry
+    // NEVER branches on host kind. InProcessHost runs `manifest.invoke` locally
+    // (byte-identical to the prior inline path); ChildProcessHost frames the command to
+    // the child. route stays thin: it does not applyOps and does not re-policy (that is
+    // Operations' job, INV#11).
+    return instance.host.route_command(command, args, invoker);
   }
 
   // --------------------------------------------------------------------------
@@ -1052,11 +1051,32 @@ export class AppRegistry
 
     // UH-1 carrier (impl-spec §3.2): wrap the live ctx in an in-process AppHost. The
     // dispose hook is the HOOK-ONLY runner (never `uninstall`) so a future teardown
-    // path through `host.dispose()` cannot recurse into `uninstall`. The closure
-    // captures the id and resolves the instance lazily, so there is no construction-
-    // order dependency on the not-yet-returned instance.
-    const host: AppHost = new InProcessHost(installed_id, ctx, () =>
-      this.runUninstallHook(installed_id),
+    // path through `host.dispose()` cannot recurse into `uninstall`. The closures
+    // capture the id and resolve the instance lazily, so there is no construction-order
+    // dependency on the not-yet-returned instance.
+    //
+    // run_command is the in-process `route_command` body — the SAME `manifest.invoke`
+    // path `route` used inline before (byte-identical): look up the command, run its
+    // handler against this app's live ctx, wrap thrown errors. `route` now delegates
+    // here polymorphically (no host-kind branch).
+    const run_command = async (
+      command: string,
+      args: unknown,
+      invoker: InvokerContext,
+    ): Promise<CommandResult> => {
+      const cmd = commands.get(command);
+      if (!cmd) return { ok: false, error: `unknown command '${installed_id}.${command}'` };
+      try {
+        return await cmd.invoke(args, ctx, invoker);
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    };
+    const host: AppHost = new InProcessHost(
+      installed_id,
+      ctx,
+      () => this.runUninstallHook(installed_id),
+      run_command,
     );
 
     return {
