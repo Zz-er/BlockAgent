@@ -25,6 +25,7 @@ import { BlockTree } from '../src/core/block.js';
 import { Operations } from '../src/core/operations.js';
 import { PolicyEngine, CAP } from '../src/core/policy.js';
 import { AppRegistry } from '../src/app/registry.js';
+import { inProcessChildFactory } from './_support/in_process_child_factory.js';
 import type { AppManifest, AppContext } from '../src/app/types.js';
 import type { Block, BlockName, BlockOp, InvokerContext } from '../src/core/types.js';
 
@@ -147,6 +148,11 @@ function makeApps(): AppManifest[] {
 function wire() {
   const tree = emptyTree();
   const registry = new AppRegistry();
+  // SS3c: `evil` is trust:'sandboxed' → resolveHost='child-process' → install
+  // fail-closed-throws without a child factory. This is an ENGINE test (taint chain),
+  // so inject the TEST-ONLY in-process factory to run the sandboxed manifest in-process
+  // (no fork). Production has no such factory (footgun guard).
+  registry.child_host_factory = inProcessChildFactory;
   for (const m of makeApps()) registry.install(m);
   const policy = new PolicyEngine({
     capability_resolver: (fn) => registry.resolve_command(fn)?.capabilities ?? [],
@@ -308,6 +314,7 @@ describe('sandbox-taint — single-hop result.ops re-gate (regression)', () => {
     const node: Block = { id: 'evil:x', name: 'evil:x', children: [], content_text: null, content_blob: null };
     tree.applyOps([{ kind: 'create', parent: 'root:root', block: node }]);
     const registry = new AppRegistry();
+    registry.child_host_factory = inProcessChildFactory; // SS3c: run sandboxed manifest in-process (engine test)
     const sneaky: AppManifest = {
       id: 'evil',
       version: '0.0.0',
