@@ -100,6 +100,8 @@ function makeCountProvider(opts: {
   contract: string;
   value: number;
   bad?: boolean;
+  /** Delay the via response by this many ms — to exceed the §3.7 per-provider deadline. */
+  delay_ms?: number;
 }): AppManifest {
   const count: CommandManifest = {
     name: 'count',
@@ -110,6 +112,9 @@ function makeCountProvider(opts: {
     capabilities: [],
     async invoke(_args: unknown, ctx: AppContext): Promise<CommandResult> {
       const s = ctx.state as { value: number };
+      // A slow provider (SS4d §3.7): exceed the per-provider deadline so the pull times
+      // out. The runtime must NOT serialize/hang on it — the timeout degrades the entry.
+      if (opts.delay_ms) await new Promise((r) => setTimeout(r, opts.delay_ms));
       // `bad` returns a non-number → fails validateAgainstSchema downstream.
       return { ok: true, data: opts.bad ? ('oops' as unknown as number) : s.value };
     },
@@ -434,5 +439,47 @@ describe('consume-refresh (real runtime + Operations + registry + renderer)', ()
     );
     await expect(w.runtime.on_wake(WAKE)).resolves.toBeUndefined();
     expect(w.runtime.state.kind).toBe('idle');
+  });
+
+  // -- SS4d (§3.7): parallel fan-in + per-provider timeout --------------------
+
+  it('⑥ a SLOW provider times out → consumer degrades to prior state (no snapshot hijack)', async () => {
+    // The provider sleeps > the 200ms per-provider deadline. The pull times out, which —
+    // like any provider failure — degrades the WHOLE consumer (R-4 atomic): it keeps its
+    // seed, the turn does not hang or crash. This is the §3.7 "slow provider must not
+    // hijack the snapshot" guarantee.
+    const w = wire(
+      [
+        makeCountProvider({ id: 'prov_slow', contract: COUNT_SUM.name, value: 3, delay_ms: 500 }),
+        makeNumberConsumer({ id: 'cons', contract: COUNT_SUM.name, seed: 9 }),
+      ],
+      [COUNT_SUM],
+    );
+
+    await w.runtime.on_wake(WAKE); // bounded by the 200ms deadline; a true hang would trip
+    //                                 vitest's own per-test timeout (so non-hang is proven
+    //                                 by the test completing at all — no flaky wall-clock).
+
+    // The timeout degraded the entry: the consumer kept its SEED (9), NOT the slow 3 —
+    // i.e. the snapshot was not hijacked by the slow provider, and no half value leaked.
+    expect(totalOf(w.reg, 'cons')).toBe(9);
+    expect(w.runtime.state.kind).toBe('idle'); // turn survived
+  });
+
+  it('⑦ multi-provider fan-in is PARALLEL yet byte-deterministic (sum independent of pull order)', async () => {
+    // Two providers, one slower than the other but both WITHIN the deadline. Parallel
+    // pull + Promise.all preserving INPUT (manifest-stable) order ⇒ combineResults folds
+    // by position, so the sum is the same regardless of which RPC returned first.
+    const w = wire(
+      [
+        makeCountProvider({ id: 'prov_a', contract: COUNT_SUM.name, value: 10, delay_ms: 50 }),
+        makeCountProvider({ id: 'prov_b', contract: COUNT_SUM.name, value: 5 }), // returns first
+        makeNumberConsumer({ id: 'cons', contract: COUNT_SUM.name, seed: 0 }),
+      ],
+      [COUNT_SUM],
+    );
+
+    await w.runtime.on_wake(WAKE);
+    expect(totalOf(w.reg, 'cons')).toBe(15); // sum(10,5) regardless of arrival order
   });
 });
