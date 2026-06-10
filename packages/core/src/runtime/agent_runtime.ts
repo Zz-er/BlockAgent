@@ -521,21 +521,55 @@ export class AgentRuntime {
     // DETERMINISM (§3.7 / INV #1): `Promise.all` resolves to results in INPUT order, and
     // `providers` is in `deriveContractTable`'s manifest-stable order, so `datas` folds
     // through `combineResults` (position-based) byte-identically regardless of which
-    // provider's RPC returned first. We MUST NOT collect by arrival order (no
-    // `Promise.race` / push-on-resolve) — that would break byte-determinism.
+    // pull returned first. We MUST NOT collect by arrival order (no `Promise.race` /
+    // push-on-resolve) — that would break byte-determinism.
+    //
+    // PULL-FROM-CACHE (UH-2 §3.6) — IRON RULE: the consume/render path NEVER forks or RPCs
+    // into a child process. `pull_cached_contract` returns the per-provider verdict:
+    //   - 'route'   → IN-PROCESS provider: the normal read-only `invoke_query` (synchronous
+    //                 against the live cell, no RPC — zero regression). This is the ONLY
+    //                 mode that ever touches `invoke_query`/`route`.
+    //   - 'cell'    → CHILD-PROCESS provider with a present declared cache slot: use that
+    //                 SYNCHRONOUSLY-read core-side value (the child pushed it via set_state
+    //                 while active for its own reasons; no fork/activate/RPC here, INV #1).
+    //   - 'degrade' → CHILD-PROCESS provider with no usable cached value (undeclared, or the
+    //                 child never activated so the slot is still undefined): we THROW — never
+    //                 route a child (that would be a forbidden sync cross-process RPC). The
+    //                 throw degrades the WHOLE consumer to last-good (per-consumer-atomic,
+    //                 SS4d). A sandboxed provider reporting stale/default until it first
+    //                 activates (for its own reasons) and pushes is acceptable (§3.6).
+    // Absent seam (contract-less double) ⇒ treated as 'route' (prior behavior).
+    const pullCached = this.registry.pull_cached_contract?.bind(this.registry);
     const datas = await Promise.all(
       providers.map(async (provider) => {
         const full_name = `${provider.app_id}.${provider.via}`;
-        const res = await withTimeout(
-          invoke_query(full_name, {}, invoker),
-          CONSUME_PULL_DEADLINE_MS,
-          `consume-refresh: query '${full_name}' exceeded ${CONSUME_PULL_DEADLINE_MS}ms`,
-        );
+        const verdict = pullCached?.(provider.app_id, contract) ?? { mode: 'route' as const };
+        let res: CommandResult;
+        if (verdict.mode === 'cell') {
+          res = { ok: true, data: verdict.value }; // §3.6 sync cell read, no RPC/activate
+        } else if (verdict.mode === 'degrade') {
+          // Child provider with no usable cache → degrade the consumer (last-good). NEVER
+          // route a child on the render path (no sync fork/RPC — the iron rule).
+          throw new Error(
+            `consume-refresh: child-process provider '${full_name}' has no cached value ` +
+              `for '${contract}' (not yet pushed) — degrading consumer to last-good (§3.6)`,
+          );
+        } else {
+          // 'route': in-process provider — the normal synchronous read-only query (no RPC),
+          // still wrapped in the §3.7 per-provider deadline as defense-in-depth.
+          res = await withTimeout(
+            invoke_query(full_name, {}, invoker),
+            CONSUME_PULL_DEADLINE_MS,
+            `consume-refresh: query '${full_name}' exceeded ${CONSUME_PULL_DEADLINE_MS}ms`,
+          );
+        }
         if (!res.ok) {
           throw new Error(
             `consume-refresh: query '${full_name}' failed: ${res.error ?? 'unknown error'}`,
           );
         }
+        // Validate against the contract output_schema the SAME way a queried value is (R-2)
+        // — a stale/garbage cell value cannot bypass the contract.
         const check = validateAgainstSchema(res.data, def.output_schema);
         if (!check.ok) {
           throw new Error(

@@ -260,6 +260,32 @@ function splitCommandName(full_name: string): { app_id: string; command: string 
     : { app_id: full_name.slice(0, idx), command: full_name.slice(idx + 1) };
 }
 
+/**
+ * The CONVENTION state slot a CHILD-PROCESS contract provider pushes its cached contract
+ * scalars into (UH-2 §3.6, A-minimal). `state.__contracts__` is a map `contract → scalar`:
+ * the child, when active for its own reasons, computes a contract's value and `set_state`s
+ * it here (framed back to the core-side cell via write_app_cell); consume-refresh reads it
+ * SYNCHRONOUSLY (no fork/RPC). A convention — NOT a manifest field — so a provider opts in
+ * simply by writing the slot; nothing to declare (anti-gold-plating). Exported so a
+ * provider/test references the same key (no drift). The `__`-fenced name avoids collision
+ * with ordinary state fields.
+ */
+export const CONTRACT_CACHE_SLOT = '__contracts__' as const;
+
+/**
+ * Read a dot-path (`a.b.c`) into a JSON state object; `undefined` if any hop is missing
+ * (UH-2 §3.6 pull-from-cache). An empty path returns the whole state. Pure + O(depth).
+ */
+function readStatePath(state: unknown, path: string): unknown {
+  if (path === '') return state;
+  let cur = state;
+  for (const key of path.split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur;
+}
+
 // ============================================================================
 // Internal install record — one live App instance + its registered surface.
 // ============================================================================
@@ -600,6 +626,49 @@ export class AppRegistry
     assertMatchesSchema(next, instance.manifest.state_schema, app_id);
     assertStateWithinQuota(app_id, instance.manifest.trust, next);
     instance.cell.state = next; // authoritative live write (what get_app_context reads)
+  }
+
+  /**
+   * pull_cached_contract — UH-2 §3.6 pull-from-cache (A-minimal, team-lead-scoped),
+   * returning HOW consume-refresh must resolve this provider so the IRON RULE holds: the
+   * consume/render path NEVER forks or RPCs into a child process. Three verdicts:
+   *
+   *   - `{ mode: 'route' }` — IN-PROCESS provider (or unknown app). Its `via` command
+   *     already runs SYNCHRONOUSLY against the live cell with no RPC, so consume-refresh
+   *     takes the normal `invoke_query`/route path. Zero regression (every built-in today).
+   *
+   *   - `{ mode: 'cell', value }` — CHILD-PROCESS provider that has pushed the contract's
+   *     scalar into the CONVENTION cell slot `state.${CONTRACT_CACHE_SLOT}[<contract>]`.
+   *     Read SYNCHRONOUSLY from the core-side cell (the value the child pushed via set_state
+   *     while it was active for its OWN reasons) — NO fork/activate/RPC (INV #1: already
+   *     committed before the snapshot freezes). NO manifest declaration: the slot is a
+   *     convention (A-minimal — a child opts in by pushing to it; nothing to declare).
+   *
+   *   - `{ mode: 'degrade' }` — CHILD-PROCESS provider with NO usable cached value (the
+   *     convention slot is absent/undefined because the child has never activated/pushed).
+   *     Consume-refresh must NOT route to it (a sync cross-process RPC on the render path is
+   *     forbidden) — it degrades to last-good via the per-consumer-atomic path (SS4d): the
+   *     consumer keeps its prior value this turn. A sandboxed provider reporting stale/
+   *     default until it first activates (for its own reasons) and pushes is acceptable.
+   *
+   * Pure + O(1): a host-kind check + a dot-path read of the convention slot.
+   */
+  pull_cached_contract(
+    app_id: string,
+    contract: string,
+  ): { mode: 'route' } | { mode: 'cell'; value: unknown } | { mode: 'degrade' } {
+    const instance = this.apps.get(app_id);
+    if (!instance) return { mode: 'route' }; // unknown app → normal path errors there
+    // In-process provider: synchronous route, no RPC — take the normal path (zero regression).
+    if (instance.host.kind !== 'child-process') return { mode: 'route' };
+    // Child-process provider: NEVER route (no sync RPC on the render path). Read the
+    // CONVENTION slot map (`state.__contracts__`) and index it by the FULL contract name
+    // (not a dot-path concat, so a contract name containing '.' is handled correctly). A
+    // present value → cell; otherwise degrade (last-good), never fork.
+    const slot = readStatePath(instance.cell.state, CONTRACT_CACHE_SLOT);
+    if (slot === null || typeof slot !== 'object') return { mode: 'degrade' };
+    const value = (slot as Record<string, unknown>)[contract];
+    return value === undefined ? { mode: 'degrade' } : { mode: 'cell', value };
   }
 
   /**
