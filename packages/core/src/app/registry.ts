@@ -47,6 +47,7 @@ import type {
 import type { ContractDef } from './contracts.js';
 import { effectiveTrust, resolveHost } from './host.js';
 import { assertStateWithinQuota } from './state_quota.js';
+import { makeGenericProjectionBuilder } from '../apps/_projection.js';
 import type { AppHost } from './app_host.js';
 import { InProcessHost } from './in_process_host.js';
 import { current_chain_trust } from '../core/taint.js';
@@ -1098,6 +1099,22 @@ export class AppRegistry
       const builder = factory(cell.state);
       this.assertLegalBuilder(installed_id, builder);
       builders.push(builder);
+    }
+
+    // UH-2/SS4b (§3.4 方案 A): a SANDBOXED app ships NO builder code — it DECLARES
+    // `projection: [{block, from}]`, and the core side synthesizes one trusted,
+    // system-owned GenericProjectionBuilder per entry (owner=system, reads state[from],
+    // forces scan+fence+clip, pins the block volatile). This is the ONLY way an
+    // untrusted app's state reaches the render path (it never runs build() itself). A
+    // TRUSTED app declaring `projection` is ignored here (it renders via its own
+    // builders) — the auto-build is sandboxed-only, so the generic builder is never
+    // layered on top of a trusted app's hand-written builders.
+    if (manifest.projection && effectiveTrust(manifest.trust) === 'sandboxed') {
+      for (const { block, from } of manifest.projection) {
+        builders.push(
+          makeGenericProjectionBuilder({ app_id: installed_id, block_name: block, from }),
+        );
+      }
     }
 
     // UH-1 carrier (impl-spec §3.2): wrap the live ctx in an in-process AppHost. The
