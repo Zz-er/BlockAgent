@@ -45,6 +45,11 @@ import type {
 import { BlockTree, BlockTreeError, is_valid_block_name, owner_app_id } from './block.js';
 import { current_chain_trust, run_in_chain, stricter_trust } from './taint.js';
 import { PolicyEngine, PRIMITIVE_COMMANDS } from './policy.js';
+// UH-2 SS4c (task#19): the SHARED, pure provenance helpers — the SAME injection scanner +
+// "data not instructions" fence memory uses (apps/memory_store.ts), reused here so an
+// untrusted-chain write goes through the exact INV#21 fence. Intra-core import (apps/ is
+// part of @block-agent/core), pure functions, no third-party dep — core closure unaffected.
+import { scanMemoryContent, fenceRecalledContent } from '../apps/memory_store.js';
 
 // ============================================================================
 // Outcome types (impl-core extensions, not in the contract interface)
@@ -259,6 +264,39 @@ export class Operations implements OperationsContract {
         );
         if (decision.kind === 'deny') return { status: 'denied', reason: decision.reason };
         if (decision.kind === 'pending') return { status: 'pending', token: decision.token };
+      }
+
+      // (3.5c) CONTENT-side provenance (UH-2 §3.4 / task#19 — confused-deputy residual).
+      //     3.5a/3.5b gate the SHAPE of the write (which objects, which op classes). This
+      //     gates the CONTENT: any text a write op stores into the tree under a SANDBOXED
+      //     chain is untrusted-origin (it flows verbatim into the LLM prompt, INV #1: the
+      //     tree IS the render source). The fatal subtlety (Raven ③): the chain is
+      //     sandboxed even when THIS command's app is trusted — a trusted deputy invoked
+      //     inside a sandboxed chain writing attacker text is the confused-deputy launder.
+      //     We key off `effective_with_chain` (folds `current_chain_trust()`), NOT the
+      //     writer's manifest.trust, so the deputy's content is still treated as untrusted.
+      //
+      //     Mechanism = bake the fence into `content_text` at WRITE time (the only legal
+      //     option: INV #1 makes the tree the render source and INV #2 forbids sidecar
+      //     block metadata, so there is no render-time hook to fence a deputy's plain block
+      //     later). The FENCE is the primary, wording-insensitive defense (INV #21) and is
+      //     applied UNCONDITIONALLY; `scanMemoryContent` is defense-in-depth — a hit denies
+      //     the whole batch (symmetric to the projection builder rendering nothing on a
+      //     hit), it is NOT the gate for whether to fence. `fenceRecalledContent` is the
+      //     SS4-harden-escaped version, so an embedded `</memory-context>` cannot forge the
+      //     fence boundary.
+      for (const op of result.ops) {
+        const text = op_content_text(op);
+        if (text === null) continue; // op carries no content_text (delete/move) → nothing to fence
+        if (!scanMemoryContent(text).ok) {
+          return {
+            status: 'denied',
+            reason:
+              `sandboxed-chain write carries content that matches an injection/exfiltration ` +
+              `pattern — refused (the content is not rendered)`,
+          };
+        }
+        set_op_content_text(op, fenceRecalledContent(text)); // unconditional fence (INV #21)
       }
     }
 
@@ -659,6 +697,68 @@ function op_policy_args(op: BlockOp): Record<string, unknown> {
     default: {
       const _never: never = op;
       return { _never };
+    }
+  }
+}
+
+/**
+ * The text a write op stores into a block's `content_text`, or null if it carries none
+ * (UH-2 SS4c). `create`/`append` carry it on the new block/child; `update` carries it
+ * directly (and only when present — an update WITHOUT `content_text` leaves the field
+ * untouched, and `content_text: null` CLEARS it, neither of which is untrusted text to
+ * fence). `delete`/`move` carry no text. Only a non-empty string is returned for fencing.
+ */
+function op_content_text(op: BlockOp): string | null {
+  switch (op.kind) {
+    case 'create':
+      return typeof op.block.content_text === 'string' && op.block.content_text.length > 0
+        ? op.block.content_text
+        : null;
+    case 'append':
+      return typeof op.child.content_text === 'string' && op.child.content_text.length > 0
+        ? op.child.content_text
+        : null;
+    case 'update':
+      // `content_text` is optional on update: present-and-string ⇒ a real text write to fence;
+      // absent (key not in patch) or null (clear) ⇒ nothing to fence.
+      return typeof op.content_text === 'string' && op.content_text.length > 0
+        ? op.content_text
+        : null;
+    case 'delete':
+    case 'move':
+      return null;
+    default: {
+      const _never: never = op;
+      return _never;
+    }
+  }
+}
+
+/**
+ * Replace the `content_text` a write op stores (UH-2 SS4c — bake the fence into the bytes
+ * that land in the tree, since the tree IS the render source, INV #1). In-place mutation
+ * of the op the command returned is intentional: this is the authorized batch about to be
+ * applied at (4), and the fence must be in the STORED bytes (there is no render-time
+ * metadata hook, INV #2). Only the kinds that carry text are touched; the matching
+ * `op_content_text` already filtered out the no-text kinds before this is called.
+ */
+function set_op_content_text(op: BlockOp, text: string): void {
+  switch (op.kind) {
+    case 'create':
+      op.block.content_text = text;
+      break;
+    case 'append':
+      op.child.content_text = text;
+      break;
+    case 'update':
+      op.content_text = text;
+      break;
+    case 'delete':
+    case 'move':
+      break; // no text field (unreachable: op_content_text returned null for these)
+    default: {
+      const _never: never = op;
+      void _never;
     }
   }
 }
