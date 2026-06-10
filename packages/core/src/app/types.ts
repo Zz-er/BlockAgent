@@ -315,6 +315,19 @@ export interface AppManifest<TState = unknown> {
   consumes?: { contract: string; as: string }[];
 
   /**
+   * Declarative projection (UH-2 §3.4, 方案 A; doc/blockapp-sandboxed-development.md
+   * 铁律1). A SANDBOXED app does NOT ship builder code — it DECLARES which slice of its
+   * state renders into which block, and the core side runs one trusted, system-owned
+   * `GenericProjectionBuilder` per entry (owner=system, reads `state[from]`, forces
+   * scan+fence+clip, pins the block to volatile). Each entry: `block` is the rendered
+   * block name (`<app_id>:<片名>`), `from` is a dot path into `state` (`''` ⇒ whole
+   * state). Optional + additive; a trusted app ships its own `builders[]` instead and
+   * leaves this unset. (Only a sandboxed app's projection is auto-built — a trusted app
+   * that also sets this is ignored here; it renders via its own builders.)
+   */
+  projection?: { block: BlockName; from: string }[];
+
+  /**
    * Trust level (§ unified-host UH-1). Decides the default host carrier and the
    * capability ceiling applied to this App's commands. Optional + additive:
    * absent ⇒ `'trusted'` (every built-in / first-party App today), so existing
