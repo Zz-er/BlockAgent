@@ -567,12 +567,29 @@ function wants_read_blob(call: OperationCall): boolean {
   return is_record(call.args) && call.args['read_blob'] === true;
 }
 
-/** Credential subtree convention: any block under `<app>:credentials...` (§9.4). */
+/**
+ * Credential subtree convention (§9.4): ANY block whose local name (after the first
+ * colon) STARTS WITH `credentials` (case-insensitive). This is deliberately the
+ * BROAD rule — `credentials`, `credentials/sub`, `credentials.key`, `credentials_new`,
+ * `credentials-bak`, `credentials2`, `credentialsaws` all count.
+ *
+ * Why broad (task#14, Sentry red-team, lead-approved): the prior check matched only
+ * `credentials` exactly and the `/`/`.` separators, so a sandboxed app could
+ * write/poison a credential-LOOKING block named `app:credentials_new` /
+ * `app:credentials2` and slip past the cred-write/read deny (task#11). A
+ * boundary-char rule would still miss digit/letter suffixes (`credentials2`). The
+ * fail-closed call: a SANDBOXED app has no legitimate need to write ANY `credentials*`
+ * block, and operator-provisioned credential blocks may use arbitrary suffixes
+ * (`credentials2`, `credentialsaws`). Over-matching a non-secret `app:credentialsstore`
+ * costs only a rename; UNDER-matching is a credential-poisoning hole. So we round UP:
+ * the credentials prefix is reserved. Case-insensitive so `Credentials_New` cannot
+ * dodge it. Pure + O(1). NOTE: this gates writes/reads via the structural floor for the
+ * RESTRICTED lane (agent / sandboxed) only — trusted user/app keep full access.
+ */
 function is_credential_name(name: string): boolean {
   const colon = name.indexOf(':');
   if (colon < 0) return false;
-  const local = name.slice(colon + 1);
-  return local === 'credentials' || local.startsWith('credentials/') || local.startsWith('credentials.');
+  return name.slice(colon + 1).toLowerCase().startsWith('credentials');
 }
 
 function is_record(v: unknown): v is Record<string, unknown> {

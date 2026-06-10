@@ -237,12 +237,15 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //    never create their builder-output nodes themselves; without this the agent's
   //    FIRST prompt is empty — even its pinned agent_identity:identity (its identity +
   //    operating constraints). We apply the placeholders through Operations.apply(
-  //    invoker=app), so the chokepoint + PolicyEngine still run (no bypass, §9.1); each
-  //    builder overwrites its block from state on every render. Parent = ROOT_NAME (the
-  //    empty-tree root core:root).
+  //    invoker=app, trust=trusted), so the chokepoint + PolicyEngine still run (no
+  //    bypass, §9.1); each builder overwrites its block from state on every render.
+  //    Parent = ROOT_NAME (the empty-tree root core:root). The explicit `trust:'trusted'`
+  //    is required by apply()'s fail-closed default (task#10): this is the TRUSTED system
+  //    seed (it may write pinned system blocks like agent_identity:identity), so it opts
+  //    into full trust explicitly — an unstamped app call now falls to the sandboxed lane.
   await registry.seedProjectionBlocks(
     (name) => operations.has(name),
-    (ops) => operations.apply(ops, { invoker: 'app' }),
+    (ops) => operations.apply(ops, { invoker: 'app', trust: 'trusted' }),
     // CM-4: seed under the runtime's ACTUAL tree root (not seedProjectionBlocks's
     // `core:root` default), so the runtime's bookkeeping blocks — registered during the
     // AgentRuntime ctor above — attach to the live root and actually render. Here
@@ -280,7 +283,9 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
       const removed = await registry.unseedProjectionBlocks(
         app_id,
         (name) => operations.has(name),
-        (ops) => operations.apply(ops, { invoker: 'app' }),
+        // trust:'trusted' — trusted system unseed (soft-delete of projection nodes
+        // through the chokepoint); required by apply()'s fail-closed default (task#10).
+        (ops) => operations.apply(ops, { invoker: 'app', trust: 'trusted' }),
       );
       // (d) drop the registry index + run on_uninstall (graceful teardown).
       registry.uninstall(app_id);

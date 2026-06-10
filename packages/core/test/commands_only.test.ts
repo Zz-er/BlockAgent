@@ -80,7 +80,7 @@ async function seedAndRenderText(
             block: { id: `seed-${name}`, name, children: [], content_text: null, content_blob: null },
           },
         ],
-        { invoker: 'app' },
+        { invoker: 'app', trust: 'trusted' },
       );
     }
   }
