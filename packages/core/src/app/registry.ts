@@ -48,6 +48,7 @@ import type { ContractDef } from './contracts.js';
 import { effectiveTrust } from './host.js';
 import type { AppHost } from './app_host.js';
 import { InProcessHost } from './in_process_host.js';
+import { current_chain_trust } from '../core/taint.js';
 
 // ============================================================================
 // Capability ceiling (INV #19 — O(1) set-membership, injected seam)
@@ -1158,9 +1159,40 @@ export class AppRegistry
         // Cross-App call re-enters the command path. In v3.0 the registry routes
         // directly; the runtime swaps in an Operations-backed router (which adds
         // PolicyEngine, INV #11) by setting `commandRouter`.
-        if (registry.commandRouter)
-          return registry.commandRouter(full_name, args, { invoker: 'app', identity: app_id });
-        return registry.route(full_name, args, { invoker: 'app', identity: app_id });
+        //
+        // Sandbox-taint propagation (SS3): inherit the CURRENT CHAIN trust and stamp it
+        // onto the nested call's ctx. If this app (or any ancestor in the chain) is
+        // sandboxed, the chain trust is `sandboxed`, so the engine's `effective_trust`
+        // takes the stricter of the target's resolved trust and this inherited floor —
+        // a nested call to a TRUSTED app still runs under the sandboxed ceiling, closing
+        // the "trusted intermediary launders the taint" hole (registry.ts call site).
+        //
+        // DETACH-FAIL-CLOSED (team-lead ruling A: ALS + fail-closed, scope = app lane):
+        // a chain store is absent when this call is dispatched from OUTSIDE the ALS
+        // context — a genuine top-level entry with no enclosing `run_in_chain` (e.g. a
+        // system-agent / wake path), or (defense-in-depth) a hypothetical context
+        // escape. Treating absence as trusted would let a sandboxed-chain intermediary
+        // launder the taint, so a NO-CHAIN call here is stamped `sandboxed` (strictest).
+        //   Scope is exactly the APP lane: this site is unconditionally `invoker:'app'`,
+        // so the fail-closed default never touches a top-level `agent`/`user` call (those
+        // are chain roots and resolve normally — they don't route through here at all).
+        //   tighten-only holds: the engine takes the STRICTER of target trust and this
+        // stamp, so even a forged `trusted` cannot relax it. Accepted cost (team-lead):
+        // a trusted handler that wants a privileged nested call must `await` it (stay in
+        // the ALS chain = normal trusted); a DETACHED privileged call is a code smell and
+        // is correctly fail-closed — so the "trusted-chain zero-regression" guarantee is
+        // specifically for AWAITED chains. (VERIFIED: ALS propagates across
+        // setTimeout/microtask/Promise.then — those do NOT escape; absence is real
+        // top-level only.) Consume-refresh `via` reached chain-less also fail-closes to
+        // sandboxed but is harmless: `via` is asserted readonly + pulled via invoke_query
+        // (ops dropped), so no op / no dangerous cap → the sandboxed ceiling never bites.
+        const ctx: InvokerContext = {
+          invoker: 'app',
+          identity: app_id,
+          trust: current_chain_trust() ?? 'sandboxed',
+        };
+        if (registry.commandRouter) return registry.commandRouter(full_name, args, ctx);
+        return registry.route(full_name, args, ctx);
       },
 
       async read(_blockname: BlockName): Promise<Block[] | BlockView[]> {
