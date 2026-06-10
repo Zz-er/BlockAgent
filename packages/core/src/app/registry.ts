@@ -45,7 +45,7 @@ import type {
   TokenBudget,
 } from './types.js';
 import type { ContractDef } from './contracts.js';
-import { effectiveTrust } from './host.js';
+import { effectiveTrust, resolveHost } from './host.js';
 import type { AppHost } from './app_host.js';
 import { InProcessHost } from './in_process_host.js';
 import { current_chain_trust } from '../core/taint.js';
@@ -1072,12 +1072,46 @@ export class AppRegistry
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
     };
-    const host: AppHost = new InProcessHost(
-      installed_id,
-      ctx,
-      () => this.runUninstallHook(installed_id),
-      run_command,
-    );
+    // UH-2/SS3c carrier SELECTION (impl-spec §3.1/§3.2): resolveHost derives the carrier
+    // from the manifest's trust/host (host.ts enforces the security invariant — a
+    // sandboxed app can never resolve in-process). trusted → InProcessHost (above);
+    // child-process → the injected child_host_factory builds a ChildProcessHost with the
+    // real HostDeps. The factory is late-injected by the launcher (it holds Operations /
+    // taint / the cell writer — registry must NOT, to keep core↔app decoupled).
+    //
+    // FAIL-CLOSED (security invariant): if a child-process app is installed but no
+    // factory was injected, we THROW — never silently fall back to in-process (that
+    // would run untrusted code in the trusted domain, defeating resolveHost). A boot
+    // that installs a sandboxed app MUST wire the factory.
+    const kind = resolveHost(manifest);
+    let host: AppHost;
+    if (kind === 'in-process') {
+      host = new InProcessHost(
+        installed_id,
+        ctx,
+        () => this.runUninstallHook(installed_id),
+        run_command,
+      );
+    } else {
+      if (!this.child_host_factory) {
+        throw new AppManifestError(
+          `app '${installed_id}' resolves to host '${kind}' but no child_host_factory is ` +
+            `injected — cannot host an untrusted app in-process (fail-closed). Wire ` +
+            `registry.child_host_factory at boot before installing sandboxed apps.`,
+          installed_id,
+        );
+      }
+      // The factory builds the carrier AppHost. PRODUCTION (launch boot) builds a real
+      // ChildProcessHost (ignoring `in_process_parts`). A TEST factory (test/_support)
+      // builds an InProcessHost from `in_process_parts` to exercise the policy/taint
+      // ENGINE against a sandboxed manifest in-process — TEST-ONLY (no production path
+      // assigns such a factory). The factory is NEVER reachable from app code.
+      host = this.child_host_factory(installed_id, manifest, {
+        ctx,
+        run_uninstall: () => this.runUninstallHook(installed_id),
+        run_command,
+      });
+    }
 
     return {
       id: installed_id,
@@ -1294,6 +1328,40 @@ export class AppRegistry
    * `on_wake` at boot; backs `AppContext.wake`. Until set, `ctx.wake` is inert.
    */
   wakeHook?: (event: WakeEvent) => void;
+
+  /**
+   * Builds the carrier AppHost for a child-process (resolveHost-derived) app (UH-2/SS3c).
+   * Late-injected (same pattern as commandRouter/wakeHook); `instantiate` calls it when
+   * `resolveHost` yields `'child-process'`, FAIL-CLOSED throwing if it is absent.
+   *
+   * Two — and ONLY two — assigners (footgun guard, team-lead / Raven SS3c hard-gate):
+   *   - PRODUCTION launch boot → builds a REAL `ChildProcessHost` with the live
+   *     `HostDeps` (Operations / taint / authoritative cell writer); it IGNORES
+   *     `in_process_parts`. This is the only production path for a sandboxed app.
+   *   - TEST `test/_support/inProcessChildFactory` → builds an `InProcessHost` FROM
+   *     `in_process_parts`, so an engine test (policy row / taint chain) can run a
+   *     sandboxed MANIFEST in-process without forking. TEST-ONLY.
+   * The two are NEVER mixed, and this field is NEVER reachable from app code (apps hold
+   * an AppContext, not the registry) — so "sandboxed runs in-process" is possible ONLY
+   * via an explicitly-injected test factory, never in production.
+   *
+   * `in_process_parts` carries the registry-built pieces an InProcessHost needs (live
+   * ctx + hook-only uninstall + local command runner) so a TEST factory can build one;
+   * a production ChildProcessHost factory ignores them.
+   */
+  child_host_factory?: (
+    app_id: string,
+    manifest: AppManifest,
+    in_process_parts: {
+      ctx: AppContext;
+      run_uninstall: () => void;
+      run_command: (
+        command: string,
+        args: unknown,
+        invoker: InvokerContext,
+      ) => Promise<CommandResult>;
+    },
+  ) => AppHost;
 }
 
 // ============================================================================

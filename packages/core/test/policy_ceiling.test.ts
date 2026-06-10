@@ -35,6 +35,19 @@ import {
   allMemberNames,
   assertAppContextWhitelist,
 } from './_support/appcontext_whitelist.js';
+import { inProcessChildFactory } from './_support/in_process_child_factory.js';
+
+// SS3c: these tests install `trust:'sandboxed'` manifests to exercise the POLICY ENGINE
+// (sandboxed row / install-time ceiling / cross-ns / whitelist) IN-PROCESS — not the
+// real carrier. resolveHost now routes a sandboxed manifest to 'child-process' and
+// `instantiate` fail-closed-throws without a child factory, so we inject the TEST-ONLY
+// in-process factory. `sandboxedRegistry()` is the one place that wires it. Production
+// has no such factory (footgun guard) — a real sandboxed app forks a child or throws.
+function sandboxedRegistry(): AppRegistry {
+  const reg = new AppRegistry();
+  reg.child_host_factory = inProcessChildFactory;
+  return reg;
+}
 
 // The two app lanes under test.
 const SANDBOXED: InvokerContext = { invoker: 'app', trust: 'sandboxed', identity: 'evil' };
@@ -111,7 +124,7 @@ function wire() {
     { kind: 'create', parent: 'root:root', block: node(PINNED_NAME) },
     { kind: 'create', parent: 'root:root', block: node('demo:scratch') },
   ]);
-  const registry = new AppRegistry();
+  const registry = sandboxedRegistry(); // capDemoApp is trust:'sandboxed' (SS3c, see helper)
   registry.install(capDemoApp());
   const policy = new PolicyEngine({
     capability_resolver: (full_name) => registry.resolve_command(full_name)?.capabilities ?? [],
@@ -206,7 +219,7 @@ describe('sandboxed lane is FAIL-CLOSED via the trust_of floor (no ctx stamp)', 
   // wire a trust_resolver, then drive a PLAIN `{invoker:'app'}` (no trust).
   function wireWithTrustFloor() {
     const tree = emptyTree();
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry(); // demo is trust:'sandboxed' (SS3c)
     registry.install({
       id: 'demo',
       version: '0.0.0',
@@ -351,7 +364,7 @@ function escalatingApp(trust: 'trusted' | 'sandboxed' | undefined): AppManifest 
 
 describe('install-time capability ceiling', () => {
   it('REJECTS a sandboxed manifest that declares an escalation capability', () => {
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry(); // sandboxed manifest needs a child factory to reach the ceiling check
     registry.ceiling_resolver = ceiling_resolver;
     expect(() => registry.install(escalatingApp('sandboxed'))).toThrow(AppCapabilityCeilingError);
     // And it left no registry state behind (fail-closed: the app did not load).
@@ -359,7 +372,7 @@ describe('install-time capability ceiling', () => {
   });
 
   it('the thrown error names the offending capability', () => {
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry();
     registry.ceiling_resolver = ceiling_resolver;
     try {
       registry.install(escalatingApp('sandboxed'));
@@ -388,7 +401,7 @@ describe('install-time capability ceiling', () => {
   });
 
   it('a sandboxed manifest declaring only in-ceiling caps installs fine', () => {
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry();
     registry.ceiling_resolver = ceiling_resolver;
     const ok: AppManifest = {
       id: 'good',
@@ -545,7 +558,7 @@ function wireTrojan(trust: 'trusted' | 'sandboxed') {
     { kind: 'create', parent: 'root:root', block: node(VICTIM_DATA) },
     { kind: 'create', parent: 'root:root', block: node(VICTIM_HOME) },
   ]);
-  const registry = new AppRegistry();
+  const registry = sandboxedRegistry(); // trojanApp may be trust:'sandboxed' (SS3c; harmless for trusted)
   registry.install(trojanApp(trust));
   const policy = new PolicyEngine({
     capability_resolver: (fn) => registry.resolve_command(fn)?.capabilities ?? [],
@@ -754,7 +767,7 @@ function minimalApp(): AppManifest {
 
 describe('INVARIANT — sandboxed app cannot reach bare Operations.apply()', () => {
   it('the live AppContext exposes invoke_command but NO apply / Operations handle', () => {
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry(); // minimalApp is trust:'sandboxed' (SS3c)
     registry.install(minimalApp());
     const ctx = registry.get_app_context('mini');
     expect(ctx).not.toBeNull();
@@ -771,7 +784,7 @@ describe('INVARIANT — sandboxed app cannot reach bare Operations.apply()', () 
   it('the AppContext write surface is exactly the by-name whitelist (no apply added)', () => {
     // The exact-own-member-set arm of the shared assertion (a future added member fails
     // it and forces a conscious review — catches an `apply`/Operations leak).
-    const registry = new AppRegistry();
+    const registry = sandboxedRegistry(); // minimalApp is trust:'sandboxed' (SS3c)
     registry.install(minimalApp());
     const ctx = registry.get_app_context('mini')!;
     expect(new Set(Object.keys(ctx))).toEqual(new Set(APP_CONTEXT_WHITELIST));
