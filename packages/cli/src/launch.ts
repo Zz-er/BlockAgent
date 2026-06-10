@@ -25,6 +25,9 @@ import { Operations } from '@block-agent/core/core/operations.js';
 import { PolicyEngine, CAP } from '@block-agent/core/core/policy.js';
 import { Renderer } from '@block-agent/core/core/renderer.js';
 import { AppRegistry, type AppTrustLevel } from '@block-agent/core/app/registry.js';
+import { ChildProcessHost, type HostDeps } from '@block-agent/core/app/child_process_host.js';
+import { forkChildApp } from '@block-agent/core/app/child/fork.js';
+import { run_in_chain } from '@block-agent/core/core/taint.js';
 import { MESSAGE_COUNT, TASK_COUNT } from '@block-agent/core/app/contracts.js';
 import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_runtime.js';
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
@@ -175,6 +178,42 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   // tighten a trusted in-process app). Left as a documented seam (UH-2 §3.8 / §3.9).
   registry.commandRouter = (full_name, args, invoker) =>
     operations.invoke_command(full_name, args, invoker);
+
+  // UH-2/SS3c: inject the PRODUCTION child-host factory — the registry calls it when a
+  // manifest resolves to 'child-process' (sandboxed). It builds a REAL ChildProcessHost
+  // (forking a tsx child) with HostDeps wired to the trusted main-side capabilities. The
+  // registry stays decoupled (it never imports Operations/taint); this is the ONE
+  // production assigner of `child_host_factory` (the only other is the TEST-ONLY
+  // in-process factory in test/_support — never both). `in_process_parts` is IGNORED
+  // here (that is only for the test factory). FAIL-CLOSED: if this is NOT injected, the
+  // registry throws on a sandboxed install (it never degrades to in-process).
+  const childHostDeps: HostDeps = {
+    // The child's framed cross-app invoke_command re-enters the chokepoint (INV#11). The
+    // ChildProcessHost wraps THIS call in run_in_chain('sandboxed') itself (the cross-
+    // process taint splice), so we just forward to Operations here.
+    invoke_command: (full_name, args, ctx) => operations.invoke_command(full_name, args, ctx),
+    // Authoritative cell write (补强①): registry re-validates schema (child is untrusted).
+    write_cell: (app_id, next) => registry.write_app_cell(app_id, next),
+    // Cross-app read → deep COPIES (INV#22/#18). structuredClone bounds it to data.
+    read_blocks: (blockname) => operations.find(blockname).map((b) => structuredClone(b)),
+    // emit doorbell (§3.5) — dispatch through the registry's event bus, no render data.
+    dispatch_event: (_app_id, event, payload) => registry.dispatch_app_event(event, payload),
+    // wake — scheduling signal (not policy-gated).
+    wake: (event) => registry.wakeHook?.(event),
+    // The cross-process taint chain start point: ALS does not cross the fork, so the
+    // host re-establishes 'sandboxed' around the child's framed callbacks (澄清#5).
+    run_sandboxed: (fn) => run_in_chain('sandboxed', fn),
+  };
+  registry.child_host_factory = (app_id, _manifest) =>
+    new ChildProcessHost({
+      app_id,
+      // pkg_path: production resolution of an installed sandboxed app's package dir is
+      // UH-3 hot-install (§9, task#23) — no sandboxed app installs at boot today, so a
+      // conventional <appsBase>/<app_id> path is the placeholder. e2e injects a fixture.
+      pkg_path: join(base, app_id),
+      deps: childHostDeps,
+      spawn: forkChildApp,
+    });
 
   // 4) Renderer over the live App-context provider so state-driven projection builders
   //    (messages:recent / tools:recent) read post-mutation state each render.
