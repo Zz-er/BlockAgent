@@ -18,8 +18,9 @@
  * contract. (CI core-closure.)
  */
 
-import type { AppContext } from './types.js';
+import type { AppContext, CommandResult } from './types.js';
 import type { AppHost } from './app_host.js';
+import type { InvokerContext } from '../core/types.js';
 
 export class InProcessHost implements AppHost {
   readonly kind = 'in-process' as const;
@@ -38,11 +39,31 @@ export class InProcessHost implements AppHost {
    *                (uninstall→dispose→uninstall); the index drop / entry removal stay
    *                the registry's / HotMutator's job, run AFTER dispose.
    */
+  /**
+   * @param run_command  injected closure that runs the app's command handler locally
+   *                (the registry's existing `manifest.invoke(args, ctx, invoker)` body) —
+   *                byte-identical to today's `AppRegistry.route`. Injected (like
+   *                run_uninstall) so the host stays decoupled from registry internals.
+   */
   constructor(
     readonly app_id: string,
     private readonly ctx: AppContext,
     private readonly run_uninstall: () => void,
+    private readonly run_command: (
+      command: string,
+      args: unknown,
+      invoker: InvokerContext,
+    ) => Promise<CommandResult>,
   ) {}
+
+  /**
+   * Run a command locally (carrier-polymorphic `route_command`): in-process is exactly
+   * today's `manifest.invoke` path via the injected `run_command` — byte-identical, no
+   * frames, no taint splice (the in-process chain already carries trust through ALS).
+   */
+  async route_command(command: string, args: unknown, invoker: InvokerContext): Promise<CommandResult> {
+    return this.run_command(command, args, invoker);
+  }
 
   /** In-process is always active — the ctx is live from install onward. */
   get active(): boolean {
