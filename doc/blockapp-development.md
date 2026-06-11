@@ -2,6 +2,8 @@
 
 这篇帮你从零写出一块属于自己的能力——一个能装进 block-agent、给 agent 暴露受约束操作、并把自己的状态呈现进上下文的 BlockApp。
 
+你要描述的就是四件事：**状态**（模块持有什么、怎么随操作演化）、**呈现**（状态怎样变成 agent 看到的那片上下文）、**操作**（对外开放哪些受约束的命令）、**契约**（声明依赖什么、提供什么）。下面逐一展开。
+
 > 本文针对**可信（trusted）app**：你写确定性 builder（`owner=system`），它跑在渲染热路径并进缓存。若你的代码不可信（第三方 / agent 产出），走**沙箱（sandboxed）app**——不写 builder、改声明式投影、`emit` 当失效门铃，见 [blockapp-sandboxed-development.md](./blockapp-sandboxed-development.md)。二者是**同一 BlockApp 模型下 `trust` 维度的两种放置，不是两种 app**。
 
 在动手之前，先理解为什么 block-agent 让你这样写。它对每个模块有三条核心要求，理解了它们，下面的字段和约定就不再是死规矩，而是顺理成章的结果：
@@ -12,7 +14,7 @@
 
 你写的，就是一个返回模块声明（manifest）的工厂函数。
 
-> 所有示例对照仓库里**真实已实现**的代码（`packages/core/src/apps/agent_identity.ts` 是最小范本，`messages.ts` / `tools.ts` / `memory.ts` / `task.ts` 是更完整的范本）。命名、字段、类型都与 `packages/core/src/app/types.ts` 一致。
+> 所有示例对照仓库里**真实已实现**的代码。每个内置模块都是 `apps/` 下一个独立工作区：`apps/agent_identity/src/manifest.ts` 是最小范本，`apps/messages` / `apps/tools` / `apps/memory` / `apps/task` 是更完整的范本。命名、字段、类型都与 `packages/core/src/app/types.ts` 一致。
 
 ---
 
@@ -34,25 +36,19 @@
 
 ## 1. 类型声明文件：只 import，不修改
 
-你的 app 只依赖一个类型声明文件（注意：这里说的是 TypeScript 的类型定义，和上面"模块按契约协作"里的"契约"是两回事）：
+你的 app 只依赖一个类型声明文件（注意：这里说的是 TypeScript 的类型定义，和上面"模块按契约协作"里的"契约"是两回事）。每个 app 都是 `apps/` 下一个独立工作区（`@block-agent/app-<id>`），从 `@block-agent/core` 按子路径导入类型：
 
 ```typescript
-// app 在 packages/core/src/apps/ 内（同 monorepo core 包）：
-import type {
-  AppManifest, AppContext, BuildContext,
-  BuilderManifest, CommandManifest, CommandResult, JsonSchema,
-} from '../app/types.js';            // 注意 NodeNext 要求 .js 扩展名
-import type { Block, BlockName, InvokerContext } from '../core/types.js';
-
-// app 在独立 npm 包内（像 apps/memory_letta，跨包）：
 import type {
   AppManifest, AppContext, BuildContext, BuilderManifest,
   CommandManifest, CommandResult, JsonSchema,
-} from '@block-agent/core/app/types.js';
+} from '@block-agent/core/app/types.js';            // 注意 NodeNext 要求 .js 扩展名
 import type { Block, BlockName, InvokerContext } from '@block-agent/core/core/types.js';
 ```
 
 `@block-agent/core` 的 `exports` 已把 `./app/*` / `./core/*` / `./apps/*` 映射到 `.ts` 源，tsx 直接跑、无构建步。
+
+> 只有当你的代码就住在 `packages/core` 包内部时，才改用相对路径（`../app/types.js` / `../core/types.js`）——这是核心自身的少数情形，正常的 app 不会落在那里。
 
 ---
 
@@ -174,12 +170,12 @@ interface CommandManifest<TState> {
 下面是一个完整、可装的最小 app（模仿 `agent_identity.ts` 的结构）。它维护一个待办列表，呈现成一个块，暴露一个 `add` 命令。
 
 ```typescript
-// packages/core/src/apps/todo.ts  （或你自己的包里，改 import 路径为 @block-agent/core/...）
-import type { Block, BlockName, InvokerContext } from '../core/types.js';
+// apps/todo/src/manifest.ts  （你的 app 是 apps/ 下一个独立工作区，有自己的 package.json）
+import type { Block, BlockName, InvokerContext } from '@block-agent/core/core/types.js';
 import type {
   AppContext, AppManifest, BuildContext,
   BuilderManifest, CommandManifest, CommandResult, JsonSchema,
-} from '../app/types.js';
+} from '@block-agent/core/app/types.js';
 
 const APP_ID = 'todo' as const;
 const LIST_BLOCK: BlockName = 'todo:list';
