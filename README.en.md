@@ -38,7 +38,7 @@ A BlockApp isn't static content; it's a small program. To write one, you describ
 
 | Module | Role |
 |---|---|
-| identity | the agent's identity and constraints; the agent can't rewrite itself |
+| agent_identity | the agent's identity and constraints; the agent can't rewrite itself |
 | messages | conversation history with automatic compaction |
 | tools | a set of built-in tools |
 | memory | local memory |
@@ -107,7 +107,7 @@ Flexible, because modules bind to contracts rather than identities. Safe, becaus
 
 ## Status
 
-In place: the core loop, the built-in modules, the interactive terminal, module discovery and (un)installation (including hot-uninstall), contract-based collaboration between modules (declared interfaces + a pre-render pull by contract), and external semantic-memory integration (verified against a live Letta / DashScope). Tests green: core 274 · cli 88 · memory_letta 44.
+In place: the core loop, the built-in modules, the interactive terminal, module discovery and (un)installation (including hot-uninstall), contract-based collaboration between modules (declared interfaces + a pre-render pull by contract), external semantic-memory integration (verified against a live Letta / DashScope), and the unified trusted/sandboxed host model (the cross-process sandbox carrier has landed and is wired into boot, with end-to-end fork tests; no sandboxed module ships with the release yet). Tests green: core 471 · cli 88 · memory_letta 44.
 
 ## License
 
