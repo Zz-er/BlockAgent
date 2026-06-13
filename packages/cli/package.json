@@ -26,6 +26,8 @@
     "@block-agent/app-task": "*",
     "@block-agent/app-stats": "*",
     "@block-agent/app-memory_letta": "*",
+    "@block-agent/app-turn_log": "*",
+    "@block-agent/app-focus": "*",
     "ink": "^5.1.0",
     "react": "^18.3.1"
   },

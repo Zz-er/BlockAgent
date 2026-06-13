@@ -40,6 +40,8 @@ import { MemoryApp } from '@block-agent/app-memory/manifest.js';
 import { TaskApp } from '@block-agent/app-task/manifest.js';
 import { StatsApp } from '@block-agent/app-stats/manifest.js';
 import { MemoryLettaApp } from '@block-agent/app-memory_letta/memory_letta_app.js';
+import { TurnLogApp } from '@block-agent/app-turn_log/manifest.js';
+import { FocusApp } from '@block-agent/app-focus/manifest.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
@@ -145,6 +147,27 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   const base = appsBaseDir(config);
   const { messages } = installEnabledApps(config, registry, base);
 
+  // 2b) turn_log — the persistent per-turn telemetry ledger (D1 §4). A presence-only app
+  //     (no agent commands, no render builders — two-cadence rule §2.5): it exists so the
+  //     launcher has a place to hang the `onTurn` subscription that appends each TurnRecord
+  //     to `runtime_log.jsonl`. The actual ledger write is wired below (step 5b), AFTER the
+  //     runtime is built; we construct + install the app here so it shares the standard
+  //     install path and storage-dir convention. Always on (default_enabled): it is the
+  //     durable source of truth that budget/inspector/runtime_stats READ.
+  const turnLog = new TurnLogApp({ dir: join(base, 'turn_log') });
+  registry.install(turnLog.manifest());
+
+  // 2c) focus — the agent's working-state / trajectory app (D5 P1.5a). Owns ③ goal +
+  //     ④ recent-action window + ⑤ working-state blocks. Installed here (before the
+  //     PolicyEngine + seedProjectionBlocks below) so its commands route and its
+  //     `focus:*` projection blocks are seeded from turn 1. The DETERMINISTIC distiller
+  //     (`focus.record`, app-only) is fired per turn from `runtime.onTurn` (step 5c,
+  //     after the runtime is built); `focus.set_goal` (agent/user, NOT app — the
+  //     anti-injection gate) enters the agent tool catalog. The app reads its focus
+  //     jsonl at construction (restart-restore, D5 §6); it never throws at boot.
+  const focus = new FocusApp({ dir: join(base, 'focus') });
+  registry.install(focus.manifest());
+
   // 3) PolicyEngine wired to the command capabilities + allowed_invokers + the
   //    AUTHORED trust of the owning App, then Operations (the single mutation
   //    chokepoint, with the engine inside).
@@ -248,6 +271,32 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
       : {}),
     root_name: ROOT_NAME,
     tool_catalog: () => currentToolCatalog,
+  });
+
+  // 5b) turn_log ledger subscription (D1 §4 / §2.5). Stamp the wall-clock `ts` HERE, at the
+  //     boot/app layer, and append each TurnRecord to `runtime_log.jsonl`. `Date.now()` is
+  //     LEGAL here — INV #16 only forbids the clock inside a builder's `build`, not on the
+  //     out-of-core telemetry seam. This is the ONE place the wall-clock is stamped (core's
+  //     TurnRecord is clock-free). Error-isolated by the runtime's emitTurn (a throwing
+  //     subscriber never breaks the turn loop), so the store call needs no extra guard. The
+  //     returned thunk is left to GC with the runtime — the process owns it for its lifetime.
+  runtime.onTurn((record) => turnLog.store.append({ ...record, ts: Date.now() }));
+
+  // 5c) focus distiller subscription (D5 §3.3 / §8). Each turn's TurnRecord is folded
+  //     into the working-state block via the app-only `focus.record` command, routed
+  //     through Operations so it re-enters the chokepoint + PolicyEngine (no bypass, INV
+  //     #11). The TurnRecord carries `wake_event`, so this ONE call sets focus + wake
+  //     reason + outcome together — no separate wake hook needed. invoker:'app' is the
+  //     deterministic, runtime-fired distiller lane (the `set_goal` gate bars 'app' for
+  //     intent, but `record` is app-only by design). Fire-and-forget with a `.catch`:
+  //     D5's A1 explicitly allows ⑤ to be ≥1 turn stale (hence the staleness cue +
+  //     degrade in the working-state block), so a dropped/failed distill never breaks the
+  //     turn loop — the verbatim recent window stays the correctness floor (§3.2). NOT
+  //     wired in core: core must never name an app command (it stays app-agnostic).
+  runtime.onTurn((record) => {
+    void operations
+      .invoke_command('focus.record', { turn_record: record }, { invoker: 'app' })
+      .catch(() => undefined);
   });
 
   // 6) Wake seam: a messages.ingest → ctx.wake → on_wake runs the turn loop. We chain
