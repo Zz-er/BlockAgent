@@ -1,0 +1,10 @@
+{
+  "$comment": "Mirrors the cli/app workspace pattern: NodeNext/strict/.js extensions. Depends on @block-agent/core + @block-agent/cli + @block-agent/protocol via the source exports maps + workspace symlinks (no tsc -b). `ws` is the ONE runtime dependency that lives here and never in core (the core-closure rule). Build-free dev.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

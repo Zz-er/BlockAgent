@@ -5,6 +5,10 @@
   "type": "module",
   "private": true,
   "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build, tsx/NodeNext). Importers use '@block-agent/cli/launch.js' etc. Added so @block-agent/server can wrap launch() + reuse the read-only context_view helpers.",
+  "exports": {
+    "./*": "./src/*"
+  },
   "bin": {
     "block-agent": "dist/main.js"
   },
