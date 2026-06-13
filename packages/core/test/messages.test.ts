@@ -602,6 +602,88 @@ describe('JsonlStore (§12.2 write rules)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// restart restore (D1 §5.2): a fresh App on the same dir re-hydrates the projection
+// ---------------------------------------------------------------------------
+
+describe('messages restart restore (D1 §5.2)', () => {
+  const charTokens: MessagesAppOptions['estimate_tokens'] = (t) => t.length;
+  const storeDir = () => join(dir, 'store');
+
+  it('re-hydrates recent + summary into initial_state from the durable history', async () => {
+    const { app, registry } = installApp();
+    app.ingest({ id: 'u1', content: 'hello' });
+    await registry.route('messages.reply', { content: 'hi back' }, { invoker: 'agent' });
+    expect(app.store.readHistory()).toHaveLength(2);
+
+    // A fresh App on the SAME dir boots with the recent window restored (NOT empty).
+    const reloaded = new MessagesApp({ dir: storeDir(), configBase: dir });
+    const state = reloaded.manifest().initial_state as MessagesState;
+    expect(state.recent.map((m) => ({ role: m.role, content: m.content }))).toEqual([
+      { role: 'user', content: 'hello' },
+      { role: 'agent', content: 'hi back' },
+    ]);
+    expect(state.summary).toBe('');
+  });
+
+  it('boots BOUNDED: an over-budget history restores compacted (recent window + summary)', async () => {
+    // budget 20, threshold 0.5 → trigger at 10 tokens; display_count 2 (same math as the
+    // compaction suite). Seed 5 messages so the restore must compact at boot.
+    writeConfig(dir, { max_history_tokens: 20, compression_threshold: 0.5, display_count: 2 });
+    const { app } = installApp({ estimate_tokens: charTokens });
+    for (let i = 1; i <= 5; i += 1) app.ingest({ id: `u${i}`, content: `m${i}` });
+
+    // The reload re-runs the SAME deterministic compaction at construction, so the booted
+    // window is bounded: only the last display_count verbatim, the rest in the summary.
+    const reloaded = new MessagesApp({ dir: storeDir(), configBase: dir, estimate_tokens: charTokens });
+    const state = reloaded.manifest().initial_state as MessagesState;
+    expect(state.recent.map((m) => m.id)).toEqual(['u4', 'u5']);
+    expect(state.summary).toContain('3 earlier messages folded');
+    expect(state.summary).toContain('m1');
+    // The durable history is intact regardless (compaction never shrinks the log).
+    expect(app.store.readHistory()).toHaveLength(5);
+  });
+
+  it('advances the id counters past the restored ids so a new reply never collides', async () => {
+    const { registry } = installApp();
+    await registry.route('messages.reply', { content: 'first' }, { invoker: 'agent' }); // agent_1
+    await registry.route('messages.reply', { content: 'second' }, { invoker: 'agent' }); // agent_2
+
+    const reloaded = new MessagesApp({ dir: storeDir(), configBase: dir });
+    const reg2 = new AppRegistry();
+    reg2.install(reloaded.manifest());
+    const res = await reg2.route('messages.reply', { content: 'third' }, { invoker: 'agent' });
+    // Next id is agent_3, not a re-used agent_1.
+    expect((res.data as { reply_id: string }).reply_id).toBe('agent_3');
+  });
+
+  it('a missing durable history boots an empty projection (zero regression)', () => {
+    const fresh = new MessagesApp({ dir: join(dir, 'never-written'), configBase: dir });
+    const state = fresh.manifest().initial_state as MessagesState;
+    expect(state.recent).toEqual([]);
+    expect(state.summary).toBe('');
+  });
+
+  it('a crash-torn history degrades gracefully (drops the torn tail, never throws)', () => {
+    const sd = storeDir();
+    mkdirSync(sd, { recursive: true });
+    // Two clean records + a torn trailing line (no newline) — the store's startup
+    // tail-truncate drops the torn line; restore reads the two clean messages, never throws.
+    writeFileSync(
+      join(sd, 'history.jsonl'),
+      '{"role":"user","id":"u1","content":"kept"}\n' +
+        '{"role":"agent","id":"agent_1","content":"also"}\n' +
+        '{"role":"user","id":"u2","content":"to',
+    );
+    let app: MessagesApp | undefined;
+    expect(() => {
+      app = new MessagesApp({ dir: sd, configBase: dir });
+    }).not.toThrow();
+    const state = app!.manifest().initial_state as MessagesState;
+    expect(state.recent.map((m) => m.content)).toEqual(['kept', 'also']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
 

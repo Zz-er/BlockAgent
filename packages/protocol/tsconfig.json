@@ -1,0 +1,10 @@
+{
+  "$comment": "Mirrors the app/cli workspace pattern: NodeNext/strict/.js extensions. Type-only package — it re-exports a few core TYPES (TurnRecord/CacheTier/...) via the @block-agent/core source exports map + the workspace symlink (NodeNext resolution); it never imports a core VALUE, so it carries zero runtime dependency on core (core is a devDep, present only so `tsc` can resolve the type re-exports). Build-free dev (no tsc -b step).",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

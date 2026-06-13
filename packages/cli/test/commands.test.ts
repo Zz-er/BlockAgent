@@ -115,7 +115,11 @@ describe('dispatch', () => {
     const view = cap.last() as Extract<CtxView, { kind: 'status' }>;
     expect(view.kind).toBe('status');
     expect(view.provider_id).toBe('mock');
-    expect(view.app_count).toBe(3);
+    // 3 config-enabled apps (agent_identity, messages, tools) + 2 always-on
+    // infrastructure apps installed unconditionally at boot: turn_log (the onTurn
+    // ledger) and focus (the working-state distiller). Both are presence/runtime
+    // apps not gated by config.apps, so they always count.
+    expect(view.app_count).toBe(5);
   });
 
   it('an unknown /slash reports a message, never throws', async () => {

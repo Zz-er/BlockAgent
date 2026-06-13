@@ -1,0 +1,488 @@
+/* ============================================================================
+   block-agent web inspector — layout + the highlight-pulse-fade (§4.5)
+   ============================================================================ */
+
+:root {
+  --bg: #0e1116;
+  --surface: #1a1f27;
+  --surface-2: #222834;
+  --border: #2b3240;
+  --text: #d7dde6;
+  --text-dim: #8a93a3;
+  --accent: #5aa9ff;
+  --accent-flash: #234a73; /* the flash color a changed card snaps to */
+  --alarm: #ff5a5a;
+  --alarm-flash: #5a1f1f;
+  --pos: #5ad18a;
+  --neg: #ff9b6a;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ---- conversation pane (left) ------------------------------------------- */
+
+.conversation {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--border);
+}
+
+.conversation__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conversation__header h1 {
+  font-size: 15px;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.conn {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+.conn--open {
+  color: var(--pos);
+}
+.conn--connecting {
+  color: var(--neg);
+}
+.conn--closed {
+  color: var(--alarm);
+}
+
+.model-tag {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.messages__empty {
+  color: var(--text-dim);
+  margin: auto;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 80%;
+}
+.message--user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+.message__role {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.message__text {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.message--user .message__text {
+  background: var(--accent-flash);
+}
+
+.thinking {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.thinking__label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+.thinking__line {
+  opacity: 0.85;
+  padding: 2px 0;
+}
+.thinking__line[data-depth="0"] {
+  opacity: 1;
+}
+
+.error-banner {
+  background: var(--alarm-flash);
+  border: 1px solid var(--alarm);
+  color: #ffd9d9;
+  padding: 8px 16px;
+  font-size: 13px;
+}
+.error-banner__more {
+  color: var(--text-dim);
+}
+
+.turn-footer {
+  padding: 6px 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+.composer__input {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+.composer__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.composer__send {
+  background: var(--accent);
+  color: #06121f;
+  border: none;
+  border-radius: 8px;
+  padding: 0 18px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.composer__send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- context sidebar (right) -------------------------------------------- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+.sidebar__header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar__header h2 {
+  font-size: 13px;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.sidebar__hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.sidebar__groups {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.tier-group {
+  margin-bottom: 14px;
+}
+
+.tier-group__header {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  transition: background-color 1.5s ease-out, border-color 1.5s ease-out;
+}
+/* tier header pulse when its segment hash moved this turn */
+.tier-group__header.changed {
+  background: var(--accent-flash);
+  transition: none;
+}
+/* the stable-prefix churn alarm — red pulse (§4.5) */
+.tier-group__header.alarm {
+  background: var(--alarm-flash);
+  border-color: var(--alarm);
+  transition: none;
+}
+.tier-group__name {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tier-group__weight {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tier-group__bar {
+  height: 4px;
+  background: var(--surface-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.tier-group__bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s ease-out;
+}
+
+.churn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 2px;
+  padding: 6px 10px;
+  background: var(--alarm-flash);
+  border: 1px solid var(--alarm);
+  border-radius: 6px;
+  color: #ffd9d9;
+  font-size: 12px;
+  animation: alarm-pulse 1.5s ease-out;
+}
+.churn-banner__text {
+  flex: 1;
+}
+.churn-banner__ack {
+  background: none;
+  border: none;
+  color: #ffd9d9;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  opacity: 0.7;
+}
+.churn-banner__ack:hover {
+  opacity: 1;
+}
+@keyframes alarm-pulse {
+  0% {
+    background: var(--alarm);
+  }
+  100% {
+    background: var(--alarm-flash);
+  }
+}
+.churn-banner__blocks {
+  color: var(--neg);
+  font-family: var(--mono);
+}
+
+.tier-group__cards {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tier-group__empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ---- block card + the highlight flash → fade-back (§4.5) ----------------- */
+
+.block-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  /* the fade: background eases back to --surface over 1.5s */
+  transition: background-color 1.5s ease-out;
+}
+/* snap to the accent flash when the changed flag is set (transition disabled
+   so the snap is instant; removing .changed lets the 1.5s transition fade it). */
+.block-card.changed {
+  background: var(--accent-flash);
+  transition: none;
+}
+.block-card.entering {
+  animation: card-enter 0.3s ease-out;
+}
+.block-card.leaving {
+  animation: card-leave 0.4s ease-in forwards;
+}
+
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes card-leave {
+  to {
+    opacity: 0;
+    transform: scaleY(0);
+    max-height: 0;
+    padding: 0;
+    margin: 0;
+  }
+}
+
+.block-card__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.badge--system {
+  color: var(--neg);
+}
+.badge--plugin {
+  color: var(--accent);
+}
+.badge--tool {
+  color: var(--pos);
+}
+.block-card__name {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.block-card__spacer {
+  flex: 1;
+}
+.block-card__delta {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.block-card__delta.pos {
+  color: var(--pos);
+}
+.block-card__delta.neg {
+  color: var(--neg);
+}
+.block-card__weight {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.block-card__chevron {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.block-card__preview {
+  padding: 0 10px 8px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.block-card__body {
+  margin: 0;
+  padding: 10px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .block-card,
+  .block-card.entering,
+  .block-card.leaving,
+  .tier-group__header,
+  .tier-group__bar-fill {
+    transition: none;
+    animation: none;
+  }
+}

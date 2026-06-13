@@ -1,0 +1,29 @@
+{
+  "name": "@block-agent/server",
+  "version": "0.0.0",
+  "description": "SessionProtocol v0 host: wraps ONE LaunchedAgent (from @block-agent/cli launch()) and speaks the protocol over two transports — an in-process transport (direct calls + subscriptions, behavior-preserving vs cli_channel/context_view) and a WebSocket transport (ws). `ws` lives ONLY here, like Letta lives only in app-memory_letta — core stays zero-runtime-dependency. Design: ai_com/design/multi-terminal-and-web-inspector.md (D3) §3 + session-protocol-v0.md (D2).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/server/*.js'.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*",
+    "@block-agent/cli": "*",
+    "@block-agent/protocol": "*",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

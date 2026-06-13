@@ -672,3 +672,98 @@ describe('memory manifest — shape', () => {
     expect(result.warnings).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// restart restore (D1 §5.2): a fresh App on the same dir re-hydrates notes/user
+// ---------------------------------------------------------------------------
+
+describe('memory restart restore (D1 §5.2)', () => {
+  let dir: string;
+  beforeEach(() => { dir = tempDir(); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('re-hydrates notes + user into initial_state from the durable JSONL', async () => {
+    // Write to the store through the live command path on one app instance.
+    const { ops } = wireApp(dir);
+    await ops.invoke_command('memory.remember', { target: 'notes', content: 'a durable note' }, AGENT);
+    await ops.invoke_command('memory.remember', { target: 'user', content: 'prefers dark mode' }, USER);
+
+    // A fresh App on the SAME dir boots with notes/user restored (NOT empty).
+    const reloaded = new MemoryApp({ dir });
+    const state = reloaded.manifest().initial_state as MemoryState;
+    expect(state.notes.map((e) => e.content)).toEqual(['a durable note']);
+    expect(state.user.map((e) => e.content)).toEqual(['prefers dark mode']);
+    // Provenance survives the round-trip (agent note unverified, user entry verified).
+    expect(state.notes[0]!.provenance).toEqual({ origin: 'agent', verified: false });
+    expect(state.user[0]!.provenance).toEqual({ origin: 'user', verified: true });
+    // pinned/recalled have no durable backing → boot empty (unchanged).
+    expect(state.pinned).toEqual([]);
+    expect(state.recalled).toEqual([]);
+  });
+
+  it('a soft-deleted (forgotten) note is folded out of the restored projection', async () => {
+    const { ops } = wireApp(dir);
+    const r = await ops.invoke_command('memory.remember', { target: 'notes', content: 'forget me' }, AGENT);
+    const id = (r.data as { id: string }).id;
+    await ops.invoke_command('memory.remember', { target: 'notes', content: 'keep me' }, AGENT);
+    await ops.invoke_command('memory.forget', { id }, AGENT); // tombstone
+
+    const reloaded = new MemoryApp({ dir });
+    const state = reloaded.manifest().initial_state as MemoryState;
+    // The tombstone is folded on read-live, so only the kept note is restored.
+    expect(state.notes.map((e) => e.content)).toEqual(['keep me']);
+  });
+
+  it('boots bounded: restore applies the per-target char limit (oldest dropped)', async () => {
+    // notes_char_limit 10 → at most 10 chars across notes; each note is 5 chars, so the
+    // third remember already trims the oldest at write time AND restore re-applies it.
+    const app1 = new MemoryApp({ dir });
+    const reg = new AppRegistry();
+    reg.install(app1.manifest());
+    const ops = Operations.with_default_policy({
+      tree: new BlockTree({ id: 'root', name: 'root:root' as BlockName, content_blob: null, content_text: null, children: [] }),
+      registry: reg,
+    });
+    // set_config is user-only; tighten notes_char_limit to 10.
+    await ops.invoke_command('memory.set_config', { notes_char_limit: 10 }, USER);
+    for (const c of ['aaaaa', 'bbbbb', 'ccccc']) {
+      await ops.invoke_command('memory.remember', { target: 'notes', content: c }, AGENT);
+    }
+
+    // The config seed is from file/defaults (2200) on reload, so to exercise the restore
+    // bound deterministically we re-seed via a config.json the reload reads.
+    mkdirSync(join(dir, 'memory'), { recursive: true });
+    writeFileSync(join(dir, 'memory', 'config.json'), JSON.stringify({ notes_char_limit: 10 }));
+    const reloaded = new MemoryApp({ dir, configBase: dir });
+    const state = reloaded.manifest().initial_state as MemoryState;
+    // 3 durable notes × 5 chars = 15 > 10 → restore drops the oldest to fit (keeps 2).
+    const total = state.notes.reduce((n, e) => n + e.content.length, 0);
+    expect(total).toBeLessThanOrEqual(10);
+    expect(state.notes.map((e) => e.content)).toEqual(['bbbbb', 'ccccc']);
+  });
+
+  it('a missing durable store boots empty (zero regression)', () => {
+    const fresh = new MemoryApp({ dir: join(dir, 'never-written') });
+    const state = fresh.manifest().initial_state as MemoryState;
+    expect(state.notes).toEqual([]);
+    expect(state.user).toEqual([]);
+  });
+
+  it('a crash-torn store degrades gracefully (drops the torn tail, never throws)', () => {
+    mkdirSync(dir, { recursive: true });
+    // Two clean note records + a torn trailing line (no newline). The store's startup
+    // tail-truncate drops the torn line; restore reads the two clean notes, never throws.
+    writeFileSync(
+      join(dir, 'notes.jsonl'),
+      '{"op":"memory","id":"mem.1","content":"kept","tags":["notes"],"provenance":{"origin":"agent","verified":false}}\n' +
+        '{"op":"memory","id":"mem.2","content":"also","tags":["notes"],"provenance":{"origin":"agent","verified":false}}\n' +
+        '{"op":"memory","id":"mem.3","content":"to',
+    );
+    let app: MemoryApp | undefined;
+    expect(() => {
+      app = new MemoryApp({ dir });
+    }).not.toThrow();
+    const state = app!.manifest().initial_state as MemoryState;
+    expect(state.notes.map((e) => e.content)).toEqual(['kept', 'also']);
+  });
+});

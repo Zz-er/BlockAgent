@@ -1,0 +1,34 @@
+{
+  "name": "@block-agent/app-turn_log",
+  "version": "1.0.0",
+  "description": "turn_log BlockApp: the persistent per-turn telemetry ledger (D1 §4). Subscribes to runtime.onTurn and appends each TurnRecord (+ a boundary-stamped ts) to runtime_log.jsonl.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-turn_log/manifest.js'.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "turn_log",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": true,
+    "summary": "运行时逐 turn 遥测的持久 ledger（runtime_log.jsonl）；不渲染进 prompt（双节拍规则）。",
+    "provides": null,
+    "requires": null
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

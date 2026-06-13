@@ -24,11 +24,16 @@ import type {
   AgentState,
   Block,
   BlockName,
+  CacheTier,
+  ContentPart,
   InvokerContext,
   Operations,
   Renderer,
+  RenderedPrompt,
   RuntimeErrorEvent,
   ThinkingEvent,
+  TurnEndReason,
+  TurnRecord,
   WakeEvent,
 } from '../core/types.js';
 import type {
@@ -65,6 +70,14 @@ export type ThinkingListener = (event: ThinkingEvent) => void;
  * is isolated so it never breaks the turn loop.
  */
 export type ErrorListener = (event: RuntimeErrorEvent) => void;
+
+/**
+ * TurnListener — a subscriber on the runtime's per-turn telemetry channel. The runtime
+ * emits one TurnRecord per turn (symmetric to ThinkingListener / ErrorListener):
+ * the wake event, the render hashes/sizes, the recaptured token usage, and the end
+ * reason. Fire-and-forget; a throwing listener is isolated so it never breaks the loop.
+ */
+export type TurnListener = (event: TurnRecord) => void;
 
 /** The agent-invokable command list advertised to the provider each turn (§4.2). */
 export type ToolCatalog = NonNullable<SendOpts['tools']>;
@@ -178,6 +191,16 @@ export class AgentRuntime {
   /** UI/caller subscribers on the error channel (failed turns). */
   private readonly error_listeners = new Set<ErrorListener>();
 
+  /** Subscribers on the per-turn telemetry channel (one TurnRecord per turn). */
+  private readonly turn_listeners = new Set<TurnListener>();
+
+  /** Monotonic wake counter; feeds the deterministic TurnRecord.turn_id (no clock). */
+  private wake_seq = 0;
+  /** Turn index within the current wake; the second half of TurnRecord.turn_id. */
+  private turn_index = 0;
+  /** The WakeEvent that opened the current wake loop (for TurnRecord.wake_event). */
+  private current_wake_event: WakeEvent | null = null;
+
   /**
    * Set when a turn produced commands-only-violating plain text (§4.2). The
    * commands-only feedback system builder PROJECTS this into the tree (B1): when
@@ -254,6 +277,19 @@ export class AgentRuntime {
   }
 
   /**
+   * onTurn — subscribe to the per-turn telemetry channel. The returned thunk
+   * unsubscribes. One TurnRecord is emitted per turn (symmetric to onThinking/onError),
+   * carrying the wake event, the render hashes/sizes, the recaptured token usage, and
+   * the end reason. The record is clock-free and never enters the tree or the next
+   * prompt — it is the seam an out-of-core subscriber (e.g. a turn_log ledger, a budget
+   * governor, a context inspector) reads, without any new tree churn.
+   */
+  onTurn(listener: TurnListener): () => void {
+    this.turn_listeners.add(listener);
+    return () => this.turn_listeners.delete(listener);
+  }
+
+  /**
    * on_wake — the only entry that moves the runtime out of idle (§8.1).
    *
    * Drives turns until a turn produces no commands (the agent is done responding)
@@ -273,6 +309,9 @@ export class AgentRuntime {
     }
 
     this.state = { kind: 'running', current_event: event };
+    this.current_wake_event = event;
+    this.wake_seq += 1;
+    this.turn_index = 0;
 
     try {
       let turns = 0;
@@ -282,6 +321,7 @@ export class AgentRuntime {
       for (;;) {
         if (turns >= this.max_turns_per_wake) break;
         turns += 1;
+        this.turn_index = turns;
 
         let progressed: boolean;
         try {
@@ -292,6 +332,7 @@ export class AgentRuntime {
           // the wake gracefully so a failed turn never crashes the process or wedges
           // the runtime in 'running'.
           this.emitError(err, 'turn');
+          this.emitTurn(this.turnEnvelope('turn_error'));
           break;
         }
 
@@ -335,6 +376,10 @@ export class AgentRuntime {
     //    being a frozen COW capture (INV #1).
     const snapshot = this.ops.snapshot();
     const prompt = await this.renderer.render(snapshot);
+    // Telemetry copied straight off the render OUTPUT (no re-hash, no re-render) for
+    // this turn's TurnRecord. Captured here so even a failed send still reports the
+    // prompt it tried to send (INV #1 untouched — this reads render output).
+    const telemetry = this.turnTelemetry(prompt);
 
     // 2) Send to the provider and accumulate the stream into one response. We
     //    advertise the agent-invokable command catalog as SendOpts.tools so a
@@ -349,6 +394,7 @@ export class AgentRuntime {
       response = await this.collect(this.provider.send(prompt, this.buildSendOpts()));
     } catch (err) {
       this.emitError(err, 'send');
+      this.emitTurn({ ...this.turnEnvelope('send_error'), ...telemetry });
       return false;
     }
 
@@ -367,21 +413,41 @@ export class AgentRuntime {
     // 4b) tool_use (commands) → invoke_command one by one (§4.2). PolicyEngine
     //     runs inside Operations.invoke_command; a `pending` decision parks the
     //     runtime (paused_for_approval) and aborts the rest of this turn.
+    // Recaptured token usage (computed in collect() at :809/:822-829, previously
+    // dropped on the floor). Spread into the TurnRecord; absent when the provider
+    // reported none (preserves exactOptionalPropertyTypes).
+    const usage = response.usage ? { usage: response.usage } : {};
+
     const { parked, end_turn } = await this.handleToolCalls(tool_calls);
     if (tool_calls.length > 0) progressed = true;
-    if (parked) return true; // parked → caller stops the loop; resumed via on_wake.
+    if (parked) {
+      this.emitTurn({ ...this.turnEnvelope('parked'), ...telemetry, ...usage });
+      return true; // parked → caller stops the loop; resumed via on_wake.
+    }
     // The agent finished responding (a command set end_turn, e.g. messages.reply): stop
     // the loop and return to idle to await the next event, instead of running another
     // turn and re-replying. Multi-step tool use (no end_turn) keeps looping as before.
-    if (end_turn) return false;
+    if (end_turn) {
+      this.emitTurn({ ...this.turnEnvelope('reply'), ...telemetry, ...usage });
+      return false;
+    }
 
     // 4c) plain text (not in thinking, not a tool_use) → commands-only REJECTION
     //     (§4.2). Write the feedback block; the agent self-corrects next turn.
-    if (this.hasDisallowedText(raw_text)) {
+    const disallowed = this.hasDisallowedText(raw_text);
+    if (disallowed) {
       await this.writeCommandsOnlyFeedback();
       progressed = true;
     }
 
+    // One TurnRecord per turn. ended_by reports the strongest signal: disallowed_text
+    // (what drives the next turn) > tool_calls > idle. (parked/reply already returned.)
+    const ended_by: TurnEndReason = disallowed
+      ? 'disallowed_text'
+      : tool_calls.length > 0
+        ? 'tool_calls'
+        : 'idle';
+    this.emitTurn({ ...this.turnEnvelope(ended_by), ...telemetry, ...usage });
     return progressed;
   }
 
@@ -629,6 +695,65 @@ export class AgentRuntime {
         // A faulty error subscriber never breaks the turn loop (fire-and-forget).
       }
     }
+  }
+
+  /**
+   * emitTurn — publish one TurnRecord per turn to the turn channel. Fire-and-forget +
+   * error-isolated, exactly like emitThoughts/emitError: a faulty subscriber never
+   * breaks the turn loop. The record is NEVER written to the tree and NEVER rendered
+   * into the next prompt (telemetry, not context).
+   */
+  private emitTurn(record: TurnRecord): void {
+    if (this.turn_listeners.size === 0) return;
+    for (const listener of this.turn_listeners) {
+      try {
+        listener(record);
+      } catch {
+        // A faulty turn subscriber never breaks the turn loop (fire-and-forget).
+      }
+    }
+  }
+
+  /**
+   * turnEnvelope — the deterministic, CLOCK-FREE fields of a TurnRecord (INV #16):
+   * a monotonic turn_id (`${wake_seq}.${turn_index}`), the spawn depth, the wake event
+   * that opened this loop, and the end reason. No wall-clock — a ts (if any) is stamped
+   * by an out-of-core subscriber, keeping core's surface deterministic.
+   */
+  private turnEnvelope(ended_by: TurnEndReason): {
+    turn_id: string;
+    spawn_depth: number;
+    wake_event: WakeEvent;
+    ended_by: TurnEndReason;
+  } {
+    return {
+      turn_id: `${this.wake_seq}.${this.turn_index}`,
+      spawn_depth: this.spawn_depth,
+      wake_event: this.current_wake_event ?? UNKNOWN_WAKE,
+      ended_by,
+    };
+  }
+
+  /**
+   * turnTelemetry — copy the render-derived fields for a TurnRecord straight off the
+   * RenderedPrompt (no re-hash, no re-render). segment_hashes is a Map keyed by tier;
+   * we narrow it to a per-tier record. per_tier_bytes is the byte length of each
+   * emitted segment's payload. Pure: a read of render OUTPUT, so INV #1 is untouched.
+   */
+  private turnTelemetry(prompt: RenderedPrompt): {
+    snapshot_hash: string;
+    segment_hashes: Partial<Record<CacheTier, string>>;
+    per_tier_bytes: Partial<Record<CacheTier, number>>;
+  } {
+    const segment_hashes: Partial<Record<CacheTier, string>> = {};
+    for (const [tier, hash] of prompt.segment_hashes) {
+      segment_hashes[tier as CacheTier] = hash;
+    }
+    const per_tier_bytes: Partial<Record<CacheTier, number>> = {};
+    for (const seg of prompt.segments) {
+      per_tier_bytes[seg.tier] = segmentBytes(seg.rendered);
+    }
+    return { snapshot_hash: prompt.snapshot_hash, segment_hashes, per_tier_bytes };
   }
 
   /**
@@ -895,6 +1020,25 @@ function buildUsage(
   if (output_tokens !== undefined) usage.output_tokens = output_tokens;
   return usage;
 }
+
+/**
+ * segmentBytes — byte length of a rendered segment's payload (string or ContentPart[]),
+ * for TurnRecord.per_tier_bytes. ContentPart.value is always a string (text or a blob
+ * handle/data-URI, core/types.ts), so this is a pure utf8 byte count — no IO, no clock.
+ */
+function segmentBytes(rendered: string | ContentPart[]): number {
+  if (typeof rendered === 'string') return Buffer.byteLength(rendered, 'utf8');
+  let total = 0;
+  for (const part of rendered) total += Buffer.byteLength(part.value, 'utf8');
+  return total;
+}
+
+/**
+ * UNKNOWN_WAKE — defensive fallback for TurnRecord.wake_event if a record were ever
+ * emitted outside a wake (on_wake always sets current_wake_event before the loop, so
+ * this is unreachable in practice; it keeps the record's wake_event non-null).
+ */
+const UNKNOWN_WAKE: WakeEvent = { kind: 'app_event', source: 'unknown' };
 
 /**
  * approvalTokenOf — recognize a PolicyEngine `pending` signal surfaced as a thrown

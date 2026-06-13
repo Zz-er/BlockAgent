@@ -391,6 +391,17 @@ export class JsonlMemoryStore implements MemoryStore {
     }
   }
 
+  /**
+   * Read all live (non-deleted) records for restart restore, split by target file
+   * (D1 §5.2). Synchronous + construction-time (NOT the hot path) so the MemoryApp can
+   * fold the durable log into `initial_state` before install — mirrors `readAppConfig`'s
+   * read-at-construction. The async `MemoryStore.query`/`load` are the runtime path; this
+   * is the boot-time bulk read the narrow async interface intentionally omits.
+   */
+  readAllByTarget(): { notes: MemoryRecord[]; user: MemoryRecord[] } {
+    return { notes: this.notes.readLive(), user: this.user.readLive() };
+  }
+
   /** Determine which file a record goes to based on its tags. */
   private fileFor(rec: MemoryRecord): MemoryJsonlFile {
     return this.fileForTags(rec.tags);
@@ -908,6 +919,46 @@ function pushBoundedChars(arr: MemoryEntry[], charLimit: number): MemoryEntry[] 
   return result;
 }
 
+/** Project a durable MemoryRecord into the bounded-projection MemoryEntry shape. */
+function entryFromRecord(rec: MemoryRecord): MemoryEntry {
+  const target: 'notes' | 'user' = rec.tags.includes('user') ? 'user' : 'notes';
+  return {
+    id: rec.id,
+    target,
+    content: rec.content,
+    provenance: { origin: rec.provenance.origin, verified: rec.provenance.verified },
+  };
+}
+
+/**
+ * Restore the bounded notes/user projection from the durable JSONL at construction
+ * (D1 §5.2). Folds each file's live records (tombstones already applied) into entries and
+ * applies the SAME per-target char bound the live `remember` path uses (`pushBoundedChars`),
+ * so the booted window is bounded. Pure function of the JSONL + config; reads NO clock, NO
+ * random — ids are loaded (content-addressed), never regenerated. `pinned`/`recalled` have
+ * no durable backing of their own, so they boot empty (unchanged from before).
+ *
+ * Robustness (mirrors `readAppConfig`): an injected non-JSONL store or any read failure →
+ * empty notes/user (zero regression), never throws at boot. Missing files already yield
+ * empty live records via the store's read-live.
+ */
+function restoreMemory(
+  store: MemoryStore,
+  config: MemoryConfig,
+): { notes: MemoryEntry[]; user: MemoryEntry[] } {
+  if (!(store instanceof JsonlMemoryStore)) return { notes: [], user: [] };
+  let live: { notes: MemoryRecord[]; user: MemoryRecord[] };
+  try {
+    live = store.readAllByTarget();
+  } catch {
+    return { notes: [], user: [] }; // torn/unreadable residue → empty, never throw.
+  }
+  return {
+    notes: pushBoundedChars(live.notes.map(entryFromRecord), config.notes_char_limit),
+    user: pushBoundedChars(live.user.map(entryFromRecord), config.user_char_limit),
+  };
+}
+
 // ============================================================================
 // MemoryApp — the BlockApp
 // ============================================================================
@@ -930,6 +981,8 @@ export interface MemoryAppOptions {
 export class MemoryApp {
   readonly store: MemoryStore;
   private readonly seedConfig: MemoryConfig;
+  /** Bounded notes/user projection re-hydrated from the durable JSONL at construction. */
+  private readonly seedProjection: { notes: MemoryEntry[]; user: MemoryEntry[] };
 
   constructor(opts: MemoryAppOptions = {}) {
     const dir = opts.dir ?? join(APPS_DIR, APP_ID);
@@ -951,6 +1004,10 @@ export class MemoryApp {
     const defaults: Record<string, unknown> = { ...DEFAULT_CONFIG };
     const seeded = readAppConfig(APP_ID, defaults, opts.configBase ?? APPS_DIR);
     this.seedConfig = clampConfig(seeded as unknown as MemoryConfig);
+    // Restart restore (D1 §5.2): re-hydrate the bounded notes/user projection from the
+    // durable JSONL at construction (pinned/recalled have no durable backing → empty).
+    // Missing/torn files or an injected non-JSONL store → empty (zero regression).
+    this.seedProjection = restoreMemory(this.store, this.seedConfig);
   }
 
   /**
@@ -964,9 +1021,13 @@ export class MemoryApp {
       version: '1.0.0',
       depends_on: [],
       tree_namespace: TREE_NAMESPACE,
+      // initial_state carries the file-seeded config AND the bounded notes/user projection
+      // re-hydrated from the durable JSONL at construction (D1 §5.2 restart restore): a
+      // restart boots with notes/user intact (char-bounded). pinned/recalled have no
+      // durable backing of their own, so they boot empty (unchanged).
       initial_state: {
-        notes: [],
-        user: [],
+        notes: this.seedProjection.notes,
+        user: this.seedProjection.user,
         pinned: [],
         recalled: [],
         config: this.seedConfig,

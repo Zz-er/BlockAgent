@@ -1,0 +1,22 @@
+{
+  "name": "@block-agent/protocol",
+  "version": "0.0.0",
+  "description": "SessionProtocol v0 — the transport-neutral message catalog (envelope + inbound/outbound discriminated unions). Pure TYPES, zero runtime dependencies. Imported type-only by @block-agent/server (host) and web/ (browser client) so both share one source. Design: ai_com/design/session-protocol-v0.md (D2).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build), like the apps. Importers use '@block-agent/protocol/*.js'. Type-only: a consumer imports with `import type`.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "devDependencies": {
+    "@block-agent/core": "*",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
