@@ -5,38 +5,35 @@
 [![CI](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-> Capability = f(weights, context). You can't change the weights; the context is entirely yours. block-agent takes that one controllable variable — context — and makes it a modular, independently-evolvable structure: **you iterate an agent by recomposing its context, not by rewriting its architecture.**
+> Capability = f(weights, context). You can't change the weights; the context is entirely yours. block-agent takes that one controllable variable — context — and makes it a structure of independently-evolvable building blocks: **you iterate an agent by recomposing its context, not by rewriting its architecture.**
 
-What an agent can do comes down to two things: the trained weights (fixed — out of your hands), and the context you feed it each turn (fully malleable). Only the latter is yours to work on. Yet most frameworks treat context as a hand-assembled string — add a piece, change a line, and it ripples everywhere; over time it becomes a black box no one dares touch. block-agent does the opposite: it runs context as a **structured, bounded, composable** system.
+## Overview
 
-The unit of that system is a **BlockApp**. Conversation history is a BlockApp; tools are one; memory is one; the agent's own identity is one. Adding a capability means writing a BlockApp and installing it; swapping an implementation means replacing one BlockApp with another — neither touches the core. Crucially, there is **no privileged kernel module**: built-in capabilities and the ones you write take the same shape, the same entry, the same constraints. The runtime grows block by block instead of stiffening as it grows.
+What an agent can do comes down to two things: the trained weights, and the context you feed it each turn. The weights are fixed — out of your hands; the context is fully malleable — yours to shape. **There is exactly one place to do the work.** That work now has a name: **context engineering** — filling the context window with the right information for the next step. Most practice treats it as prompt-assembly craft, so context ends up a hand-assembled string: add a piece, change a line, and it ripples everywhere, hardening over time into a black box no one dares touch. block-agent treats it as a **runtime problem**: context is a structured, bounded, composable system, run by a runtime — made of independently-evolvable **building blocks**.
 
-## Three core ideas
+### Context is the model's interface
 
-- **Context is composed of modules, each evolving on its own.** Every module owns its slice — developed, replaced, independent. Swap one memory implementation for another and the modules that depend on it don't change a word.
-- **Modules collaborate through declared contracts, not by naming each other.** One module says "I provide a message count," another says "I need a message count" — neither has to know who the other is. Replace the provider and the consumer is unaffected. Flexibility comes from binding to a contract, not an identity.
-- **The agent can only act through a constrained operation.** Plain text isn't an action — it's rejected and fed back as a correction. Every write converges on a single authorization gate; nobody has a back door. This is also the floor against prompt injection.
+APIs were designed for programs; GUIs for humans. For a model, the interface is the **context** — everything the agent perceives of the world arrives in what you feed it each turn. An interface deserves to be designed, yet most agents' context never was: it's an append-only transcript of calls — every tool invocation appends another result, every action re-fetches the whole state all over again (browser agents re-snapshotting the entire page after each step are the extreme case), near-identical copies pile up side by side, and the signal slowly drowns in the stale. That disease now has a name too: **context rot**. Deleting stale tool results after the fact is one cure; block-agent takes the earlier step — **never writing them in to begin with**.
 
-## A path toward self-evolution
+What it hands the agent is not a transcript but a **stateful screen**. Each block presents its state as one slice of the screen; when the state changes, that slice updates in place; each turn, the whole screen is re-rendered from current state. Tool results live in a bounded window — as new ones arrive, the oldest leave the view (the full history sits in an on-disk log; nothing is lost); conversation history folds into two slices, a summary plus the recent messages verbatim. What the agent sees is always **the world as it is now**, never a pile of past responses. And if the context changes every turn yet the prompt cache still hits, that's what deterministic rendering buys: the same state always renders the same bytes, blocks are laid out stable → slow-changing → volatile, and the stable prefix sits firmly in cache — **mutable state and cacheable context are not a trade-off here.**
 
-Put it together: the malleable part of capability lives entirely in context, and context is a set of modules you can add to, remove, and replace — so "making the agent stronger" reduces to one clear act: recomposing its modules, not rewriting its architecture.
+### The interface is built from blocks
 
-The agent already reshapes its own context: through the operations modules expose, it writes memories, logs tasks, adjusts what it will see next turn. That is the early form of self-evolution. One step further — since adding a capability is just adding a module — the end of this path is an agent that produces modules and extends itself. The hard part was never "letting it write," but "letting it write within bounds"; and the bounds (a single state entry, unified authorization, an agent that cannot rewrite its own constraints) are a premise of this design, not an afterthought. **Safe self-extension is treated as a structural problem** — which is exactly what modularity and constrained operations buy.
+A screen can't be one undivided slab — that's the hand-assembled-string road all over again. block-agent cuts it into slices, each owned by an independent little program. That program is a **BlockApp** — "Block" meant literally: a **building block**. Conversation history is one block; tools are one; memory is one; the agent's own identity is one. Adding a capability means snapping in a new block; swapping an implementation means swapping one block for another — neither touches the core.
 
-## BlockApp: a stateful context program
+To write a block, you describe four things: **state** (what it holds, and how that changes under operations), **presentation** (how that state becomes the slice of the interface the agent sees), **operations** (what it exposes — the user, the agent, other blocks, and external systems all use the same set), and **contracts** (what it declares it needs and provides; other blocks connect through that, not through who it is).
 
-A BlockApp isn't static content; it's a small program. To write one, you describe four things:
+Put together, this is what we mean by an **AI-native application**: a BlockApp is not a human-facing program with an API wrapped around it, but an application written for the AI from the start — its interface is its slice of the context, its buttons are the operations it exposes. Giving the agent a capability means installing an application for it, not handing it a stack of API docs. Blocks **bind to contracts, never to names**: one says "I provide a message count," another says "I need a message count" — neither has to know who the other is, and replacing the provider leaves the consumer untouched. And there is **no privileged kernel block** — the built-in blocks and the ones you write take the same shape, the same entry, the same constraints, so the runtime grows block by block instead of stiffening as it grows.
 
-1. **State, and how it evolves** — what the module holds, and how that changes under operations.
-2. **Presentation** — how that state becomes the slice of context the agent sees.
-3. **Operations** — what it exposes; the active face of its interface, used alike by the user, the agent, other modules, and external systems.
-4. **Contracts** — what it declares it needs and provides; other modules connect through that, not through its identity or internals.
+### Safety and self-extension
 
-> A working example: an "overview" module declares it needs a "message count" and a "task count"; the conversation and task modules each declare they provide them. The framework wires them up and feeds the latest figures in each turn. Replace the conversation module wholesale — as long as the new one also provides a "message count," the overview module doesn't change a line.
+Every slice of the screen is backed by state; if anyone could casually rewrite that state, the rest is worthless. So **every write converges on a single gate**: for the agent to do anything, it must go through one constrained operation — plain text isn't an action; it's rejected and fed back as a correction. The user, the agent, and the blocks all use the same set of operations; the differences in privilege are decided by one unified authorization gate, and nobody has a back door. Add two deliberate asymmetries: the agent cannot rewrite its own identity constraints, and it cannot install or remove blocks. That is the floor against prompt injection — and these bounds are part of the structure itself, not patches applied after an incident.
 
-## Built-in modules
+The bounds are laid down first so the next step can be taken safely. The agent already reshapes its own context every day: it writes memories, logs tasks, adjusts what it will see next turn — the early form of self-evolution. Since adding a capability is just adding a block, the end of this road is an agent that produces blocks and extends itself. The hard part was never "letting it write" — it's "letting it write within bounds." The runtime prepares for this with a unified host model: trusted blocks run in-process; untrusted ones — third-party, or produced by the agent itself — are placed in a child-process sandbox, and a block declaring capabilities beyond its ceiling is rejected at install time. **Safe self-extension is solved as a structural problem, not gambled on as an alignment problem.**
 
-| Module | Role |
+### Built-in blocks
+
+| Block | Role |
 |---|---|
 | agent_identity | the agent's identity and constraints; the agent can't rewrite itself |
 | messages | conversation history with automatic compaction |
@@ -44,9 +41,11 @@ A BlockApp isn't static content; it's a small program. To write one, you describ
 | memory | local memory |
 | memory_letta | external semantic memory (same interface as memory, interchangeable) |
 | task | a task list; writable by the agent or by an external system |
-| stats | cross-module statistics (an example of module-to-module collaboration) |
+| stats | cross-block statistics (an example of contract-based cooperation) |
 
-To write a capability of your own, see the [usage & development docs](./doc/README.md).
+### Status
+
+In place: the core loop, the built-in blocks, the interactive terminal, block discovery and (un)installation (including hot-uninstall), contract-based cooperation between blocks (declared interfaces + a pre-render pull by contract), external semantic-memory integration (verified against a live Letta / DashScope), and the unified trusted/sandboxed host model (the cross-process sandbox carrier has landed and is wired into boot, with end-to-end fork tests; no sandboxed block ships with the release yet). Tests green: core 471 · cli 88 · memory_letta 44.
 
 ## Quick start (DeepSeek as an example)
 
@@ -95,19 +94,13 @@ npm start
 npm start -- --dry-run
 ```
 
-You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help` for the full list, `/apps` for the modules). The two ways mix freely; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
+You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help` for the full list, `/apps` for the blocks). The two ways mix freely; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
 
-## What it buys you
+## Tutorial & docs
 
-Flexible, because modules bind to contracts rather than identities. Safe, because every write converges on a single gate, and the agent can neither rewrite its own constraints nor install or remove modules. Clear, because context is rendered deterministically — the same state always yields the same content, so the context cache holds. Together, those three are the structured, legible context block-agent sets out to hand the model. It is model-agnostic: Anthropic and any OpenAI-compatible endpoint work out of the box.
+To build a block of your own, start with the [BlockApp development guide](./doc/blockapp-development.md) — it begins from the project's directory layout (where `apps/` lives, which files make up a block), then walks you file by file through writing your first working block. Full usage & development docs are in [`doc/`](./doc/README.md).
 
-## Layout & docs
-
-`packages/core` (runtime + built-in modules, zero runtime dependencies) · `packages/cli` (the interactive terminal) · `apps/*` (built-in BlockApps, including `apps/memory_letta` for dependency-isolated external-memory integration) · `doc/` ([usage & development docs](./doc/README.md)). Stack: Node 24 · TypeScript · vitest.
-
-## Status
-
-In place: the core loop, the built-in modules, the interactive terminal, module discovery and (un)installation (including hot-uninstall), contract-based collaboration between modules (declared interfaces + a pre-render pull by contract), external semantic-memory integration (verified against a live Letta / DashScope), and the unified trusted/sandboxed host model (the cross-process sandbox carrier has landed and is wired into boot, with end-to-end fork tests; no sandboxed module ships with the release yet). Tests green: core 471 · cli 88 · memory_letta 44.
+Code layout: `packages/core` (the core runtime, zero runtime dependencies) · `packages/cli` (the interactive terminal) · `apps/*` (built-in BlockApps, including `apps/memory_letta` for dependency-isolated external-memory integration). Stack: Node 24 · TypeScript · vitest.
 
 ## License
 
