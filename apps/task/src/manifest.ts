@@ -353,6 +353,46 @@ export class TaskStore {
 }
 
 // ============================================================================
+// Restart restore (D1 §5.2 — construction-time read-once)
+// ============================================================================
+
+/**
+ * Restore the bounded task projection from the durable log at construction (D1 §5.2):
+ * fold the log to its live tasks and keep the most-recent `list_limit` (by deterministic
+ * `ts`) so the booted window is bounded — exactly the count cap the builder renders. Pure
+ * function of the jsonl + config; reads NO clock, NO random — ids/`ts` are loaded from the
+ * records, never regenerated. A missing log → empty (zero regression); any read failure
+ * degrades to empty rather than crashing boot (mirrors `readAppConfig`).
+ */
+function restoreTasks(store: TaskStore, listLimit: number): Task[] {
+  let live: Task[];
+  try {
+    live = store.readAll();
+  } catch {
+    return []; // torn/unreadable residue → empty, never throw at boot.
+  }
+  if (live.length <= listLimit) return live;
+  // Over-bound: keep the most-recent `list_limit` by monotonic `ts`, preserving the
+  // store's first-seen order among the kept tasks (stable + deterministic).
+  const cutoff = [...live].sort((a, b) => b.ts - a.ts)[listLimit - 1]!.ts;
+  return live.filter((t) => t.ts >= cutoff).slice(0, listLimit);
+}
+
+/** Highest internal `task_N` sequence already used, so a new task gets `task_{n+1}`. */
+function highestTaskSeq(tasks: readonly Task[]): number {
+  let max = 0;
+  for (const t of tasks) {
+    const match = /^task_(\d+)$/.exec(t.id);
+    if (match !== null) {
+      const n = Number(match[1]);
+      if (n > max) max = n;
+    }
+    if (Number.isFinite(t.ts) && t.ts > max) max = Math.floor(t.ts);
+  }
+  return max;
+}
+
+// ============================================================================
 // Builder — task:list (slow_changing), owner 'system', PURE (INV #4 / #16)
 // ============================================================================
 
@@ -783,9 +823,11 @@ export interface TaskAppOptions {
 export class TaskApp {
   readonly store: TaskStore;
   private readonly seedConfig: TaskConfig;
+  /** Bounded task list re-hydrated from the durable log at construction (D1 §5.2). */
+  private readonly seedTasks: Task[];
   private ctx: AppContext<TaskState> | null = null;
   /** Monotonic counter for deterministic task ids within this instance (INV #16). */
-  private seq = 0;
+  private seq: number;
 
   constructor(opts: TaskAppOptions = {}) {
     const dir = opts.dir ?? join(APPS_DIR, APP_ID);
@@ -796,6 +838,12 @@ export class TaskApp {
       opts.configBase ?? APPS_DIR,
     );
     this.seedConfig = clampConfig(seeded as unknown as TaskConfig);
+    // Restart restore (D1 §5.2): re-hydrate the bounded task list from the durable log at
+    // construction, then advance the id counter past the loaded ids/`ts` so a new task
+    // after restart gets the NEXT `task_N` instead of colliding. Missing/torn log → empty
+    // (zero regression), never throws.
+    this.seedTasks = restoreTasks(this.store, this.seedConfig.list_limit);
+    this.seq = highestTaskSeq(this.seedTasks);
   }
 
   /**
@@ -810,7 +858,10 @@ export class TaskApp {
       depends_on: [],
       provides: [{ contract: 'task_count', via: 'count' }],
       tree_namespace: TREE_NAMESPACE,
-      initial_state: { tasks: [], config: this.seedConfig },
+      // initial_state carries the file-seeded config AND the bounded task list re-hydrated
+      // from the durable log at construction (D1 §5.2 restart restore): a restart boots
+      // with the open tasks intact, not an empty list.
+      initial_state: { tasks: this.seedTasks, config: this.seedConfig },
       state_schema: STATE_SCHEMA,
       builders: [() => TaskListBlockBuilder],
       commands: [

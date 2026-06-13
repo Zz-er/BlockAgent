@@ -435,6 +435,85 @@ describe('task jsonl store', () => {
 });
 
 // ---------------------------------------------------------------------------
+// restart restore (D1 §5.2): a fresh App on the same dir re-hydrates initial_state
+// ---------------------------------------------------------------------------
+
+describe('task restart restore (D1 §5.2)', () => {
+  it('re-hydrates the bounded task list into initial_state from the durable log', async () => {
+    const storeDir = join(dir, 'store');
+    const { app, registry } = installApp();
+    const a = ((await registry.route('task.add', { title: 'alpha' }, AGENT)).data as { id: string }).id;
+    await registry.route('task.add', { title: 'beta' }, USER);
+    await registry.route('task.complete', { id: a }, AGENT); // alpha → done (still live)
+
+    // A fresh App on the SAME dir boots with the projection restored (NOT empty), and the
+    // folded live status survives (alpha done, beta open).
+    const reloaded = new TaskApp({ dir: storeDir, configBase: dir });
+    const restored = (reloaded.manifest().initial_state as TaskState).tasks;
+    expect(restored.map((t) => t.title)).toEqual(['alpha', 'beta']);
+    expect(restored.find((t) => t.title === 'alpha')!.status).toBe('done');
+    expect(restored.find((t) => t.title === 'beta')!.status).toBe('open');
+    // The durable jsonl is intact regardless (the source of the restore).
+    expect(app.store.readAll()).toHaveLength(2);
+  });
+
+  it('advances the id counter past the restored ids so a new task never collides', async () => {
+    const storeDir = join(dir, 'store');
+    const { registry } = installApp();
+    await registry.route('task.add', { title: 'one' }, AGENT); // task_1
+    await registry.route('task.add', { title: 'two' }, AGENT); // task_2
+
+    const reloaded = new TaskApp({ dir: storeDir, configBase: dir });
+    const reg2 = new AppRegistry();
+    reg2.install(reloaded.manifest());
+    const res = await reg2.route('task.add', { title: 'three' }, AGENT);
+    // Next id is task_3, not a re-used task_1 — and it does not clobber a restored task.
+    expect((res.data as { id: string }).id).toBe('task_3');
+    expect((reg2.get_app_context('task')?.state as TaskState).tasks.map((t) => t.id)).toEqual([
+      'task_1',
+      'task_2',
+      'task_3',
+    ]);
+  });
+
+  it('boots bounded: an over-limit durable log keeps the most-recent list_limit tasks', async () => {
+    const storeDir = join(dir, 'store');
+    writeConfig(dir, { list_limit: 3 });
+    const { registry } = installApp();
+    for (let i = 1; i <= 6; i += 1) await registry.route('task.add', { title: `t${i}` }, AGENT);
+
+    const reloaded = new TaskApp({ dir: storeDir, configBase: dir });
+    const restored = (reloaded.manifest().initial_state as TaskState).tasks;
+    // Bounded to list_limit, keeping the most-recent by monotonic ts (t4..t6).
+    expect(restored.map((t) => t.title)).toEqual(['t4', 't5', 't6']);
+  });
+
+  it('a missing durable log boots an empty list (zero regression)', () => {
+    const fresh = new TaskApp({ dir: join(dir, 'never-written'), configBase: dir });
+    expect((fresh.manifest().initial_state as TaskState).tasks).toEqual([]);
+  });
+
+  it('a crash-torn durable log degrades gracefully (drops the torn tail, never throws)', () => {
+    const storeDir = join(dir, 'store');
+    mkdirSync(storeDir, { recursive: true });
+    // Two clean records + a torn trailing line (no newline) — the store's startup
+    // tail-truncate drops the torn line, restore reads the two clean tasks, never throws.
+    writeFileSync(
+      join(storeDir, 'tasks.jsonl'),
+      '{"op":"upsert","id":"task_1","title":"kept","status":"open","source":"agent","ts":1}\n' +
+        '{"op":"upsert","id":"task_2","title":"also","status":"open","source":"agent","ts":2}\n' +
+        '{"op":"upsert","id":"task_3","title":"torn',
+    );
+    let app: TaskApp | undefined;
+    expect(() => {
+      app = new TaskApp({ dir: storeDir, configBase: dir });
+    }).not.toThrow();
+    const restored = (app!.manifest().initial_state as TaskState).tasks;
+    expect(restored.map((t) => t.title)).toEqual(['kept', 'also']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
 

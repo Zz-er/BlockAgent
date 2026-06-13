@@ -802,6 +802,53 @@ export class MessagesStore {
 }
 
 // ============================================================================
+// Restart restore (D1 §5.2 — construction-time read-once, re-compact)
+// ============================================================================
+
+/**
+ * Restore the bounded projection from the durable history at construction (D1 §5.2):
+ * fold the FULL durable history into `recent`, then re-run the same deterministic
+ * `compactIfNeeded` transform the live path uses, so a long history boots BOUNDED
+ * (recent window + summary) rather than over-budget. Pure function of the jsonl + the
+ * config; reads NO clock, NO random — ids are loaded from the records, never regenerated.
+ *
+ * Robustness (mirrors `readAppConfig`'s "never throw at boot"): a missing file already
+ * yields an empty history (zero regression); the store's startup tail-truncate has
+ * dropped any crash-torn tail; any residual parse failure here degrades to the empty
+ * projection (`{ recent: [], summary: '' }`) instead of crashing boot.
+ */
+function restoreProjection(
+  history: readonly HistoryMessage[],
+  config: MessagesConfig,
+  estimate: TokenEstimator,
+  summarize: Summarizer,
+): { recent: HistoryMessage[]; summary: string } {
+  if (history.length === 0) return { recent: [], summary: '' };
+  // Replay through the SAME pure transform the live path uses, so the booted window is
+  // bounded exactly as it would be had the messages arrived one at a time.
+  const seeded: MessagesState = { recent: [...history], summary: '', config };
+  const compacted = compactIfNeeded(seeded, estimate, summarize);
+  return { recent: compacted.recent, summary: compacted.summary };
+}
+
+/**
+ * Highest per-role counter already used by the durable history, so a reply/ingest after
+ * restart assigns the NEXT id (`agent_{n+1}`) instead of colliding with a loaded one.
+ * Parses the `<role>_<n>` ids this instance assigns; ignores foreign id shapes.
+ */
+function highestSeq(history: readonly HistoryMessage[]): { user: number; agent: number } {
+  const seq = { user: 0, agent: 0 };
+  for (const m of history) {
+    const match = /^(user|agent)_(\d+)$/.exec(m.id);
+    if (match === null) continue;
+    const role = match[1] as 'user' | 'agent';
+    const n = Number(match[2]);
+    if (n > seq[role]) seq[role] = n;
+  }
+  return seq;
+}
+
+// ============================================================================
 // MessagesApp — the BlockApp (manifest + the §8.2 wake-seam ingest door)
 // ============================================================================
 
@@ -833,9 +880,11 @@ export class MessagesApp {
   private readonly estimate: TokenEstimator;
   private readonly summarize: Summarizer;
   private readonly seedConfig: MessagesConfig;
+  /** Bounded projection reconstructed from durable history at construction (D1 §5.2). */
+  private readonly seedProjection: { recent: HistoryMessage[]; summary: string };
   private ctx: AppContext<MessagesState> | null = null;
   /** Monotonic per-role counters for deterministic message ids within this instance. */
-  private readonly seq: { user: number; agent: number } = { user: 0, agent: 0 };
+  private readonly seq: { user: number; agent: number };
   /** Subscribers on the reply channel (§6 Option B); see `onReply`. */
   private readonly replyListeners = new Set<ReplyListener>();
 
@@ -853,14 +902,27 @@ export class MessagesApp {
       opts.configBase ?? APPS_DIR,
     );
     this.seedConfig = clampConfig(seeded as unknown as MessagesConfig);
+    // Restart restore (D1 §5.2): re-hydrate the bounded projection from the durable
+    // history at construction, then advance the id counters past the loaded ids so a
+    // reply/ingest after restart never collides with a record already on disk. A missing
+    // / torn history degrades to an empty projection (zero regression), never throws.
+    let history: HistoryMessage[];
+    try {
+      history = this.store.readHistory();
+    } catch {
+      history = []; // torn/unreadable residue → empty, never throw at boot.
+    }
+    this.seedProjection = restoreProjection(history, this.seedConfig, this.estimate, this.summarize);
+    this.seq = highestSeq(history);
   }
 
   /**
    * The AppManifest to hand to `AppRegistry.install` (§6.3). Returned widened to the
    * bare `AppManifest` per the team's locked TS2379 convention; the typed
    * `MessagesState` discipline stays in the command/builder factories. `initial_state`
-   * carries the file-seeded config (recovery of prior history into the projection is a
-   * v3.1 follow-up — the durable log is intact either way).
+   * carries the file-seeded config AND the bounded projection re-hydrated from the
+   * durable history at construction (D1 §5.2 restart restore): a restart now boots with
+   * the recent window + summary intact (compacted to budget), not an empty projection.
    */
   manifest(): AppManifest {
     const app = this;
@@ -872,7 +934,11 @@ export class MessagesApp {
       // readonly `count` command (the StatsApp consumes it identity-free, §3.2).
       provides: [{ contract: 'message_count', via: 'count' }],
       tree_namespace: TREE_NAMESPACE,
-      initial_state: { recent: [], summary: '', config: this.seedConfig },
+      initial_state: {
+        recent: this.seedProjection.recent,
+        summary: this.seedProjection.summary,
+        config: this.seedConfig,
+      },
       state_schema: STATE_SCHEMA,
       builders: [() => SummaryBlockBuilder, () => RecentBlockBuilder],
       commands: [
