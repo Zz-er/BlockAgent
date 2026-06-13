@@ -355,6 +355,48 @@ export interface RuntimeErrorEvent {
   spawn_depth: number;
 }
 
+/**
+ * TurnEndReason — which branch of the runtime's turn loop ended a turn (one value per
+ * real exit; see AgentRuntime.runTurn / on_wake). Feeds TurnRecord.ended_by.
+ */
+export type TurnEndReason =
+  | 'reply' // a command set end_turn (e.g. messages.reply) → the loop stops
+  | 'tool_calls' // ≥1 tool_call, no end_turn → the loop continues
+  | 'disallowed_text' // commands-only rejection was written (the agent self-corrects)
+  | 'idle' // no command and no feedback → the agent is done
+  | 'parked' // a policy 'pending' decision parked the runtime
+  | 'send_error' // the provider/transport call failed (render had already succeeded)
+  | 'turn_error'; // an unexpected failure outside the send path
+
+/**
+ * TurnRecord — per-turn telemetry emitted on the runtime's turn channel
+ * (`AgentRuntime.onTurn`), symmetric to ThinkingEvent / RuntimeErrorEvent. It is a
+ * pure, CLOCK-FREE value (no wall-clock `ts`): a timestamp, if needed, is stamped by
+ * an out-of-core subscriber at write time, keeping core's surface deterministic
+ * (INVARIANT #1 / #16). The record is a READ of render output + provider usage; it is
+ * never written to the tree and never rendered into the next prompt (telemetry, not
+ * context). Hashes and per-tier byte sizes are copied verbatim off the RenderedPrompt
+ * this turn produced — no re-hash, no re-render.
+ */
+export interface TurnRecord {
+  /** Deterministic, NOT a uuid (INV #16): `${wake_seq}.${turn_index}`, monotonic ints. */
+  turn_id: string;
+  /** runtime.spawn_depth; 0 = the main agent. */
+  spawn_depth: number;
+  /** The WakeEvent that opened this wake loop. */
+  wake_event: WakeEvent;
+  /** RenderedPrompt.snapshot_hash, verbatim. Absent if the turn failed before render. */
+  snapshot_hash?: string;
+  /** RenderedPrompt.segment_hashes as a record; only emitted (non-empty) tiers present. */
+  segment_hashes?: Partial<Record<CacheTier, string>>;
+  /** Byte length of each emitted segment's rendered payload; only emitted tiers present. */
+  per_tier_bytes?: Partial<Record<CacheTier, number>>;
+  /** Recaptured token usage; absent if the provider reported none. */
+  usage?: { input_tokens?: number; output_tokens?: number };
+  /** Which branch ended the turn (see TurnEndReason). */
+  ended_by: TurnEndReason;
+}
+
 // ============================================================================
 // ACTOR INTERFACES (wave 2 — added so runtime/index wire against stable shapes)
 //
