@@ -43,6 +43,18 @@
  * block names use a colon, command full-names a dot; relative imports carry `.js`.
  */
 
+import {
+  closeSync,
+  existsSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
+import { join } from 'node:path';
+
 import type { Block, BlockName, InvokerContext, WakeEvent } from '@block-agent/core/core/types.js';
 import type {
   AppContext,
@@ -54,6 +66,7 @@ import type {
   CommandResult,
   JsonSchema,
 } from '@block-agent/core/app/types.js';
+import { APPS_DIR } from '@block-agent/core/apps/_app_config.js';
 import type { ConvKind, ImPushFrame, WireMessage } from './wire.js';
 import { ImClient, type ImClientApi } from './im_client.js';
 
@@ -68,6 +81,41 @@ const TREE_NAMESPACE = '/im_proxy' as const;
 /** The two blocks this App renders into the prompt (INV #15). */
 const CONVERSATIONS_BLOCK: BlockName = 'im_proxy:conversations';
 const CHAT_BLOCK: BlockName = 'im_proxy:chat';
+
+// ============================================================================
+// Restart-recovery (D2d) — durable per-conversation backfill cursor
+// ============================================================================
+
+/**
+ * cursors.jsonl under `.block-agent/apps/im_proxy/` — the DURABLE per-conversation
+ * `consumed_seq` store (D2d). On restart, bootstrap reads the persisted cursor per conv and
+ * backfills `history(conv, persistedSeq)` instead of `since=0`, so (1) messages that arrived
+ * during downtime are NOT dropped and (2) already-handled messages are NOT re-surfaced (no
+ * duplicate reply). Mirrors focus's focus.jsonl / messages' history.jsonl restore pattern.
+ * This file is durable substrate — INV #5: on_uninstall NEVER deletes it.
+ */
+const CURSORS_FILE = 'cursors.jsonl' as const;
+
+/** §12.2: each jsonl line MUST be ≤ 64KB (mirrors focus.jsonl). */
+const MAX_LINE_BYTES = 64 * 1024;
+
+/** Timeout (ms) spinning for the advisory lock before giving up (mirrors focus). */
+const LOCK_TIMEOUT_MS = 5_000;
+
+/**
+ * Backfill page size (D2d catch-up loop). The IM service caps `limit` at 500
+ * (im.ts §4.3 / GET /im/history). A FULL page implies there may be more, so the loop
+ * pulls another page from the new cursor.
+ */
+const BACKFILL_PAGE = 500;
+
+/**
+ * Hard ceiling on messages backfilled per conversation on boot (D2d). A bounded
+ * catch-up loop pulls pages of `BACKFILL_PAGE` until a short page; if it hits this many
+ * messages it STOPS and logs a visible warning (no silent truncation — the gap-free
+ * thesis is loud-or-correct). 10 pages is a generous downtime budget per conv.
+ */
+const MAX_BACKFILL_PER_CONV = BACKFILL_PAGE * 10;
 
 // ============================================================================
 // Capability tokens
@@ -578,7 +626,11 @@ function ingestCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
           typeof (e as { msg?: unknown }).msg === 'object',
       );
       if (batch.length === 0) return { ok: true, data: { ingested: 0 } };
+      const before = ctx.state;
       ctx.set_state((s) => app.foldMessages(s, batch));
+      // D2d: persist the per-conv cursor for every conv this batch advanced, so a restart
+      // resumes past the just-ingested (already-handled) messages — no duplicate reply.
+      app.persistCursorDeltas(before, ctx.state);
       return { ok: true, data: { ingested: batch.length } };
     },
   };
@@ -802,6 +854,131 @@ function setOwnerCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
 }
 
 // ============================================================================
+// CursorStore — durable per-conversation backfill cursor (D2d restart-recovery)
+// ============================================================================
+
+/** One durable cursor record in the jsonl: the max seq consumed for a conversation. */
+interface CursorRecord {
+  conv_id: string;
+  consumed_seq: number;
+}
+
+/**
+ * CursorStore — an append-only, last-wins jsonl of `{conv_id, consumed_seq}` under
+ * `.block-agent/apps/im_proxy/cursors.jsonl`. It persists each conversation's backfill
+ * cursor so a restart resumes from where it left off (no missed-message loss, no
+ * duplicate-reply). The full message history is the IM service; this file holds ONLY the
+ * scalar cursor per conv (bounded — INV #14-ish).
+ *
+ * Durability discipline is identical to focus's FocusStore (the precedent): ≤64KB/line,
+ * an exclusive 'wx' advisory lock around each append, and a startup tail-truncate of a
+ * crash-torn last line. `readCursors` collapses the append log to the last value per conv
+ * and NEVER throws at boot (a missing / torn / unparseable file → an empty map), mirroring
+ * focus.restoreState / messages' try-catch restore. This is DURABLE substrate — INV #5:
+ * on_uninstall must NEVER delete it.
+ */
+export class CursorStore {
+  private readonly path: string;
+  private readonly lockPath: string;
+
+  constructor(readonly dir: string) {
+    mkdirSync(dir, { recursive: true });
+    this.path = join(dir, CURSORS_FILE);
+    this.lockPath = `${this.path}.lock`;
+    this.truncateIncompleteTail();
+  }
+
+  /** Append one cursor advance as a single jsonl line under an exclusive advisory lock. */
+  append(record: CursorRecord): void {
+    const line = `${JSON.stringify(record)}\n`;
+    const bytes = Buffer.byteLength(line, 'utf8');
+    if (bytes > MAX_LINE_BYTES)
+      throw new Error(
+        `im_proxy cursors.jsonl line is ${bytes}B, exceeds the ${MAX_LINE_BYTES}B/line limit`,
+      );
+    const release = acquireLock(this.lockPath);
+    try {
+      const fd = openSync(this.path, 'a');
+      try {
+        writeSync(fd, line);
+      } finally {
+        closeSync(fd);
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Read the durable cursors, collapsed last-wins per conv_id (the append log is replayed
+   * in order; a later line for the same conv overwrites an earlier one). Total + never
+   * throws: a missing / unreadable file → an empty map; an unparseable line is skipped.
+   */
+  readCursors(): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!existsSync(this.path)) return out;
+    let text: string;
+    try {
+      text = readFileSync(this.path, 'utf8');
+    } catch {
+      return out; // unreadable residue → empty, never throw at boot.
+    }
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      try {
+        const rec = JSON.parse(line) as CursorRecord;
+        if (typeof rec.conv_id === 'string' && typeof rec.consumed_seq === 'number') {
+          out.set(rec.conv_id, rec.consumed_seq);
+        }
+      } catch {
+        continue; // skip unparseable (shouldn't happen after tail-truncate)
+      }
+    }
+    return out;
+  }
+
+  /** Startup scan: truncate a crash-torn trailing line (mirrors focus's FocusStore). */
+  private truncateIncompleteTail(): void {
+    if (!existsSync(this.path)) return;
+    const buf = readFileSync(this.path);
+    if (buf.length === 0) return;
+    const lastNewline = buf.lastIndexOf(0x0a); // '\n'
+    const keep = lastNewline + 1;
+    if (keep === buf.length) return;
+    const fd = openSync(this.path, 'r+');
+    try {
+      ftruncateSync(fd, keep);
+    } finally {
+      closeSync(fd);
+    }
+  }
+}
+
+/** Portable exclusive advisory lock using atomic 'wx' file creation (mirrors focus). */
+function acquireLock(lockPath: string): () => void {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      closeSync(fd);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      if (Date.now() > deadline)
+        throw new Error(`im_proxy cursors.jsonl lock timeout on ${lockPath} (held too long)`);
+      // Tight spin: appends are sub-millisecond; staying synchronous avoids async.
+    }
+  }
+  return () => {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* already released — releasing twice is harmless */
+    }
+  };
+}
+
+// ============================================================================
 // ImProxyApp — the BlockApp (manifest + push→wake→ingest seam)
 // ============================================================================
 
@@ -827,6 +1004,17 @@ export interface ImProxyAppOptions {
   client?: ImClientApi;
   /** Pre-bound account (principal_id + display); usually set on register/boot. */
   account?: { principal_id: string; display: string };
+  /**
+   * Storage dir for the durable cursor store (D2d). Defaults to
+   * `.block-agent/apps/im_proxy/` (same `join(APPS_DIR, APP_ID)` resolution as messages/focus).
+   * Tests point this at a temp dir.
+   */
+  dir?: string;
+  /**
+   * Injectable cursor store (tests). Overrides the default jsonl store at `dir`. Production
+   * omits it (a real CursorStore is created at `dir`).
+   */
+  cursors?: CursorStore;
 }
 
 /**
@@ -851,6 +1039,10 @@ export class ImProxyApp {
   /** WS unsubscribe thunk (set on_install, cleared on_uninstall). */
   private unsubscribe: (() => void) | null = null;
   private readonly seedAccount?: { principal_id: string; display: string };
+  /** Durable per-conversation backfill cursor store (D2d restart-recovery). */
+  readonly cursors: CursorStore;
+  /** Cursors restored from disk at construction → seeded into conv shells in bootstrap. */
+  private readonly restoredCursors: Map<string, number>;
 
   constructor(opts: ImProxyAppOptions = {}) {
     this.client =
@@ -874,6 +1066,37 @@ export class ImProxyApp {
     // display falls back to the principal_id (the directory may later resolve a nicer name).
     const self = opts.account ?? readSelfAccountFromEnv();
     if (self) this.seedAccount = self;
+
+    // D2d restart-recovery: the durable cursor store + the cursors restored from it at
+    // construction (mirrors messages reading history.jsonl / focus reading focus.jsonl into
+    // initial_state). The read NEVER throws at boot (torn/missing → empty map). The default
+    // dir resolves identically to messages: `join(APPS_DIR, APP_ID)`.
+    this.cursors = opts.cursors ?? new CursorStore(opts.dir ?? join(APPS_DIR, APP_ID));
+    let restored: Map<string, number>;
+    try {
+      restored = this.cursors.readCursors();
+    } catch {
+      restored = new Map(); // belt-and-suspenders: never block boot on a cursor read.
+    }
+    this.restoredCursors = restored;
+  }
+
+  /**
+   * persistCursorDeltas — append the cursor for every conv whose `consumed_seq` ADVANCED
+   * between two states (D2d). Called right after each `set_state(foldMessages(...))` at the
+   * three fold seams (bootstrap backfill, ingest, optimistic send). foldMessages stays a
+   * PURE transform (no IO); the durable write lives here at the same seam as set_state, so
+   * the persisted cursor and the in-state consumed_seq advance together. Public so the
+   * `im.ingest` command factory (a free function holding the `app`) can call it at its seam.
+   */
+  persistCursorDeltas(before: ImProxyState, after: ImProxyState): void {
+    const priorById = new Map(before.conversations.map((c) => [c.id, c.consumed_seq]));
+    for (const c of after.conversations) {
+      const prior = priorById.get(c.id) ?? 0;
+      if (c.consumed_seq > prior) {
+        this.cursors.append({ conv_id: c.id, consumed_seq: c.consumed_seq });
+      }
+    }
   }
 
   /** The AppManifest to hand to AppRegistry.install. */
@@ -935,19 +1158,54 @@ export class ImProxyApp {
   }
 
   /**
-   * bootstrap — first-screen load: GET /im/conversations, then per-conv backfill from
-   * since=0. Pure-ish (network read only); folds the windows into state via set_state.
-   * Degrades silently if the service is unreachable (the client returns empty).
+   * bootstrap — first-screen load: GET /im/conversations, then per-conv backfill. On a
+   * fresh boot each conv starts at `consumed_seq=0`; on a RESTART (D2d) it starts at the
+   * DURABLE persisted cursor (`restoredCursors`), so the backfill resumes from where the
+   * pre-crash run left off — missed messages are caught up, already-handled ones are not
+   * re-surfaced (no duplicate reply). Pure-ish (network read only); folds windows into state
+   * via set_state. Degrades silently if the service is unreachable (the client returns empty).
+   *
+   * RESTART RE-WAKE (D2d, the oa_proxy 7a9b611 pattern): on_install runs FIRE-AND-FORGET
+   * (registry `void on_install`), so the backfill folds the missed messages into state AFTER
+   * the agent first reports idle — and the fold alone does NOT trigger a turn, so the agent
+   * would sit idle on the recovered messages and reply to NONE of them. After a RESTART that
+   * actually folds missed messages we therefore `ctx.wake` ONCE so the runtime runs a turn
+   * over the recovered window (the live `flush()` path's wake covers ongoing pushes; this
+   * covers the boot gap). The wake is GATED (see below) so it never changes fresh-boot
+   * behavior.
+   *
+   * RECOVERY CONTRACT — gap-free RECOVERY, NOT gap-free REPLY (team-lead ruling, D2d).
+   * The durability guarantee is: `consumed_seq` advances past ALL missed messages (no loss,
+   * and — critically — the cursor NEVER lags the render window, which would make the backfill
+   * re-fetch the same page forever) AND no already-handled message is re-replied. The agent
+   * then resumes on the RECENT WINDOW (`recent` is capped at `config.window`), NOT the whole
+   * backlog: after a long downtime the recovery surfaces the most-recent window-worth, and the
+   * agent replies to that — it does NOT fire a reply to every message in a deep backlog
+   * (reboot-flood is an anti-feature). Replying-to-every-missed would require holding the
+   * cursor behind beyond-window messages (re-fetch loop) or an unbounded window (INV #14), so
+   * it is intentionally OUT OF SCOPE here; if ever desired it is a scoped follow-up, not a
+   * patch. The `D2d: restart recovery advances cursor past ALL missed` unit test locks this.
    */
   async bootstrap(): Promise<void> {
     const ctx = this.ctx;
     if (ctx === null) return;
     const { conversations } = await this.client.listConversations();
     const cap = ctx.state.config.max_conversations;
-    const window = ctx.state.config.window;
     const limited = conversations.slice(0, cap);
 
-    // Seed empty conversation shells first (so foldMessages can find them).
+    // Was this a TRUE RESTART? — a durable cursor was persisted for at least one of the convs
+    // the service still lists. This is the gate for the boot re-wake (RULING below): on a
+    // restart, the backfill pulls only `seq > cursor` = messages MISSED DURING DOWNTIME, which
+    // the agent must process. On a FRESH boot (no persisted cursor) the backfill pulls the
+    // conversation's PRE-EXISTING history — the agent is seeing it for the first time and must
+    // NOT auto-reply to that historical backlog, so a fresh boot never wakes. This is what
+    // keeps D1/D2a/D2b/D2c (fresh boot into an empty/new conv) from regressing.
+    const isRestart = limited.some((c) => this.restoredCursors.has(c.id));
+
+    // Seed conversation shells, each at its DURABLE restored cursor (D2d) — 0 on a fresh
+    // boot, the persisted max-consumed-seq on a restart. A persisted cursor for a conv the
+    // service no longer lists is simply never applied (RULING 5: cursor restore rides on
+    // conv discovery, it is not independent of it).
     ctx.set_state((s) => {
       const focus = s.focus ?? limited[0]?.id;
       return {
@@ -962,23 +1220,85 @@ export class ImProxyApp {
           })),
           recent: [],
           unread: 0,
-          consumed_seq: 0,
+          consumed_seq: this.restoredCursors.get(c.id) ?? 0,
         })),
         ...(focus !== undefined ? { focus } : {}),
       };
     });
 
-    // Per-conversation backfill (since each conv's consumed_seq, starting at 0).
+    // Per-conversation backfill: a BOUNDED CATCH-UP LOOP from each conv's restored cursor
+    // (RULING 2). The IM service caps a page at BACKFILL_PAGE and returns seq > since
+    // ascending; a FULL page implies more, so we re-pull from the advanced cursor. We stop
+    // on a short page, or — defensively — at MAX_BACKFILL_PER_CONV, logging LOUDLY (no
+    // silent truncation: the gap-free thesis is correct-or-loud). Accumulate how many
+    // messages were actually folded so we can decide whether to re-wake.
+    let folded = 0;
     for (const c of limited) {
-      const { messages } = await this.client.history(c.id, 0, window);
-      if (messages.length === 0) continue;
+      folded += await this.backfillConversation(ctx, c.id);
+    }
+
+    // Boot re-wake (the oa_proxy 7a9b611 pattern): wake ONCE iff this was a true RESTART AND
+    // the backfill actually folded missed messages. A fresh boot (no persisted cursor) NEVER
+    // wakes — it would otherwise reply to pre-existing history. An empty restart backfill
+    // (cursor restored but nothing arrived during downtime) also does NOT wake — there is
+    // nothing to process, so it settles back to idle (mirrors oa_proxy's "空折不 wake"). The
+    // single wake re-renders the recovered window so the runtime runs a turn over the missed
+    // messages, closing the boot-backfill-no-wake gap E2E's real-spawn restart vertical found.
+    if (isRestart && folded > 0) {
+      ctx.wake?.({ kind: 'app_event', source: APP_ID, reason: 'im_backfill_loaded' });
+    }
+  }
+
+  /**
+   * backfillConversation — drain a conversation's missed history from its current
+   * `consumed_seq` in bounded pages (D2d catch-up loop). Each page is folded via the shared
+   * pure foldMessages, the in-state consumed_seq advances, and the durable cursor is
+   * persisted right after each fold so a crash MID-backfill still resumes correctly. Stops
+   * on a short page; caps at MAX_BACKFILL_PER_CONV with a visible warning. Returns the count
+   * of messages actually folded (so bootstrap can gate the restart re-wake on a non-empty fold).
+   */
+  private async backfillConversation(ctx: AppContext<ImProxyState>, convId: string): Promise<number> {
+    // `folded` counts messages that ACTUALLY entered a window (a NEW seq), not merely pulled:
+    // a page may carry already-consumed dupes (seq <= consumed_seq) that foldIntoConv drops.
+    // Each fresh message bumps `recent`+`unread`, so a fold is detectable as an unread delta.
+    let folded = 0;
+    let pulled = 0;
+    for (;;) {
+      const since = ctx.state.conversations.find((c) => c.id === convId)?.consumed_seq ?? 0;
+      const { messages } = await this.client.history(convId, since, BACKFILL_PAGE);
+      if (messages.length === 0) break;
+      const before = ctx.state;
       ctx.set_state((s) =>
         this.foldMessages(
           s,
-          messages.map((msg) => ({ conv: c.id, msg })),
+          messages.map((msg) => ({ conv: convId, msg })),
         ),
       );
+      this.persistCursorDeltas(before, ctx.state);
+      // Count the messages that actually folded this page (unread delta for this conv).
+      const unreadBefore = before.conversations.find((c) => c.id === convId)?.unread ?? 0;
+      const unreadAfter = ctx.state.conversations.find((c) => c.id === convId)?.unread ?? 0;
+      folded += Math.max(0, unreadAfter - unreadBefore);
+      pulled += messages.length;
+      // A short page means we have caught up to the conv's latest_seq.
+      if (messages.length < BACKFILL_PAGE) break;
+      // Anti-wedge fence: if a full page did NOT advance the cursor (a misbehaving service
+      // returning seq <= since), stop rather than re-pull the same page forever. The
+      // gap-free thesis must never trade a missed message for a hung boot.
+      const after = ctx.state.conversations.find((c) => c.id === convId)?.consumed_seq ?? 0;
+      if (after <= since) break;
+      if (pulled >= MAX_BACKFILL_PER_CONV) {
+        // Loud, not silent: a downtime longer than the budget is an operational signal.
+        console.warn(
+          `[im_proxy] backfill for conv '${convId}' hit the ${MAX_BACKFILL_PER_CONV}-message ceiling; ` +
+            `older missed messages were NOT pulled (cursor at ${
+              ctx.state.conversations.find((c) => c.id === convId)?.consumed_seq ?? 0
+            }). Live pushes will resume from here.`,
+        );
+        break;
+      }
     }
+    return folded;
   }
 
   /**
@@ -1016,7 +1336,11 @@ export class ImProxyApp {
       seq: res.seq,
       ...(mentions ? { mentions } : {}),
     };
+    const before = ctx.state;
     ctx.set_state((s) => this.foldMessages(s, [{ conv, msg: sent }]));
+    // D2d: persist the cursor for this conv if the optimistic fold advanced consumed_seq, so
+    // the agent's OWN sent message is never re-surfaced as inbound after a restart.
+    this.persistCursorDeltas(before, ctx.state);
     return { ok: true, data: { id: res.id, seq: res.seq, client_msg_id: clientMsgId } };
   }
 

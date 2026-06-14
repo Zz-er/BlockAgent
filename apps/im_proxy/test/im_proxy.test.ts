@@ -11,7 +11,10 @@
  * No real network. No ws SDK loaded (dependency isolation — the client is faked).
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AppContext, AppManifest, BuilderManifest, CommandManifest, JsonSchema } from '@block-agent/core/app/types.js';
 import type { BlockSnapshot, BlockName, WakeEvent } from '@block-agent/core/core/types.js';
 // The REAL validator consume-refresh uses to check the folded value against the `as`
@@ -33,12 +36,34 @@ import {
   type ImProxyState,
   CHAT_BLOCK,
   CONVERSATIONS_BLOCK,
+  CursorStore,
   labelFor,
   sanitizeId,
 } from '../src/manifest.js';
 // The REAL ImClient (loads the `ws` SDK) — used ONLY by the WS-graceful-degrade regression at
 // the end, which needs a real socket to exercise the 'error' path the fake client can't reach.
 import { ImClient } from '../src/im_client.js';
+
+// D2d test isolation: an ImProxyApp built WITHOUT an explicit `dir` persists its backfill
+// cursor to the shared cwd-relative default `.block-agent/apps/im_proxy/cursors.jsonl`. In a
+// single test process those default-dir constructions would otherwise pollute each other (a
+// cursor persisted by one test seeds a non-zero consumed_seq in the next → a fresh seq:1 push
+// is `<= consumed_seq` → silently dropped → renders `(no messages)`). We give EACH test a
+// clean slate: before every test, wipe the shared default dir so every default-dir
+// construction starts from an empty cursor; after every test, remove the cwd-relative
+// `.block-agent` residue so nothing leaks into the repo. Tests that pass an explicit temp
+// `dir`/`cursors` (the D2d suite below) are already isolated and unaffected. Production never
+// uses the cwd-relative default — launch.ts wires `dir: join(base, 'im_proxy')` under
+// storage_dir (so two co-located fleet instances never share one cursor file).
+const DEFAULT_CURSOR_DIR = join('.block-agent', 'apps', 'im_proxy');
+beforeEach(() => {
+  rmSync(DEFAULT_CURSOR_DIR, { recursive: true, force: true });
+});
+afterEach(() => {
+  // Remove ONLY the im_proxy cursor subtree (NOT the whole `.block-agent` root — a real
+  // tree with other apps' data could co-locate there) so no cwd-relative residue leaks.
+  rmSync(DEFAULT_CURSOR_DIR, { recursive: true, force: true });
+});
 
 // ============================================================================
 // FakeImClient — in-memory, scriptable; records calls; no network
@@ -874,5 +899,334 @@ describe('ImClient — WS graceful degrade (no crash when the service is absent)
     await new Promise((r) => setTimeout(r, 250));
     expect(frames).toHaveLength(0); // no service → no frames, but no crash either
     close(); // idempotent teardown (closing a dead/null socket is harmless)
+  });
+});
+
+// ============================================================================
+// D2d restart-recovery — durable per-conversation cursor + backfill-from-cursor
+//
+// The keystone of the 7x24 always-on loop: after a crash/restart the proxy must
+// (1) NOT drop messages that arrived during downtime (catch-up loop), and
+// (2) NOT re-surface already-handled messages (no duplicate reply). Both hinge on
+// persisting `consumed_seq` per conv to cursors.jsonl and backfilling from it.
+// ============================================================================
+
+/**
+ * PagingFakeImClient — a backfill client that PAGINATES (the real service caps a page at
+ * 500). `history(conv, since, limit)` returns at most `limit` messages with seq > since,
+ * ascending — so a catch-up loop must re-pull from the advanced cursor to drain a backlog
+ * larger than one page. Records every history() call (conv/since/limit) for assertions.
+ */
+class PagingFakeImClient extends FakeImClient {
+  override async history(conv: string, since: number, limit?: number): Promise<ImHistoryResponse> {
+    this.historyCalls.push({ conv, since, ...(limit !== undefined ? { limit } : {}) });
+    const all = (this.historyByConv.get(conv) ?? []).filter((m) => m.seq > since).sort((a, b) => a.seq - b.seq);
+    const page = limit !== undefined ? all.slice(0, limit) : all;
+    const latest_seq = (this.historyByConv.get(conv) ?? []).reduce((mx, m) => Math.max(mx, m.seq), since);
+    return { messages: page, latest_seq };
+  }
+}
+
+describe('D2d: durable CursorStore (jsonl, last-wins, torn-tolerant)', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useRealTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_cursor_'));
+  });
+
+  it('persists on append and restores last-wins per conv', () => {
+    const store = new CursorStore(dir);
+    store.append({ conv_id: 'cA', consumed_seq: 5 });
+    store.append({ conv_id: 'cB', consumed_seq: 2 });
+    store.append({ conv_id: 'cA', consumed_seq: 9 }); // later wins for cA
+    const restored = new CursorStore(dir).readCursors();
+    expect(restored.get('cA')).toBe(9);
+    expect(restored.get('cB')).toBe(2);
+  });
+
+  it('missing file → empty map, never throws', () => {
+    const store = new CursorStore(join(dir, 'does-not-exist-yet'));
+    expect(store.readCursors().size).toBe(0);
+  });
+
+  it('a torn trailing line is tolerated (truncated at next open, no throw)', () => {
+    const store = new CursorStore(dir);
+    store.append({ conv_id: 'cA', consumed_seq: 5 });
+    // Simulate a crash-torn append: a partial last line with no trailing newline.
+    const path = join(dir, 'cursors.jsonl');
+    writeFileSync(path, readFileSync(path, 'utf8') + '{"conv_id":"cB","consumed_se', 'utf8');
+    // Re-open: the constructor tail-truncates the torn line; the good record survives.
+    const restored = new CursorStore(dir).readCursors();
+    expect(restored.get('cA')).toBe(5);
+    expect(restored.has('cB')).toBe(false);
+  });
+});
+
+describe('D2d: cursor persists on every consumed_seq advance', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_persist_'));
+  });
+
+  it('im.ingest advancing consumed_seq writes the cursor to disk', async () => {
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: [] }];
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    const ingest = getCommand(app.manifest(), 'ingest');
+    await ingest.invoke({ messages: [{ conv: 'c1', msg: wireMsg({ conv: 'c1', seq: 7, body: 'hi' }) }] }, ctx, { invoker: 'app' });
+
+    // A fresh store reading the SAME dir sees the persisted cursor.
+    const restored = new CursorStore(dir).readCursors();
+    expect(restored.get('c1')).toBe(7);
+  });
+
+  it('im.send (optimistic) persists the cursor for the agent\'s own message', async () => {
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: [] }];
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState({ focus: 'c1' }));
+    await app.manifest().on_install!(ctx);
+
+    const send = getCommand(app.manifest(), 'send');
+    const res = await send.invoke({ conv: 'c1', body: 'from-agent' }, ctx, { invoker: 'app' });
+    expect(res.ok).toBe(true);
+
+    const seq = ctx.state.conversations.find((c) => c.id === 'c1')!.consumed_seq;
+    expect(new CursorStore(dir).readCursors().get('c1')).toBe(seq);
+  });
+});
+
+describe('D2d: bootstrap backfills FROM the persisted cursor (not since=0)', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useRealTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_restart_'));
+  });
+
+  it('a restart resumes backfill from the persisted cursor; pre-crash messages are NOT re-folded', async () => {
+    // --- Pre-crash: seed a durable cursor on disk (the agent already handled up to seq 50). ---
+    new CursorStore(dir).append({ conv_id: 'c1', consumed_seq: 50 });
+
+    // --- Restart: the service holds the full history, incl. pre-crash (<=50) AND missed (51,52). ---
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    client.historyByConv.set('c1', [
+      wireMsg({ id: 'old', conv: 'c1', seq: 50, body: 'pre-crash-handled' }),
+      wireMsg({ id: 'miss1', conv: 'c1', seq: 51, body: 'missed-during-downtime-1' }),
+      wireMsg({ id: 'miss2', conv: 'c1', seq: 52, body: 'missed-during-downtime-2' }),
+    ]);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx); // bootstrap restores cursor + backfills
+
+    // The conv shell was seeded AT the restored cursor (50), not 0.
+    const c1 = ctx.state.conversations.find((c) => c.id === 'c1')!;
+    // The pre-crash message (seq 50) is NOT re-surfaced; only the missed ones appear.
+    expect(c1.recent.map((m) => m.body)).toEqual([
+      'missed-during-downtime-1',
+      'missed-during-downtime-2',
+    ]);
+    expect(c1.consumed_seq).toBe(52);
+    // history() was called with since=50 (the restored cursor), NEVER since=0.
+    const c1Calls = client.historyCalls.filter((h) => h.conv === 'c1');
+    expect(c1Calls.length).toBeGreaterThan(0);
+    expect(c1Calls.every((h) => h.since >= 50)).toBe(true);
+    expect(c1Calls.some((h) => h.since === 0)).toBe(false);
+  });
+
+  it('a fresh boot (no cursor file) backfills from since=0', async () => {
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: [] }];
+    client.historyByConv.set('c1', [wireMsg({ id: 'm1', conv: 'c1', seq: 1, body: 'first' })]);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    expect(ctx.state.conversations.find((c) => c.id === 'c1')!.consumed_seq).toBe(1);
+    expect(client.historyCalls.filter((h) => h.conv === 'c1')[0]!.since).toBe(0);
+  });
+});
+
+// ============================================================================
+// D2d: boot re-wake — the oa_proxy 7a9b611 pattern. on_install is fire-and-forget, so the
+// backfill folds missed messages AFTER the agent first reports idle; the fold alone does not
+// run a turn. A TRUE RESTART that folds missed messages must wake ONCE so the agent processes
+// them. A fresh boot (no persisted cursor) must NOT wake (it would reply to pre-existing
+// history). An empty restart backfill must NOT wake (nothing to process). This is the defect
+// E2E's real-spawn restart vertical caught — the fold-state unit tests above can't see it.
+// ============================================================================
+describe('D2d: restart re-wake (boot-backfill processes missed messages)', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useRealTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_rewake_'));
+  });
+
+  it('a NON-EMPTY restart backfill emits exactly ONE app_event wake (im_backfill_loaded)', async () => {
+    // Pre-crash cursor at 50; the service holds 2 messages missed during downtime (51, 52).
+    new CursorStore(dir).append({ conv_id: 'c1', consumed_seq: 50 });
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    client.historyByConv.set('c1', [
+      wireMsg({ id: 'm51', conv: 'c1', seq: 51, body: 'missed-1' }),
+      wireMsg({ id: 'm52', conv: 'c1', seq: 52, body: 'missed-2' }),
+    ]);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    // Exactly ONE wake, an app_event from im_proxy with the backfill reason.
+    expect(ctx.wakes).toHaveLength(1);
+    const woke = ctx.wakes[0]!;
+    expect(woke.kind).toBe('app_event');
+    if (woke.kind === 'app_event') {
+      expect(woke.source).toBe('im_proxy');
+      expect(woke.reason).toBe('im_backfill_loaded');
+    }
+  });
+
+  it('a fresh boot (no persisted cursor) folds pre-existing history but does NOT wake', async () => {
+    // No cursor on disk → fresh boot. The conv already has history (the agent is seeing it for
+    // the first time) — it must NOT auto-reply, so no wake. This is the D1/D2a/D2b/D2c shape.
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    client.historyByConv.set('c1', [
+      wireMsg({ id: 'h1', conv: 'c1', seq: 1, body: 'pre-existing-1' }),
+      wireMsg({ id: 'h2', conv: 'c1', seq: 2, body: 'pre-existing-2' }),
+    ]);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    // History WAS folded (consumed_seq advanced) but NO wake fired (fresh boot is not a restart).
+    expect(ctx.state.conversations.find((c) => c.id === 'c1')!.consumed_seq).toBe(2);
+    expect(ctx.wakes).toHaveLength(0);
+  });
+
+  it('an EMPTY restart backfill (cursor restored, nothing missed) does NOT wake', async () => {
+    // Cursor at 52; the service has nothing newer → the restart backfill folds nothing → no
+    // wake (mirrors oa_proxy "空折不 wake"; the agent settles back to idle, harmless).
+    new CursorStore(dir).append({ conv_id: 'c1', consumed_seq: 52 });
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    client.historyByConv.set('c1', [
+      wireMsg({ id: 'm52', conv: 'c1', seq: 52, body: 'already-handled' }),
+    ]);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    expect(ctx.state.conversations.find((c) => c.id === 'c1')!.consumed_seq).toBe(52);
+    expect(ctx.wakes).toHaveLength(0);
+  });
+});
+
+describe('D2d: bounded catch-up loop drains a backlog larger than one page', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useRealTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_catchup_'));
+  });
+
+  it('pages through >500 missed messages, advancing the cursor across batches', async () => {
+    const client = new PagingFakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: [] }];
+    // 1200 missed messages (seq 1..1200) — 3 pages of 500/500/200.
+    const msgs: WireMessage[] = [];
+    for (let seq = 1; seq <= 1200; seq++) msgs.push(wireMsg({ id: `m${seq}`, conv: 'c1', seq, body: `b${seq}` }));
+    client.historyByConv.set('c1', msgs);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState({ config: { window: 20, max_conversations: 50, coalesce_ms: 200 } }));
+    await app.manifest().on_install!(ctx);
+
+    const c1 = ctx.state.conversations.find((c) => c.id === 'c1')!;
+    // The cursor advanced past the WHOLE backlog (no message dropped) even though the
+    // render window only keeps the last 20 (window cap).
+    expect(c1.consumed_seq).toBe(1200);
+    expect(c1.recent).toHaveLength(20);
+    expect(c1.recent[c1.recent.length - 1]!.body).toBe('b1200');
+    // The loop re-pulled from the advanced cursor: 3 pages (since 0, 500, 1000).
+    const sinces = client.historyCalls.filter((h) => h.conv === 'c1').map((h) => h.since);
+    expect(sinces).toContain(0);
+    expect(sinces).toContain(500);
+    expect(sinces).toContain(1000);
+    // The final persisted cursor reflects the full drain.
+    expect(new CursorStore(dir).readCursors().get('c1')).toBe(1200);
+  });
+});
+
+// ============================================================================
+// D2d CONTRACT LOCK (team-lead ruling: gap-free RECOVERY, not gap-free REPLY). A restart
+// backfill of N > window missed messages must: (a) advance consumed_seq past ALL N (no loss,
+// and — critically — NEVER hold the cursor behind a beyond-window message, which would
+// infinite-loop the backfill re-fetch), (b) render only the last `window` (the recovery
+// surfaces the recent window, not the whole backlog — a reboot must not flood replies), and
+// (c) emit exactly ONE im_backfill_loaded wake. This pins the recovery contract in code so a
+// future change can't silently regress the cursor-past-all-vs-window invariant.
+// ============================================================================
+describe('D2d: restart recovery advances cursor past ALL missed (window-capped render, one wake)', () => {
+  let dir: string;
+  beforeEach(() => {
+    vi.useRealTimers();
+    dir = mkdtempSync(join(tmpdir(), 'im_proxy_recovery_'));
+  });
+
+  it('N > window missed on restart: cursor past all N, recent capped at window, ONE wake', async () => {
+    const WINDOW = 20;
+    const N = 50; // a deep backlog: 50 missed messages, far past the 20-slot render window.
+    // True RESTART: a durable cursor existed pre-crash (consumed_seq=0 here; the point is a
+    // cursor FILE exists → isRestart=true → the recovered backlog is processed, not ignored).
+    new CursorStore(dir).append({ conv_id: 'c1', consumed_seq: 0 });
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    const msgs: WireMessage[] = [];
+    for (let seq = 1; seq <= N; seq++) msgs.push(wireMsg({ id: `m${seq}`, conv: 'c1', seq, body: `b${seq}` }));
+    client.historyByConv.set('c1', msgs);
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState({ config: { window: WINDOW, max_conversations: 50, coalesce_ms: 200 } }));
+    await app.manifest().on_install!(ctx);
+
+    const c1 = ctx.state.conversations.find((c) => c.id === 'c1')!;
+    // (a) consumed_seq advanced past ALL N — the cursor never lags the window (no re-fetch loop).
+    expect(c1.consumed_seq).toBe(N);
+    expect(new CursorStore(dir).readCursors().get('c1')).toBe(N);
+    // (b) recent[] is capped at window and holds the NEWEST window-worth (recovery surfaces the
+    //     recent window, not the entire backlog — no reboot-flood).
+    expect(c1.recent).toHaveLength(WINDOW);
+    expect(c1.recent[0]!.body).toBe(`b${N - WINDOW + 1}`); // oldest kept = seq 31
+    expect(c1.recent[c1.recent.length - 1]!.body).toBe(`b${N}`); // newest = seq 50
+    // (c) exactly ONE im_backfill_loaded wake (one turn over the recovered window).
+    expect(ctx.wakes).toHaveLength(1);
+    const woke = ctx.wakes[0]!;
+    expect(woke.kind).toBe('app_event');
+    if (woke.kind === 'app_event') expect(woke.reason).toBe('im_backfill_loaded');
+  });
+});
+
+// on_uninstall must NEVER delete the durable cursor file (INV #5: graceful teardown only).
+describe('D2d: on_uninstall preserves cursors.jsonl (INV #5)', () => {
+  it('uninstall closes the WS/timer but leaves the durable cursor file intact', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'im_proxy_uninstall_'));
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: [] }];
+    const app = new ImProxyApp({ client, dir });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx);
+
+    const ingest = getCommand(app.manifest(), 'ingest');
+    await ingest.invoke({ messages: [{ conv: 'c1', msg: wireMsg({ conv: 'c1', seq: 4, body: 'x' }) }] }, ctx, { invoker: 'app' });
+    const path = join(dir, 'cursors.jsonl');
+    expect(existsSync(path)).toBe(true);
+
+    await app.manifest().on_uninstall!(ctx);
+    // The durable file is untouched — a later restart still restores the cursor.
+    expect(existsSync(path)).toBe(true);
+    expect(new CursorStore(dir).readCursors().get('c1')).toBe(4);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

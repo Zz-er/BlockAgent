@@ -501,7 +501,16 @@ function installEnabledApps(
   // (registered above); im_proxy + task_proxy CONSUME it (assignee/from → name) — install order is
   // irrelevant (the registry derives the provider table over all installed manifests).
   if (config.apps.im_proxy.enabled) {
-    registry.install(new ImProxyApp().manifest() as Parameters<typeof registry.install>[0]);
+    // `dir` under storage_dir (D2d) — the durable per-conv backfill cursor (cursors.jsonl)
+    // lives at `<base>/im_proxy/`, like every sibling durable app (messages/memory/task).
+    // Without it the cursor would land at cwd-relative `.block-agent/...` (leaking into the
+    // repo) AND two co-located fleet instances would share ONE cursor file → cross-instance
+    // cursor bleed. The endpoint/token still come from ENV inside the app's client.
+    registry.install(
+      new ImProxyApp({ dir: join(base, 'im_proxy') }).manifest() as Parameters<
+        typeof registry.install
+      >[0],
+    );
   }
   if (config.apps.oa_proxy.enabled) {
     registry.install(new OaProxyApp({ configBase: base }).manifest() as Parameters<typeof registry.install>[0]);
