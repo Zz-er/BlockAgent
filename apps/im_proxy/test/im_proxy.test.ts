@@ -36,6 +36,9 @@ import {
   labelFor,
   sanitizeId,
 } from '../src/manifest.js';
+// The REAL ImClient (loads the `ws` SDK) — used ONLY by the WS-graceful-degrade regression at
+// the end, which needs a real socket to exercise the 'error' path the fake client can't reach.
+import { ImClient } from '../src/im_client.js';
 
 // ============================================================================
 // FakeImClient — in-memory, scriptable; records calls; no network
@@ -700,5 +703,35 @@ describe('AppManifest invariants', () => {
     expect(res.data).toBe(5);
     expect(cmd.readonly).toBe(true);
     expect(cmd.allowed_invokers).toEqual(['app', 'user']);
+  });
+});
+
+// ============================================================================
+// REGRESSION: WS graceful degrade when the IM service is ABSENT.
+//
+// The `ws` WebSocket is an EventEmitter — an unhandled 'error' event is RE-THROWN by Node as
+// an uncaughtException and crashes the whole agent process. im_proxy is DEFAULT-OFF but, once
+// enabled, on_install opens a subscribe socket immediately; if the IM service isn't up yet
+// (a normal startup race / a misconfig), that connect fails and MUST degrade silently, never
+// crash. This bug was invisible to the fake-client unit tests above (no real socket) and was
+// caught only by a headless boot smoke; this test is its automated guard. Without the
+// `socket.on('error', …)` handler in im_client.openSocket, this test fails (uncaughtException).
+// ============================================================================
+describe('ImClient — WS graceful degrade (no crash when the service is absent)', () => {
+  it('subscribe() to an unreachable service swallows the ws error and does not crash', async () => {
+    // REAL timers: a sibling test uses vi.useFakeTimers() (the coalesce window), and a leaked
+    // fake clock would freeze the real-async wait below forever (a 5s timeout). The ws connect +
+    // its 'error' event are real async, so we must run them under the real clock.
+    vi.useRealTimers();
+    // 127.0.0.1:9 (discard) is effectively unbound here → the WS connect fails fast. A real
+    // ImClient (real `ws`) is required: the fake client never opens a socket.
+    const client = new ImClient({ baseUrl: 'http://127.0.0.1:9', token: '' });
+    const frames: ImPushFrame[] = [];
+    const close = client.subscribe((f) => frames.push(f));
+    // Let the async connect + 'error' event fire. If the error were unhandled, vitest's
+    // uncaughtException hook would fail this test (the regression). Reaching the assertion = handled.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(frames).toHaveLength(0); // no service → no frames, but no crash either
+    close(); // idempotent teardown (closing a dead/null socket is harmless)
   });
 });
