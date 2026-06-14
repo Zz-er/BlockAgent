@@ -447,6 +447,48 @@ describe('push → coalesce → ingest → wake', () => {
 });
 
 // ============================================================================
+// inbound → RENDERED chat block (the "agent really sees the message in context"
+// assertion, Architect §4): an ingested peer message must appear VERBATIM in the
+// rendered `im_proxy:chat` prompt block — this is what makes the agent able to act
+// on it. Separating "rendered into context" from "command produced" guards the
+// E2E vertical against a false-green where a reply lands without the agent having
+// actually seen the message. The cross-process harness proves the same property
+// transitively (the reply echoes the human's exact text); this pins it directly.
+// ============================================================================
+
+describe('inbound message renders verbatim into im_proxy:chat (agent sees it in context)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  it('a pushed peer message appears verbatim in the rendered chat block', async () => {
+    const client = new FakeImClient();
+    client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
+    const app = new ImProxyApp({ client });
+    const ctx = makeCtx(app, makeState());
+    await app.manifest().on_install!(ctx); // bootstrap seeds the conv shell + focus
+
+    // A human pushes a message; the proxy coalesces → ingests → wakes.
+    client.pushFrame({
+      type: 'message',
+      conv: 'c1',
+      msg: wireMsg({ conv: 'c1', seq: 1, from: 'alice', body: 'please ack this' }),
+    });
+    await vi.advanceTimersByTimeAsync(250);
+
+    // Render the chat block from post-ingest state — the body MUST be present verbatim, so a
+    // real/mocked agent reading this block can act on it. (This is the in-proc equivalent of
+    // asserting the message reached the agent's RenderedPrompt.)
+    const builder = getBuilder(app.manifest(), CHAT_BLOCK);
+    const block = await builder.build(FAKE_BUILD_CTX, ctx);
+    expect(block).not.toBeNull();
+    expect(block!.content_text).toContain('please ack this');
+    // And it renders as an inbound line (sanitized peer label), not the agent's own `[me]`.
+    expect(block!.content_text).toContain(`[${labelFor('alice')}] please ack this`);
+  });
+});
+
+// ============================================================================
 // send command — forwarding + optimistic append
 // ============================================================================
 
@@ -486,6 +528,60 @@ describe('im.send', () => {
     expect(conv.recent).toHaveLength(1);
     expect(conv.recent[0]!.body).toBe('my message');
     expect(conv.recent[0]!.from_label).toBe(labelFor('agent_me'));
+  });
+});
+
+// ============================================================================
+// reply command — send to the FOCUSED conversation (no conv arg). The agent's
+// natural "answer the chat I'm reading" door (mirrors messages.reply); the proof
+// the agent can reply WITHOUT knowing a raw conv id (no block exposes one).
+// ============================================================================
+
+describe('im.reply (send to the focused conversation)', () => {
+  it('forwards to the focused conv with no `conv` arg, optimistically appending the reply', async () => {
+    const client = new FakeImClient();
+    const app = new ImProxyApp({ client });
+    const cmd = getCommand(app.manifest(), 'reply');
+    const ctx = makeCtx(
+      app,
+      makeState({
+        focus: 'c1',
+        conversations: [{ id: 'c1', kind: 'dm', members: [], recent: [], unread: 0, consumed_seq: 0 }],
+      }),
+    );
+    const res = await cmd.invoke({ body: 'an answer' }, ctx, { invoker: 'agent' });
+    expect(res.ok).toBe(true);
+    // It went to the focused conversation (the one the agent is reading), no conv arg needed.
+    expect(client.sendCalls).toHaveLength(1);
+    expect(client.sendCalls[0]!.conv).toBe('c1');
+    expect(client.sendCalls[0]!.body).toBe('an answer');
+    expect(client.sendCalls[0]).not.toHaveProperty('from'); // server derives `from` (§7)
+    // And the reply is optimistically appended to the window.
+    expect(ctx.state.conversations[0]!.recent.map((m) => m.body)).toEqual(['an answer']);
+  });
+
+  it('errors when no conversation is focused (nothing to reply to)', async () => {
+    const client = new FakeImClient();
+    const app = new ImProxyApp({ client });
+    const cmd = getCommand(app.manifest(), 'reply');
+    const ctx = makeCtx(app, makeState({ conversations: [{ id: 'c1', kind: 'dm', members: [], recent: [], unread: 0, consumed_seq: 0 }] }));
+    const res = await cmd.invoke({ body: 'hi' }, ctx, { invoker: 'agent' });
+    expect(res.ok).toBe(false);
+    expect(client.sendCalls).toHaveLength(0);
+  });
+
+  it('rejects an empty/missing body', async () => {
+    const app = new ImProxyApp({ client: new FakeImClient() });
+    const cmd = getCommand(app.manifest(), 'reply');
+    const ctx = makeCtx(app, makeState({ focus: 'c1', conversations: [{ id: 'c1', kind: 'dm', members: [], recent: [], unread: 0, consumed_seq: 0 }] }));
+    expect((await cmd.invoke({}, ctx, { invoker: 'agent' })).ok).toBe(false);
+  });
+
+  it('is available to the agent (no user-only gate — the agent must be able to reply)', () => {
+    const app = new ImProxyApp({ client: new FakeImClient() });
+    const cmd = getCommand(app.manifest(), 'reply');
+    // allowed_invokers undefined → all invokers (incl. agent), like im.send.
+    expect(cmd.allowed_invokers).toBeUndefined();
   });
 });
 
@@ -703,6 +799,51 @@ describe('AppManifest invariants', () => {
     expect(res.data).toBe(5);
     expect(cmd.readonly).toBe(true);
     expect(cmd.allowed_invokers).toEqual(['app', 'user']);
+  });
+});
+
+// ============================================================================
+// IM_SERVICE_SELF — the agent's own principal_id seeds `account` (self-label).
+// Symmetric with IM_SERVICE_URL/TOKEN; mirrors task_proxy's TASK_SERVICE_SELF.
+// It is a LABEL (renders `[me]`/`@me`), NOT identity-authority (the §7 fence holds).
+// ============================================================================
+
+describe('IM_SERVICE_SELF seeds the self account', () => {
+  it('seeds initial_state.account.principal_id from the env var', () => {
+    const prev = process.env['IM_SERVICE_SELF'];
+    process.env['IM_SERVICE_SELF'] = 'agent_a1';
+    try {
+      // No explicit `account` opt → the constructor reads the env (real-client path is fine; we
+      // inject a fake client so no network, but the env read is independent of the client).
+      const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+      expect(m.initial_state).toMatchObject({ account: { principal_id: 'agent_a1', display: 'agent_a1' } });
+    } finally {
+      if (prev === undefined) delete process.env['IM_SERVICE_SELF'];
+      else process.env['IM_SERVICE_SELF'] = prev;
+    }
+  });
+
+  it('an explicit account opt overrides the env', () => {
+    const prev = process.env['IM_SERVICE_SELF'];
+    process.env['IM_SERVICE_SELF'] = 'from_env';
+    try {
+      const m = new ImProxyApp({ client: new FakeImClient(), account: { principal_id: 'explicit', display: 'X' } }).manifest();
+      expect(m.initial_state).toMatchObject({ account: { principal_id: 'explicit', display: 'X' } });
+    } finally {
+      if (prev === undefined) delete process.env['IM_SERVICE_SELF'];
+      else process.env['IM_SERVICE_SELF'] = prev;
+    }
+  });
+
+  it('no env + no opt → no account (graceful: `[me]` simply does not render)', () => {
+    const prev = process.env['IM_SERVICE_SELF'];
+    delete process.env['IM_SERVICE_SELF'];
+    try {
+      const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+      expect((m.initial_state as ImProxyState).account).toBeUndefined();
+    } finally {
+      if (prev !== undefined) process.env['IM_SERVICE_SELF'] = prev;
+    }
   });
 });
 

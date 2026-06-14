@@ -33,6 +33,7 @@ import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
 import { MockProvider } from '@block-agent/core/provider/mock.js';
+import { ImEchoMockProvider } from '@block-agent/core/provider/im_echo_mock.js';
 import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
 import { MessagesApp } from '@block-agent/app-messages/manifest.js';
 import { ToolsApp } from '@block-agent/app-tools/manifest.js';
@@ -712,8 +713,15 @@ function buildProviderOrThrow(config: LauncherConfig): ModelProvider {
       });
     }
     case 'mock': {
-      // Offline / --dry-run: a scripted provider that replies once then ends the loop,
-      // so a no-key, no-network smoke run still exercises the full turn loop.
+      // Offline / --dry-run. With im_proxy enabled, use the CONTEXT-REACTIVE im-echo mock: it
+      // reads the rendered prompt each turn and replies (`im_proxy.reply`) to any inbound IM
+      // message it sees, so the no-key dry-run exercises the full human→IM→im_proxy→agent→
+      // reply→IM vertical (it must react to context, not a fixed script — the agent burns turns
+      // before the message arrives, which would exhaust a canned queue). Otherwise the plain
+      // scripted mock that replies once then ends the loop (a generic dry-run smoke).
+      if (config.apps.im_proxy.enabled) {
+        return new ImEchoMockProvider();
+      }
       return new MockProvider([
         {
           thinking: ['(mock provider) acknowledging the message'],

@@ -490,40 +490,52 @@ function sendCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
       const body = readString(a?.body);
       if (conv === null || body === null)
         return { ok: false, error: 'send requires string `conv` and `body`' };
-      const mentions = Array.isArray(a?.mentions)
-        ? (a!.mentions as unknown[]).filter((m): m is string => typeof m === 'string')
-        : undefined;
-
-      const clientMsgId = app.nextClientMsgId();
-      let res: { id: string; seq: number; ts: number };
-      try {
-        res = await app.client.send({
-          conv,
-          body,
-          client_msg_id: clientMsgId,
-          ...(mentions ? { mentions } : {}),
-        });
-      } catch (err) {
-        return { ok: false, error: `im.send failed: ${(err as Error).message}` };
-      }
-
-      // Optimistic append: fold the just-sent message into the conv window using the
-      // service-assigned id/seq (advances this conv's consumed_seq — REST sync return is
-      // the primary delivery path; a later WS `ack` with the same id is a no-op dedupe).
-      const selfId = ctx.state.account?.principal_id;
-      const sent: WireMessage = {
-        id: res.id,
-        conv,
-        from: selfId ?? '',
-        body,
-        ts: res.ts,
-        seq: res.seq,
-        ...(mentions ? { mentions } : {}),
-      };
-      ctx.set_state((s) => app.foldMessages(s, [{ conv, msg: sent }]));
-      return { ok: true, data: { id: res.id, seq: res.seq, client_msg_id: clientMsgId } };
+      return app.forwardSend(ctx, conv, body, readMentions(a?.mentions));
     },
   };
+}
+
+/**
+ * im.reply({ body, mentions? }) — send to the FOCUSED conversation (`state.focus`), no
+ * `conv` arg. This is the agent's natural "reply to the current chat" door, mirroring
+ * `messages.reply`: the conversation the agent is reading (`im_proxy:chat`) is the one it
+ * answers, so it never needs a raw conversation id — which is GOOD, since no projection
+ * block exposes a conv id and an id in context would be both ugly and an injection surface.
+ * All invokers (the agent replies). Caps [block:write, net:http]. Errors if nothing is
+ * focused (the agent has no conversation open to reply to).
+ */
+function replyCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
+  return {
+    name: 'reply',
+    description: 'Reply to the currently focused conversation (the one shown in im_proxy:chat). Put the text in `body`.',
+    args_schema: {
+      type: 'object',
+      required: ['body'],
+      properties: {
+        body: { type: 'string', description: 'The message text.' },
+        mentions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional principal_ids to @-mention (must be conv members).',
+        },
+      },
+    },
+    capabilities: [CAP_BLOCK_WRITE, CAP_NET_HTTP],
+    invoke: async (args, ctx): Promise<CommandResult> => {
+      const a = args as { body?: unknown; mentions?: unknown } | undefined;
+      const body = readString(a?.body);
+      if (body === null) return { ok: false, error: 'reply requires a string `body`' };
+      const conv = ctx.state.focus;
+      if (conv === undefined || conv.length === 0)
+        return { ok: false, error: 'reply: no conversation is focused (open one first)' };
+      return app.forwardSend(ctx, conv, body, readMentions(a?.mentions));
+    },
+  };
+}
+
+/** Pull a `string[]` mentions arg, dropping non-strings; undefined when absent. */
+function readMentions(v: unknown): string[] | undefined {
+  return Array.isArray(v) ? (v as unknown[]).filter((m): m is string => typeof m === 'string') : undefined;
 }
 
 /**
@@ -793,6 +805,18 @@ function setOwnerCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
 // ImProxyApp — the BlockApp (manifest + push→wake→ingest seam)
 // ============================================================================
 
+/**
+ * readSelfAccountFromEnv — derive the agent's own `account` from `IM_SERVICE_SELF` (the agent's
+ * principal_id, injected by the platform Console alongside IM_SERVICE_URL/TOKEN). Returns
+ * undefined when unset (the proxy then has no self-label and degrades gracefully — `[me]`/`@me`
+ * simply don't render). `display` falls back to the principal_id. This is a LABEL, not authority.
+ */
+function readSelfAccountFromEnv(): { principal_id: string; display: string } | undefined {
+  const self = process.env['IM_SERVICE_SELF'];
+  if (self === undefined || self.length === 0) return undefined;
+  return { principal_id: self, display: self };
+}
+
 /** Options for constructing an ImProxyApp. */
 export interface ImProxyAppOptions {
   /** IM service base URL (real client). Ignored if `client` is injected. */
@@ -840,7 +864,16 @@ export class ImProxyApp {
         baseUrl: opts.baseUrl ?? process.env['IM_SERVICE_URL'] ?? 'http://localhost:8083',
         token: opts.token ?? process.env['IM_SERVICE_TOKEN'] ?? '',
       });
-    if (opts.account) this.seedAccount = opts.account;
+    // Self principal_id from ENV (symmetric with IM_SERVICE_URL/TOKEN above; mirrors
+    // task_proxy's TASK_SERVICE_SELF). This is the agent's OWN principal_id — it seeds
+    // `account` so the pure builder can render the agent's own messages as `[me]` and judge
+    // `@me` self-mentions. It is NOT a credential and NOT identity-authority (the §7 fence is
+    // unchanged: inbound `from` is still sanitized content, never `ctx.identity`); it is the
+    // agent's self-LABEL. The token stays the sole authority server-side. An explicit
+    // `opts.account` (tests) overrides; unset → no self-label (graceful, vertical still works).
+    // display falls back to the principal_id (the directory may later resolve a nicer name).
+    const self = opts.account ?? readSelfAccountFromEnv();
+    if (self) this.seedAccount = self;
   }
 
   /** The AppManifest to hand to AppRegistry.install. */
@@ -869,6 +902,7 @@ export class ImProxyApp {
       builders: [() => ConversationsBlockBuilder, () => ChatBlockBuilder],
       commands: [
         () => sendCommand(app),
+        () => replyCommand(app),
         () => ingestCommand(app),
         () => openCommand(),
         () => listCommand(),
@@ -945,6 +979,45 @@ export class ImProxyApp {
         ),
       );
     }
+  }
+
+  /**
+   * forwardSend — the shared outbound path behind `im.send` (explicit conv) and `im.reply`
+   * (focused conv): generate the idempotency key, POST to the service (`from` is
+   * token-derived server-side, §7), then optimistically fold the just-sent message into the
+   * conv window so the agent sees its own turn immediately (a later WS `ack` with the same id
+   * is a no-op dedupe). On a transport failure it reports `ok:false` and leaves state intact.
+   */
+  async forwardSend(
+    ctx: AppContext<ImProxyState>,
+    conv: string,
+    body: string,
+    mentions: string[] | undefined,
+  ): Promise<CommandResult> {
+    const clientMsgId = this.nextClientMsgId();
+    let res: { id: string; seq: number; ts: number };
+    try {
+      res = await this.client.send({
+        conv,
+        body,
+        client_msg_id: clientMsgId,
+        ...(mentions ? { mentions } : {}),
+      });
+    } catch (err) {
+      return { ok: false, error: `im.send failed: ${(err as Error).message}` };
+    }
+    const selfId = ctx.state.account?.principal_id;
+    const sent: WireMessage = {
+      id: res.id,
+      conv,
+      from: selfId ?? '',
+      body,
+      ts: res.ts,
+      seq: res.seq,
+      ...(mentions ? { mentions } : {}),
+    };
+    ctx.set_state((s) => this.foldMessages(s, [{ conv, msg: sent }]));
+    return { ok: true, data: { id: res.id, seq: res.seq, client_msg_id: clientMsgId } };
   }
 
   /** A deterministic, per-instance client_msg_id (idempotency key for im.send). */
