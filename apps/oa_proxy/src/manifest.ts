@@ -404,6 +404,16 @@ export class OaProxyApp {
        * on_install: warm the directory projection by pulling GET /oa/directory once. OA
        * unreachable → silent degrade (leave directory empty; oa.refresh_directory retries
        * later). Never throws at boot. INV #5: reads only — deletes nothing.
+       *
+       * The registry runs on_install FIRE-AND-FORGET (registry.ts `void on_install`), so the
+       * GET completes asynchronously AFTER the agent reports idle. A consumer that woke before
+       * the directory landed (e.g. an inbound message arrives, the agent renders an EMPTY
+       * `# Organization` block, and an OA-resolving reader finds nothing) would otherwise be
+       * stuck — the late directory fold does not by itself re-run a turn. So after a non-empty
+       * fold we `ctx.wake` once: it re-renders with the directory present, letting that reader
+       * resolve on the next turn. This closes the boot directory-load RACE deterministically
+       * (health-idle no longer has to imply the fetch finished). A redundant wake when nothing
+       * is pending simply settles back to idle (harmless).
        */
       async on_install(ctx: AppContext<OaProxyState>): Promise<void> {
         try {
@@ -412,6 +422,9 @@ export class OaProxyApp {
           if (dir !== null) {
             const members = capDirectory(dir.members, ctx.state.config.dir_limit);
             ctx.set_state((s) => ({ ...s, org_id: dir.org_id, directory: members }));
+            // Re-wake so a reader that rendered before the directory landed gets another turn
+            // with `# Organization` populated (closes the boot directory-load race).
+            ctx.wake?.({ kind: 'app_event', source: APP_ID, reason: 'oa_directory_loaded' });
           }
         } catch {
           // Graceful degrade — leave directory empty.

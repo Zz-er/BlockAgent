@@ -97,7 +97,11 @@ const SAMPLE_DIR: OrgDirectory = { org_id: 'org_1', members: MEMBERS };
 // AppContext / BuildContext stubs
 // ============================================================================
 
-function makeCtx(initialState: OaProxyState): AppContext<OaProxyState> {
+/** Captures `ctx.wake` calls so a test can assert the on_install re-wake (race fix). */
+function makeCtx(
+  initialState: OaProxyState,
+  wakes?: Array<{ kind: string; source?: string; reason?: string }>,
+): AppContext<OaProxyState> {
   let state = initialState;
   return {
     app_id: 'oa_proxy',
@@ -110,6 +114,7 @@ function makeCtx(initialState: OaProxyState): AppContext<OaProxyState> {
     async read() { return []; },
     on() {},
     emit() {},
+    wake(ev: { kind: string; source?: string; reason?: string }) { wakes?.push(ev); },
     spawn_system_agent() { return { id: 'fake', stop() {} }; },
   } as unknown as AppContext<OaProxyState>;
 }
@@ -340,6 +345,37 @@ describe('oa.refresh_directory', () => {
     const caps = (cmd.capabilities ?? []).map((c) => c.name);
     expect(caps).toContain('block:write');
     expect(caps).toContain('net:http');
+  });
+});
+
+// ============================================================================
+// on_install — warm the directory + RE-WAKE (boot directory-load race fix)
+// ============================================================================
+
+describe('oa_proxy on_install', () => {
+  it('folds the directory into state on boot', async () => {
+    const manifest = new OaProxyApp({ client: new FakeOaClient(SAMPLE_DIR) }).manifest();
+    const ctx = makeCtx(initialState());
+    await manifest.on_install?.(ctx);
+    expect(ctx.state.directory).toHaveLength(2);
+    expect(ctx.state.org_id).toBe('org_1');
+  });
+
+  it('RE-WAKES after a non-empty fold so a reader that rendered pre-directory gets another turn', async () => {
+    // The registry runs on_install fire-and-forget; a consumer that woke before the directory
+    // landed would be stuck without this wake (the boot directory-load race — D2c e2e flake).
+    const manifest = new OaProxyApp({ client: new FakeOaClient(SAMPLE_DIR) }).manifest();
+    const wakes: Array<{ kind: string; source?: string; reason?: string }> = [];
+    await manifest.on_install?.(makeCtx(initialState(), wakes));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ kind: 'app_event', source: 'oa_proxy', reason: 'oa_directory_loaded' });
+  });
+
+  it('does NOT wake when OA is unavailable (empty fold → nothing to re-render)', async () => {
+    const manifest = new OaProxyApp({ client: new FakeOaClient(null) }).manifest();
+    const wakes: Array<{ kind: string; source?: string; reason?: string }> = [];
+    await manifest.on_install?.(makeCtx(initialState(), wakes));
+    expect(wakes).toHaveLength(0);
   });
 });
 
