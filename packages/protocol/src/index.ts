@@ -400,6 +400,19 @@ export interface ReplyFrame extends Envelope {
 }
 
 /**
+ * `tool_call` — one structured tool_call the agent invoked this turn (the runtime's
+ * onToolCall channel). A UI groups these under the in-flight agent turn and collapses them
+ * once the `reply` lands. Carries ONLY the command `name` + `ok` + `spawn_depth` — never the
+ * args (telemetry, not content; an inspector reads the effect via the `context` layer).
+ */
+export interface ToolCallFrame extends Envelope {
+  kind: 'tool_call';
+  name: string;
+  ok: boolean;
+  spawn_depth: number;
+}
+
+/**
  * OutboundFrame — the discriminated union of everything the server may send, keyed by
  * `kind`. Every member is a read-only projection: emitting one never mutates the tree or
  * runtime state.
@@ -407,6 +420,7 @@ export interface ReplyFrame extends Envelope {
 export type OutboundFrame =
   | ThinkingFrame
   | ReplyFrame
+  | ToolCallFrame
   | ErrorFrame
   | TurnFrame
   | ContextFrame
@@ -431,6 +445,7 @@ export type OutboundKind = OutboundFrame['kind'];
 export const V0_EMITS: readonly OutboundKind[] = [
   'thinking',
   'reply',
+  'tool_call',
   'error',
   'turn',
   'context',

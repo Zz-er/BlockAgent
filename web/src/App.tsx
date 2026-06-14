@@ -13,7 +13,7 @@ export function App(): JSX.Element {
     <div className="app">
       <ConversationPane
         chat={session.chat}
-        thinking={session.thinking}
+        liveActivity={session.liveActivity}
         errors={session.errors}
         lastTurn={session.lastTurn}
         connection={session.connection}

@@ -32,6 +32,7 @@ import type {
   RenderedPrompt,
   RuntimeErrorEvent,
   ThinkingEvent,
+  ToolCallEvent,
   TurnEndReason,
   TurnRecord,
   WakeEvent,
@@ -78,6 +79,9 @@ export type ErrorListener = (event: RuntimeErrorEvent) => void;
  * reason. Fire-and-forget; a throwing listener is isolated so it never breaks the loop.
  */
 export type TurnListener = (event: TurnRecord) => void;
+
+/** A subscriber on the runtime's tool-call channel; see `AgentRuntime.onToolCall`. */
+export type ToolCallListener = (event: ToolCallEvent) => void;
 
 /** The agent-invokable command list advertised to the provider each turn (§4.2). */
 export type ToolCatalog = NonNullable<SendOpts['tools']>;
@@ -226,6 +230,9 @@ export class AgentRuntime {
   /** Subscribers on the per-turn telemetry channel (one TurnRecord per turn). */
   private readonly turn_listeners = new Set<TurnListener>();
 
+  /** UI subscribers on the tool-call channel (one event per agent command invoked). */
+  private readonly tool_call_listeners = new Set<ToolCallListener>();
+
   /** Monotonic wake counter; feeds the deterministic TurnRecord.turn_id (no clock). */
   private _wake_seq = 0;
   /** Turn index within the current wake; the second half of TurnRecord.turn_id. */
@@ -348,6 +355,17 @@ export class AgentRuntime {
   onTurn(listener: TurnListener): () => void {
     this.turn_listeners.add(listener);
     return () => this.turn_listeners.delete(listener);
+  }
+
+  /**
+   * onToolCall — subscribe to the tool-call channel: one ToolCallEvent per structured
+   * tool_call the agent invokes this turn (the command name + whether it succeeded). A UI
+   * groups these under the in-flight agent turn. Symmetric to onThinking; the returned
+   * thunk unsubscribes. Telemetry only — never the command args, never the tree.
+   */
+  onToolCall(listener: ToolCallListener): () => void {
+    this.tool_call_listeners.add(listener);
+    return () => this.tool_call_listeners.delete(listener);
   }
 
   /**
@@ -776,6 +794,23 @@ export class AgentRuntime {
   }
 
   /**
+   * emitToolCall — publish one invoked tool_call (name + ok) to the tool-call channel.
+   * Fire-and-forget + listener-isolated like emitThoughts; never carries the args (INV #13
+   * spirit: telemetry, not content). No-op when nobody is subscribed.
+   */
+  private emitToolCall(name: string, ok: boolean): void {
+    if (this.tool_call_listeners.size === 0) return;
+    const event: ToolCallEvent = { name, ok, spawn_depth: this.spawn_depth };
+    for (const listener of this.tool_call_listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A faulty UI subscriber never breaks the turn loop (fire-and-forget).
+      }
+    }
+  }
+
+  /**
    * emitError — publish a failed-turn event to the error channel. Like emitThoughts
    * it is fire-and-forget: each listener is isolated in try/catch so a faulty
    * subscriber never breaks the (already failing) turn. Normalizes the thrown value
@@ -901,12 +936,18 @@ export class AgentRuntime {
       const token = pendingTokenOf(res);
       if (token !== null) {
         this.state = { kind: 'paused_for_approval', gateway_token: token };
-        return 'parked';
+        return 'parked'; // deferred until approval — emit when it actually runs on resume.
       }
       // A successful command may signal it COMPLETED the agent's response (e.g.
       // messages.reply): the runtime then stops the turn loop instead of looping and
-      // re-replying (CommandResult.end_turn, §8.1).
+      // re-replying (CommandResult.end_turn, §8.1). The end_turn command IS the reply —
+      // it surfaces as the `reply` event (the chat bubble), so we do NOT also emit it as a
+      // tool_call (that would double-show it AND, since onReply fires inside the command,
+      // arrive after the reply and strand the UI's live-activity panel).
       if (res.ok && res.end_turn === true) return 'end_turn';
+      // Any OTHER executed command (memory.write, task.add, a denied command…) → surface it
+      // to the tool-call channel for a UI to group under the turn (name + ok, never args).
+      this.emitToolCall(call.name, res.ok);
       // Otherwise a deny/failed command is not fatal: Operations already recorded
       // the refusal as the CommandResult; the owning App's block (or the result's
       // own error surfaced to the agent next turn) reflects it. Nothing to do here
@@ -918,7 +959,9 @@ export class AgentRuntime {
         this.state = { kind: 'paused_for_approval', gateway_token: token };
         return 'parked';
       }
-      // Non-policy error: record it so the agent sees it next turn (§8.1).
+      // Non-policy error: surface the failed call to the UI channel (ok:false), then record
+      // it so the agent sees it next turn (§8.1).
+      this.emitToolCall(call.name, false);
       await this.recordCommandError(call, err);
       return 'done';
     }

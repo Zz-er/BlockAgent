@@ -30,8 +30,9 @@ import type {
   ChatEntry,
   ChurnAlarm,
   ErrorEntry,
-  ThinkingEntry,
   TierGroup,
+  ToolCallEntry,
+  TurnActivity,
   TurnInfo,
 } from './types.js';
 
@@ -49,7 +50,8 @@ export interface SessionApi {
   connection: ConnectionState;
   model: string | null;
   chat: ChatEntry[];
-  thinking: ThinkingEntry[];
+  /** the in-flight turn's reasoning + tool calls, shown expanded until the reply lands. */
+  liveActivity: TurnActivity | null;
   errors: ErrorEntry[];
   lastTurn: TurnInfo | null;
   tierGroups: TierGroup[];
@@ -68,8 +70,24 @@ export function useSession(): SessionApi {
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [model, setModel] = useState<string | null>(null);
   const [chat, setChat] = useState<ChatEntry[]>([]);
-  const [thinking, setThinking] = useState<ThinkingEntry[]>([]);
+  const [liveActivity, setLiveActivity] = useState<TurnActivity | null>(null);
   const [errors, setErrors] = useState<ErrorEntry[]>([]);
+
+  // Accumulators for the in-flight agent turn (thinking + tool calls since the user's last
+  // message). On the reply frame they're collapsed onto the agent ChatEntry, then reset.
+  const pendingThinking = useRef<string[]>([]);
+  const pendingToolCalls = useRef<ToolCallEntry[]>([]);
+  const bumpLive = useCallback(() => {
+    setLiveActivity({
+      thinking: [...pendingThinking.current],
+      toolCalls: [...pendingToolCalls.current],
+    });
+  }, []);
+  const resetActivity = useCallback(() => {
+    pendingThinking.current = [];
+    pendingToolCalls.current = [];
+    setLiveActivity(null);
+  }, []);
   const [lastTurn, setLastTurn] = useState<TurnInfo | null>(null);
   const [churn, setChurn] = useState<ChurnAlarm>({ active: false, blocks: [], reason: null });
 
@@ -190,14 +208,30 @@ export function useSession(): SessionApi {
           setModel(frame.model);
           break;
         case 'thinking':
-          setThinking((t) => [...t, { id: nextId(), text: frame.text, spawn_depth: frame.spawn_depth }]);
+          // Accumulate into the in-flight turn (shown live, collapsed onto the reply later).
+          pendingThinking.current = [...pendingThinking.current, frame.text];
+          bumpLive();
           break;
-        case 'reply':
-          // The agent's conversational turn (MessagesApp.onReply). Append to the chat as the
-          // 'agent' role so it renders alongside the user's messages (the optimistic user echo
-          // is added in submit()). This is the only place agent replies enter the chat stream.
-          setChat((c) => [...c, { id: nextId(), role: 'agent', text: frame.content }]);
+        case 'tool_call':
+          // One command the agent invoked this turn (name + ok). Grouped with thinking.
+          pendingToolCalls.current = [...pendingToolCalls.current, { name: frame.name, ok: frame.ok }];
+          bumpLive();
           break;
+        case 'reply': {
+          // The agent's conversational turn (MessagesApp.onReply). Append as the 'agent' role
+          // and COLLAPSE this turn's accumulated thinking + tool calls onto the entry (rendered
+          // as a foldable disclosure). Then reset the accumulators + clear the live panel.
+          const activity: TurnActivity | undefined =
+            pendingThinking.current.length > 0 || pendingToolCalls.current.length > 0
+              ? { thinking: [...pendingThinking.current], toolCalls: [...pendingToolCalls.current] }
+              : undefined;
+          setChat((c) => [
+            ...c,
+            { id: nextId(), role: 'agent', text: frame.content, ...(activity ? { activity } : {}) },
+          ]);
+          resetActivity();
+          break;
+        }
         case 'error':
           setErrors((e) => [...e, { id: nextId(), message: frame.message, phase: frame.phase }]);
           break;
@@ -247,7 +281,7 @@ export function useSession(): SessionApi {
           break;
       }
     },
-    [handleContext],
+    [handleContext, bumpLive, resetActivity],
   );
 
   // --- lifecycle -----------------------------------------------------------
@@ -271,12 +305,18 @@ export function useSession(): SessionApi {
 
   // --- public actions ------------------------------------------------------
 
-  const submit = useCallback((text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    setChat((c) => [...c, { id: nextId(), role: 'user', text: trimmed }]);
-    clientRef.current?.submit(trimmed);
-  }, []);
+  const submit = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      // A new user message starts a fresh turn: clear any leftover live activity so the next
+      // reply only carries THIS turn's thinking + tool calls.
+      resetActivity();
+      setChat((c) => [...c, { id: nextId(), role: 'user', text: trimmed }]);
+      clientRef.current?.submit(trimmed);
+    },
+    [resetActivity],
+  );
 
   const fetchBlockBody = useCallback((name: string, content_hash: string) => {
     // Lazy body-on-expand (scope:'block'). Cache-key contract: the body's
@@ -320,7 +360,7 @@ export function useSession(): SessionApi {
     connection,
     model,
     chat,
-    thinking,
+    liveActivity,
     errors,
     lastTurn,
     tierGroups,

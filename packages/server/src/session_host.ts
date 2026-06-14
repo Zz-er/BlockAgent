@@ -33,6 +33,7 @@ import type {
   CacheTier,
   RuntimeErrorEvent,
   ThinkingEvent,
+  ToolCallEvent,
   InvokerContext,
   AgentState,
 } from '@block-agent/core/core/types.js';
@@ -140,6 +141,17 @@ export class SessionHost {
       agent.runtime.onThinking((e: ThinkingEvent) => this.broadcast(this.toThinkingFrame(e))),
       agent.runtime.onError((e: RuntimeErrorEvent) => this.broadcast(this.toErrorFrame(e))),
       agent.runtime.onTurn((record: TurnRecord) => this.onTurnRecord(record)),
+      // The agent's tool_call stream: one frame per command it invokes this turn (name + ok,
+      // never args). A UI groups these under the turn and collapses them when the reply lands.
+      agent.runtime.onToolCall((e: ToolCallEvent) =>
+        this.broadcast({
+          kind: 'tool_call',
+          v: PROTOCOL_VERSION,
+          name: e.name,
+          ok: e.ok,
+          spawn_depth: e.spawn_depth,
+        }),
+      ),
     );
 
     // The agent's reply stream (the SAME push channel the CLI subscribes to: cli-design §6).

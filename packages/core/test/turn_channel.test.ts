@@ -198,3 +198,49 @@ describe('onTurn — per-turn telemetry channel', () => {
     expect(records).toHaveLength(0);
   });
 });
+
+describe('onToolCall — tool-call channel', () => {
+  it('emits one event per NON-reply command, with name + ok (never args)', async () => {
+    // reply.say is a normal (non-end_turn) command; a second idle response ends the wake.
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'reply.say', args: { text: 'hi' } }] },
+      {},
+    ]);
+    const { runtime } = wire(provider, makeReplyApp);
+    const calls: Array<{ name: string; ok: boolean; spawn_depth: number }> = [];
+    runtime.onToolCall((e) => calls.push(e));
+
+    await runtime.on_wake(WAKE);
+
+    // The channel surfaced the command's name + success — and the event carries no `args`
+    // (telemetry, not content).
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({ name: 'reply.say', ok: true, spawn_depth: 0 });
+    expect(Object.keys(calls[0]!)).not.toContain('args');
+  });
+
+  it('does NOT emit for the end_turn (reply) command — it is the reply, not a tool', async () => {
+    // done.reply sets end_turn → surfaced as the reply, never double-shown as a tool_call.
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'done.reply', args: {} }] },
+    ]);
+    const { runtime } = wire(provider, makeEndTurnApp);
+    const calls: unknown[] = [];
+    runtime.onToolCall((e) => calls.push(e));
+
+    await runtime.on_wake(WAKE);
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not emit for a wake that produces no tool_calls (idle text turn)', async () => {
+    const provider = new MockProvider([{ thinking: ['just thinking'], tool_calls: [] }]);
+    const { runtime } = wire(provider, makeReplyApp);
+    const calls: unknown[] = [];
+    runtime.onToolCall((e) => calls.push(e));
+
+    await runtime.on_wake(WAKE);
+
+    expect(calls).toHaveLength(0);
+  });
+});

@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from 'react';
 import type {
   ChatEntry,
   ErrorEntry,
-  ThinkingEntry,
+  TurnActivity,
   TurnInfo,
 } from '../session/types.js';
 import type { ConnectionState } from '../protocol/client.js';
@@ -14,7 +14,7 @@ import { formatWeight } from '../lib/weight.js';
 
 interface ConversationPaneProps {
   chat: ChatEntry[];
-  thinking: ThinkingEntry[];
+  liveActivity: TurnActivity | null;
   errors: ErrorEntry[];
   lastTurn: TurnInfo | null;
   connection: ConnectionState;
@@ -24,13 +24,14 @@ interface ConversationPaneProps {
 
 export function ConversationPane({
   chat,
-  thinking,
+  liveActivity,
   errors,
   lastTurn,
   connection,
   model,
   onSubmit,
 }: ConversationPaneProps): JSX.Element {
+  const live = hasContent(liveActivity) ? liveActivity : null;
   return (
     <main className="conversation">
       <header className="conversation__header">
@@ -41,9 +42,7 @@ export function ConversationPane({
 
       {errors.length > 0 && <ErrorBanner errors={errors} />}
 
-      <MessageList chat={chat} />
-
-      {thinking.length > 0 && <ThinkingStream thinking={thinking} />}
+      <MessageList chat={chat} live={live} />
 
       {lastTurn && <TurnFooter turn={lastTurn} />}
 
@@ -52,11 +51,18 @@ export function ConversationPane({
   );
 }
 
-function MessageList({ chat }: { chat: ChatEntry[] }): JSX.Element {
+/** Does a turn activity have anything to show (thinking or tool calls)? */
+function hasContent(a: TurnActivity | null): a is TurnActivity {
+  return a !== null && (a.thinking.length > 0 || a.toolCalls.length > 0);
+}
+
+function MessageList({ chat, live }: { chat: ChatEntry[]; live: TurnActivity | null }): JSX.Element {
   const endRef = useRef<HTMLDivElement>(null);
+  // Re-scroll as messages arrive AND as live activity streams in during a turn.
+  const liveLen = (live?.thinking.length ?? 0) + (live?.toolCalls.length ?? 0);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chat.length]);
+  }, [chat.length, liveLen]);
 
   return (
     <div className="messages">
@@ -65,21 +71,64 @@ function MessageList({ chat }: { chat: ChatEntry[] }): JSX.Element {
         <div key={entry.id} className={`message message--${entry.role}`}>
           <span className="message__role">{entry.role}</span>
           <span className="message__text">{entry.text}</span>
+          {/* The reply's reasoning + tool calls, collapsed under the bubble (expand to inspect). */}
+          {entry.activity && <ActivityDisclosure activity={entry.activity} />}
         </div>
       ))}
+      {/* The in-flight turn: thinking + tool calls shown LIVE + expanded until the reply lands. */}
+      {live && <LiveActivity activity={live} />}
       <div ref={endRef} />
     </div>
   );
 }
 
-function ThinkingStream({ thinking }: { thinking: ThinkingEntry[] }): JSX.Element {
-  const recent = thinking.slice(-8);
+/** A one-line summary of a turn activity, e.g. "2 thinking · 3 tools". */
+function activitySummary(a: TurnActivity): string {
+  const parts: string[] = [];
+  if (a.thinking.length > 0) parts.push(`${a.thinking.length} thinking`);
+  if (a.toolCalls.length > 0) {
+    parts.push(`${a.toolCalls.length} tool${a.toolCalls.length > 1 ? 's' : ''}`);
+  }
+  return parts.join(' · ') || 'details';
+}
+
+/** Collapsed reasoning + tool-call trace attached to a completed agent reply. */
+function ActivityDisclosure({ activity }: { activity: TurnActivity }): JSX.Element {
   return (
-    <div className="thinking">
-      <span className="thinking__label">thinking</span>
-      {recent.map((t) => (
-        <div key={t.id} className="thinking__line" data-depth={t.spawn_depth}>
-          {t.text}
+    <details className="activity activity--collapsed">
+      <summary className="activity__summary">{activitySummary(activity)}</summary>
+      <ActivityBody activity={activity} />
+    </details>
+  );
+}
+
+/** The in-flight turn's activity, shown expanded (no fold) while the agent is working. */
+function LiveActivity({ activity }: { activity: TurnActivity }): JSX.Element {
+  return (
+    <div className="activity activity--live">
+      <span className="activity__label">working… ({activitySummary(activity)})</span>
+      <ActivityBody activity={activity} />
+    </div>
+  );
+}
+
+/** The shared body: tool calls (name + ✓/✗) then the reasoning lines. */
+function ActivityBody({ activity }: { activity: TurnActivity }): JSX.Element {
+  return (
+    <div className="activity__body">
+      {activity.toolCalls.length > 0 && (
+        <ul className="tool-calls">
+          {activity.toolCalls.map((t, i) => (
+            <li key={i} className={`tool-call tool-call--${t.ok ? 'ok' : 'fail'}`}>
+              <span className="tool-call__name">{t.name}</span>
+              <span className="tool-call__status">{t.ok ? '✓' : '✗'}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {activity.thinking.map((text, i) => (
+        <div key={i} className="thinking__line">
+          {text}
         </div>
       ))}
     </div>

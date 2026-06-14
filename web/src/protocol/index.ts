@@ -33,6 +33,7 @@ export type {
   OutboundKind,
   ThinkingFrame,
   ReplyFrame,
+  ToolCallFrame,
   ErrorFrame,
   TurnFrame,
   ContextFrame,
@@ -69,6 +70,7 @@ export function isOutboundFrame(value: unknown): value is OutboundFrame {
   return (
     kind === 'thinking' ||
     kind === 'reply' ||
+    kind === 'tool_call' ||
     kind === 'error' ||
     kind === 'turn' ||
     kind === 'context' ||

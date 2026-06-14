@@ -3,11 +3,33 @@
 
 import type { BlockAttribution, CacheTier, TurnRecord } from '../protocol/index.js';
 
+/** One tool_call the agent invoked (command name + whether it succeeded). */
+export interface ToolCallEntry {
+  name: string;
+  ok: boolean;
+}
+
+/**
+ * TurnActivity — the reasoning + tool-call trace accumulated during ONE agent response
+ * (from the user's message until the agent's reply lands). Shown LIVE+expanded while the
+ * turn runs, then COLLAPSED onto the agent's reply once it completes.
+ */
+export interface TurnActivity {
+  thinking: string[];
+  toolCalls: ToolCallEntry[];
+}
+
 /** A line in the conversation pane. */
 export interface ChatEntry {
   id: string;
   role: 'user' | 'agent';
   text: string;
+  /**
+   * The thinking + tool-call trace that produced this reply (agent entries only). Rendered
+   * as a collapsed disclosure under the bubble. Absent on user entries / a reply with no
+   * surfaced activity.
+   */
+  activity?: TurnActivity;
 }
 
 /** A surfaced reasoning chunk (UI-only thinking stream). */

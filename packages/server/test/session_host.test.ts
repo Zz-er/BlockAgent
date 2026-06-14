@@ -112,6 +112,24 @@ describe('SessionHost — submit', () => {
     conn.close();
     host.close();
   });
+
+  it('does NOT surface the reply (end_turn) command as a tool_call frame', async () => {
+    const { host } = await makeHost();
+    const { sink, ofKind } = collectingSink();
+    const conn = connectInProcess(host, sink);
+
+    await conn.send({ kind: 'submit', v: '0', text: 'hello agent' });
+
+    // The mock's only command is messages.reply (end_turn) — surfaced as the `reply` frame
+    // (the chat bubble), NOT as a tool_call (the runtime skips the end_turn command so the web
+    // doesn't double-show it / strand the live-activity panel). A non-reply command WOULD emit
+    // a tool_call frame (covered at the runtime onToolCall channel level in core).
+    expect(ofKind('reply').length).toBeGreaterThanOrEqual(1);
+    expect(ofKind('tool_call')).toHaveLength(0);
+
+    conn.close();
+    host.close();
+  });
 });
 
 describe('SessionHost — query is read-only', () => {

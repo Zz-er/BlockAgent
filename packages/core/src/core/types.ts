@@ -333,6 +333,26 @@ export interface ThinkingEvent {
 }
 
 /**
+ * ToolCallEvent — one structured tool_call the agent issued this turn, emitted on the
+ * runtime's tool-call channel (`AgentRuntime.onToolCall`), symmetric to the thinking
+ * channel. A UI groups these under the in-flight agent turn (e.g. "memory.write ✓").
+ *
+ * Carries ONLY the command `name` + whether it succeeded (`ok`) + `spawn_depth` — NOT the
+ * args. Args can hold conversation/memory content; the tool-call channel is a lightweight
+ * activity signal for a UI, not a content firehose (a UI that wants the effect reads the
+ * resulting block via the context layer). Like thinking, this is telemetry: emitting it
+ * never writes the tree and never re-enters the prompt.
+ */
+export interface ToolCallEvent {
+  /** The command full-name the agent invoked, e.g. `messages.reply` / `memory.write`. */
+  name: string;
+  /** Whether the command succeeded (false = denied by policy or the command failed). */
+  ok: boolean;
+  /** runtime.spawn_depth; 0 = the main agent (a UI can attribute sub-agent tool use). */
+  spawn_depth: number;
+}
+
+/**
  * RuntimeErrorEvent — a turn that failed unexpectedly, emitted on the runtime's
  * error channel (`AgentRuntime.onError`), symmetric to the thinking channel.
  *
