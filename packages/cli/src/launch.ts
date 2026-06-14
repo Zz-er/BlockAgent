@@ -42,6 +42,13 @@ import { StatsApp } from '@block-agent/app-stats/manifest.js';
 import { MemoryLettaApp } from '@block-agent/app-memory_letta/memory_letta_app.js';
 import { TurnLogApp } from '@block-agent/app-turn_log/manifest.js';
 import { FocusApp } from '@block-agent/app-focus/manifest.js';
+// Phase C platform-service proxies (default-off). ORG_DIRECTORY is the org_directory
+// ContractDef OWNED BY oa_proxy (a platform-domain contract — deliberately NOT in core,
+// which must hold no app-domain knowledge); launch registers it so the im/task proxies'
+// `consumes` bind resolves.
+import { ImProxyApp } from '@block-agent/app-im_proxy/manifest.js';
+import { OaProxyApp, ORG_DIRECTORY } from '@block-agent/app-oa_proxy/manifest.js';
+import { TaskProxyApp } from '@block-agent/app-task_proxy/manifest.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
@@ -143,6 +150,11 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //     dropped. App-defined contracts (none built-in beyond these two) would register here too.
   registry.registerContract(MESSAGE_COUNT);
   registry.registerContract(TASK_COUNT);
+  // org_directory (Phase C): provided by oa_proxy, consumed by im_proxy + task_proxy. Registered
+  // UNCONDITIONALLY (like the two above) so a consumer resolves the name even if oa_proxy is off
+  // — with no provider the consume-refresh yields an empty directory and each proxy falls back to
+  // the sanitized principal_id label (graceful, never throws).
+  registry.registerContract(ORG_DIRECTORY);
 
   const base = appsBaseDir(config);
   const { messages } = installEnabledApps(config, registry, base);
@@ -476,6 +488,23 @@ function installEnabledApps(
   // installs LAST so the providers it consumes are already present at first refresh.
   if (config.apps.stats.enabled) {
     registry.install(new StatsApp({ configBase: base }).manifest());
+  }
+  // Phase C platform-service proxies (im/oa/task). DEFAULT-OFF: each projects a BlockAI-team
+  // service over the network and must not connect on a default boot. Their fetch/ws clients are
+  // isolated inside the app workspaces (cli runtime dep, core devDep) — core's runtime closure
+  // stays empty (DR-M4, same as memory_letta). Each reads its endpoint + token from ENV inside
+  // its own client (IM/OA/TASK_SERVICE_URL + _SERVICE_TOKEN; token env-only) — launch passes no
+  // credential. Unconfigured → an empty projection, never a throw. oa_proxy PROVIDES org_directory
+  // (registered above); im_proxy + task_proxy CONSUME it (assignee/from → name) — install order is
+  // irrelevant (the registry derives the provider table over all installed manifests).
+  if (config.apps.im_proxy.enabled) {
+    registry.install(new ImProxyApp().manifest() as Parameters<typeof registry.install>[0]);
+  }
+  if (config.apps.oa_proxy.enabled) {
+    registry.install(new OaProxyApp({ configBase: base }).manifest() as Parameters<typeof registry.install>[0]);
+  }
+  if (config.apps.task_proxy.enabled) {
+    registry.install(new TaskProxyApp().manifest() as Parameters<typeof registry.install>[0]);
   }
 
   return { messages };

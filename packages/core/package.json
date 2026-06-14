@@ -30,6 +30,9 @@
     "@block-agent/app-tools": "*",
     "@block-agent/app-memory": "*",
     "@block-agent/app-task": "*",
-    "@block-agent/app-stats": "*"
+    "@block-agent/app-stats": "*",
+    "@block-agent/app-im_proxy": "*",
+    "@block-agent/app-oa_proxy": "*",
+    "@block-agent/app-task_proxy": "*"
   }
 }

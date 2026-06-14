@@ -42,6 +42,11 @@ export const DEFAULTS: LauncherConfig = {
     // stats: pure consumer (message_count + task_count); off by default (§4.4) so a
     // default boot renders no `stats:summary` block unless the operator opts in.
     stats: { enabled: false },
+    // Phase C platform-service proxies: each projects a BlockAI-team service (IM/OA/Task)
+    // and needs that service running, so ALL off by default (like memory_letta).
+    im_proxy: { enabled: false },
+    oa_proxy: { enabled: false },
+    task_proxy: { enabled: false },
   },
   welcome: { cube: true },
 };
@@ -288,6 +293,9 @@ export function loadConfig(
       memory_letta: resolveMemoryLetta(flags, fileApps, env),
       task: resolveTask(flags, fileApps),
       stats: resolveStats(flags, fileApps),
+      im_proxy: resolveServiceProxy('im_proxy', flags, fileApps),
+      oa_proxy: resolveServiceProxy('oa_proxy', flags, fileApps),
+      task_proxy: resolveServiceProxy('task_proxy', flags, fileApps),
     },
     ...(storage_dir !== undefined ? { storage_dir } : {}),
     ...(max_turns_per_wake !== undefined ? { max_turns_per_wake } : {}),
@@ -572,4 +580,25 @@ function resolveMemoryLetta(
     ...(base_url !== undefined ? { base_url } : {}),
     ...(recall_limit !== undefined ? { recall_limit } : {}),
   };
+}
+
+/**
+ * resolveServiceProxy — the shared resolver for the Phase C platform-service proxies
+ * (`im_proxy` / `oa_proxy` / `task_proxy`). ALL DISABLED by default (each needs a running
+ * BlockAI-team service): `enabled` is on ONLY when a positive flag (`--im-proxy`) or the
+ * file says so; `--no-<id>` forces off. This resolver carries ONLY the enable gate — the
+ * endpoint + token are read from ENV inside each proxy's client (`*_SERVICE_URL` /
+ * `*_SERVICE_TOKEN`, the token env-only per the ANTHROPIC_API_KEY rule), never config/flag.
+ */
+function resolveServiceProxy(
+  id: 'im_proxy' | 'oa_proxy' | 'task_proxy',
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['im_proxy'] {
+  const f = pickObject(fileApps[id]);
+  const flagId = id.replace('_', '-'); // im_proxy → im-proxy
+  const fileEnabled = asBool(f['enabled']) ?? false;
+  const flagOn = flags[flagId] === true || flags[flagId] === 'true';
+  const flagOff = flags[`no-${flagId}`] === true || flags[`no-${flagId}`] === 'true';
+  return { enabled: flagOff ? false : flagOn || fileEnabled };
 }

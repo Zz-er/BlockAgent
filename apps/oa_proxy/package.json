@@ -1,0 +1,35 @@
+{
+  "name": "@block-agent/app-oa_proxy",
+  "version": "1.0.0",
+  "description": "oa_proxy BlockApp: projects the OA org directory into agent context as a stable block and provides the org_directory contract. HTTP client to the OA service is isolated here; @block-agent/core never imports it.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-oa_proxy/manifest.js'. ORG_DIRECTORY ContractDef is re-exported from manifest for launch to register (same pattern as MESSAGE_COUNT/TASK_COUNT).",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "oa_proxy",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": false,
+    "summary": "把 OA 组织目录投影为 stable 块，并提供 org_directory 契约。",
+    "provides": ["org_directory"],
+    "consumes": [],
+    "requires": "OA service + OA_SERVICE_TOKEN"
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

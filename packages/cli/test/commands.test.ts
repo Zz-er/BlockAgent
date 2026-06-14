@@ -27,6 +27,9 @@ function mockConfig(storage_dir: string): LauncherConfig {
       memory_letta: { enabled: false },
       task: { enabled: false },
       stats: { enabled: false },
+      im_proxy: { enabled: false },
+      oa_proxy: { enabled: false },
+      task_proxy: { enabled: false },
     },
     storage_dir,
   };

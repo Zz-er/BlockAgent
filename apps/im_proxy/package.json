@@ -1,0 +1,37 @@
+{
+  "name": "@block-agent/app-im_proxy",
+  "version": "1.0.0",
+  "description": "im_proxy BlockApp: projects an external IM service into agent context (chat window + push→wake→ingest). The ws/fetch client is isolated here; @block-agent/core never imports it.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-im_proxy/manifest.js'; NodeNext resolves it via the workspace symlink.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "im_proxy",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": false,
+    "summary": "把外部 IM 服务投影成 agent 上下文里的聊天块。",
+    "provides": ["message_count"],
+    "consumes": ["org_directory"],
+    "requires": "IM service + per-principal bearer token"
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

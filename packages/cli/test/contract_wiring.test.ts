@@ -44,6 +44,9 @@ function fourAppConfig(dir: string): LauncherConfig {
       memory_letta: { enabled: false },
       task: { enabled: true },
       stats: { enabled: true },
+      im_proxy: { enabled: false },
+      oa_proxy: { enabled: false },
+      task_proxy: { enabled: false },
     },
     storage_dir: dir,
   };

@@ -33,6 +33,10 @@ function mockConfig(dir: string): LauncherConfig {
       memory_letta: { enabled: false }, // needs an external server; off in tests
       task: { enabled: true },
       stats: { enabled: false },
+      // Phase C platform-service proxies: each needs its BlockAI-team service running, off in tests.
+      im_proxy: { enabled: false },
+      oa_proxy: { enabled: false },
+      task_proxy: { enabled: false },
     },
     storage_dir: dir,
   };

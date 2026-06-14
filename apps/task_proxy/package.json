@@ -1,0 +1,35 @@
+{
+  "name": "@block-agent/app-task_proxy",
+  "version": "1.0.0",
+  "description": "task_proxy BlockApp: projects the external Task service into agent context (kanban / my-tasks). The HTTP/WS Task-service client is isolated here; @block-agent/core never imports it.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-task_proxy/manifest.js'. Same wildcard subpath discipline as app-task / app-memory_letta; tsx runs the source directly via the workspace symlink.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "task_proxy",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": false,
+    "summary": "对接外部 Task 服务，渲染任务看板 / 我的任务；提供 task_count 契约，消费 org_directory。",
+    "provides": ["task_count"],
+    "consumes": ["org_directory"],
+    "requires": "Task service (REST /task/* + WS task_changed) + TASK_SERVICE_TOKEN"
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

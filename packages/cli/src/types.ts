@@ -145,6 +145,20 @@ export interface MemoryLettaConfig {
 }
 
 /**
+ * Platform-service proxy app config — shared by `im_proxy` / `oa_proxy` / `task_proxy`
+ * (Phase C). ALL DISABLED by default: each projects a BlockAI-team service (IM/OA/Task)
+ * and must not try to connect on a default boot. This config carries ONLY the enable gate;
+ * the connection is configured by ENV, read inside each proxy's client uniformly — the
+ * endpoint `IM_SERVICE_URL` / `OA_SERVICE_URL` / `TASK_SERVICE_URL` and the bearer token
+ * `IM_SERVICE_TOKEN` / `OA_SERVICE_TOKEN` / `TASK_SERVICE_TOKEN` (the token is env-ONLY, the
+ * ANTHROPIC_API_KEY rule — never config/flag/log). Unconfigured → the proxy degrades to an
+ * empty projection. (The Phase D platform console injects per-instance env per process.)
+ */
+export interface ServiceProxyConfig {
+  enabled: boolean;
+}
+
+/**
  * LauncherConfig — resolved from flags ⊕ file ⊕ env ⊕ defaults by `loadConfig()`
  * (design §3, precedence highest-wins: flags > file > env > defaults; the config file
  * is authoritative over ambient env vars). Pure data; `launch()` turns it into the
@@ -162,6 +176,10 @@ export interface LauncherConfig {
     task: TaskConfig;
     /** §4.4 stats summary (pure consumer); DISABLED by default. */
     stats: StatsConfig;
+    /** Phase C platform-service proxies; ALL DISABLED by default (each needs a running service). */
+    im_proxy: ServiceProxyConfig;
+    oa_proxy: ServiceProxyConfig;
+    task_proxy: ServiceProxyConfig;
   };
   /**
    * OPTIONAL operator-supplied contract rebindings (C-API-7). The contract model
