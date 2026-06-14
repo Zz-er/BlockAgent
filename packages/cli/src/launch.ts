@@ -34,6 +34,7 @@ import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
 import { MockProvider } from '@block-agent/core/provider/mock.js';
 import { ImEchoMockProvider } from '@block-agent/core/provider/im_echo_mock.js';
+import { TaskCreateMockProvider } from '@block-agent/core/provider/task_create_mock.js';
 import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
 import { MessagesApp } from '@block-agent/app-messages/manifest.js';
 import { ToolsApp } from '@block-agent/app-tools/manifest.js';
@@ -719,6 +720,17 @@ function buildProviderOrThrow(config: LauncherConfig): ModelProvider {
       // reply→IM vertical (it must react to context, not a fixed script — the agent burns turns
       // before the message arrives, which would exhaust a canned queue). Otherwise the plain
       // scripted mock that replies once then ends the loop (a generic dry-run smoke).
+      // Task WRITE vertical (platform Phase D2b): with task_proxy enabled the offline mock is the
+      // CONTEXT-REACTIVE task-create mock — it reads the rendered prompt each turn and, on an
+      // inbound IM directive `create task: <title>` in the im_proxy:chat block, emits a
+      // `task_proxy.add` tool_call, exercising the human→IM→im_proxy→agent→task_proxy→Task-service
+      // WRITE path with no key. Checked BEFORE im_proxy (more specific): the vertical enables BOTH
+      // im_proxy (the directive arrives via IM) and task_proxy (the action goes to Task), so a
+      // task-directive run must select this mock, not the im-echo one. D1/D2a enable im_proxy ONLY,
+      // so they still resolve to the im-echo mock below (behavior unchanged).
+      if (config.apps.task_proxy.enabled) {
+        return new TaskCreateMockProvider();
+      }
       if (config.apps.im_proxy.enabled) {
         return new ImEchoMockProvider();
       }
