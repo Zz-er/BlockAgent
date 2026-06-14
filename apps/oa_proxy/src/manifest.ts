@@ -150,7 +150,13 @@ function oaStateOf(app_ctx: AppContext | undefined): OaProxyState | null {
   return s as OaProxyState;
 }
 
-/** Render one member line. dept_path + title shown when present; nulls omitted. */
+/**
+ * Render one member line. dept_path + title shown when present; nulls omitted. The line carries
+ * the member's `principal_id` in a trailing `[<principal_id>]` tag: it is the JOIN KEY a reader
+ * (e.g. another proxy / a downstream consumer) uses to resolve a message sender (whose authority is
+ * its principal_id) to this directory's display name. The principal_id is the authoritative key,
+ * never the display name — the tag makes the directory addressable by it.
+ */
 function renderMember(m: DirectoryMember): string {
   const parts: string[] = [];
   // Primary display: prefer the display name, fall back to the real name.
@@ -160,6 +166,8 @@ function renderMember(m: DirectoryMember): string {
   if (m.title != null && m.title.length > 0) meta.push(m.title);
   if (m.dept_path != null && m.dept_path.length > 0) meta.push(m.dept_path);
   if (meta.length > 0) parts.push(` — ${meta.join(', ')}`);
+  // Trailing principal_id tag (the authoritative join key); always last on the line.
+  parts.push(` [${m.principal_id}]`);
   return parts.join('');
 }
 
@@ -348,9 +356,18 @@ export class OaProxyApp {
       DEFAULT_CONFIG as unknown as Record<string, unknown>,
       opts.configBase ?? APPS_DIR,
     );
+    // base_url precedence: OA_SERVICE_URL env > file config > compiled default. The platform
+    // (BlockAI-team Console) injects the per-instance OA endpoint via OA_SERVICE_URL env (same
+    // contract as task_proxy's TASK_SERVICE_URL / im_proxy's IM_SERVICE_URL) — the token already
+    // comes from OA_SERVICE_TOKEN env (oa_client.ts), so the URL must too, or oa_proxy connects to
+    // the compiled localhost default and the directory never loads. user `set_config` can still
+    // retune base_url at runtime; this only sets the seed.
+    const envBaseUrl = process.env['OA_SERVICE_URL'];
+    const fileBaseUrl =
+      typeof seeded['base_url'] === 'string' ? (seeded['base_url'] as string) : DEFAULT_CONFIG.base_url;
     this.seedConfig = {
       dir_limit: typeof seeded['dir_limit'] === 'number' ? (seeded['dir_limit'] as number) : DEFAULT_CONFIG.dir_limit,
-      base_url: typeof seeded['base_url'] === 'string' ? (seeded['base_url'] as string) : DEFAULT_CONFIG.base_url,
+      base_url: envBaseUrl !== undefined && envBaseUrl.length > 0 ? envBaseUrl : fileBaseUrl,
     };
     this.client = opts.client;
   }

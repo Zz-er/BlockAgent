@@ -35,6 +35,7 @@ import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_comp
 import { MockProvider } from '@block-agent/core/provider/mock.js';
 import { ImEchoMockProvider } from '@block-agent/core/provider/im_echo_mock.js';
 import { TaskCreateMockProvider } from '@block-agent/core/provider/task_create_mock.js';
+import { OaResolveMockProvider } from '@block-agent/core/provider/oa_resolve_mock.js';
 import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
 import { MessagesApp } from '@block-agent/app-messages/manifest.js';
 import { ToolsApp } from '@block-agent/app-tools/manifest.js';
@@ -733,6 +734,19 @@ function buildProviderOrThrow(config: LauncherConfig): ModelProvider {
       // through to the plain mock, not spin emptily on a missing chat source.
       if (config.apps.im_proxy.enabled && config.apps.task_proxy.enabled) {
         return new TaskCreateMockProvider();
+      }
+      // OA NAME-RESOLUTION vertical (platform Phase D2c): with im_proxy AND oa_proxy enabled (and
+      // NOT task_proxy — that is the more specific im&&task vertical, checked above), the offline
+      // mock is the CONTEXT-REACTIVE oa-resolve mock. It reads the rendered prompt each turn and,
+      // for an inbound IM message, replies with the peer's OA-RESOLVED display name (read out of the
+      // `# Chat — dm <display>` header, which im_proxy resolves from oa_proxy's `org_directory`
+      // projection of the live OA service) folded with the inbound nonce — exercising the
+      // human→IM→im_proxy→agent→reply path AND proving OA→oa_proxy→org_directory→im_proxy name
+      // resolution, with no key. EXPLICIT conjunction (im_proxy AND oa_proxy): without oa_proxy the
+      // chat header carries no resolved name, so a config missing oa_proxy must fall through to the
+      // plain im-echo mock below rather than spin with no OA projection to react to.
+      if (config.apps.im_proxy.enabled && config.apps.oa_proxy.enabled) {
+        return new OaResolveMockProvider();
       }
       if (config.apps.im_proxy.enabled) {
         return new ImEchoMockProvider();

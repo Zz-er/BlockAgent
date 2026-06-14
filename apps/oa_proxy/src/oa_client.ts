@@ -60,7 +60,12 @@ export class OaServiceClient {
   private readonly timeoutMs: number;
 
   constructor(opts: OaServiceClientOptions = {}) {
-    this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+    // Base URL: explicit option, else the platform-injected `OA_SERVICE_URL` env (the same
+    // convention im_proxy/task_proxy follow — `IM_SERVICE_URL`/`TASK_SERVICE_URL`), else the
+    // local default. Without the env read, the console-injected per-instance OA endpoint is
+    // ignored and oa_proxy silently degrades against localhost (Phase C oversight — oa_proxy was
+    // the only proxy not reading its `*_SERVICE_URL` env).
+    this.baseUrl = (opts.baseUrl ?? process.env['OA_SERVICE_URL'] ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     // Token from explicit option, else env ONLY (never config/state/log).
     this.token = opts.token ?? process.env['OA_SERVICE_TOKEN'] ?? undefined;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;

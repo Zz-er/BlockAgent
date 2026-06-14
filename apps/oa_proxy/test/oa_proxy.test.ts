@@ -199,7 +199,7 @@ describe('oa_proxy:directory block', () => {
     expect(a!.content_text).toBe(b!.content_text);
     // Stable snapshot of the rendered bytes.
     expect(a!.content_text).toBe(
-      '# Organization\n- 张三 (human) — 后端 Lead, /eng/backend\n- Coder (agent) — 编码岗',
+      '# Organization\n- 张三 (human) — 后端 Lead, /eng/backend [p_zhang]\n- Coder (agent) — 编码岗 [agent_coder]',
     );
   });
 });
