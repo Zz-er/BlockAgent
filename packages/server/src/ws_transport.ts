@@ -15,9 +15,11 @@
  * N sessions behind a supervisor (§4.4) is additive and out of scope here.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import type { SessionHost, OutboundSink } from './session_host.js';
+import type { SessionHost, OutboundSink, HealthSnapshot } from './session_host.js';
 import type { InvokerContext } from '@block-agent/core/core/types.js';
 import {
   PROTOCOL_VERSION,
@@ -61,6 +63,15 @@ export interface WsTransportOptions {
    * lets D4 land remote auth without touching this transport's shape.
    */
   authenticate?: AuthenticateFn;
+  /**
+   * Optional liveness probe (D6 §8 seam 3). When supplied, the transport serves `GET /health`
+   * with this snapshot as JSON on the SAME port the WS server binds — so a supervisor can poll
+   * `{state, wake_seq, turn_index}` without opening the protocol. It is a READ-ONLY probe (no
+   * invoker, no auth membrane needed): it exposes only liveness counters, never tree content
+   * or a side effect, so it is safe even when the WS path itself is loopback-gated. Absent ⇒
+   * no HTTP route is served (every request 426-upgrades, the prior WS-only behavior).
+   */
+  health?: () => HealthSnapshot;
 }
 
 /** Loopback hosts that need no auth membrane in v0 (a local operator connection, §4.3). */
@@ -150,8 +161,15 @@ export function startWsTransport(
   }
 
   return new Promise((resolve, reject) => {
-    const wss = new WebSocketServer({ port: opts.port, host: bindHost });
+    // Own an explicit HTTP server so the WS upgrade AND the `GET /health` probe can share one
+    // port (D6 §8 seam 3). `ws` would otherwise create its own bare server; we pass ours so a
+    // plain HTTP request can be answered (health) while upgrades still reach the WS server.
+    const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+      handleHttp(req, res, opts.health);
+    });
+    const wss = new WebSocketServer({ server: httpServer });
 
+    httpServer.on('error', reject);
     wss.on('error', reject);
 
     wss.on('connection', (socket: WebSocket, req: { socket?: { remoteAddress?: string } }) => {
@@ -197,17 +215,49 @@ export function startWsTransport(
       socket.on('error', () => unsubscribe());
     });
 
-    wss.on('listening', () => {
-      const address = wss.address();
+    httpServer.on('listening', () => {
+      const address = httpServer.address();
       const port = typeof address === 'object' && address !== null ? address.port : opts.port;
       resolve({
         port,
         close: () =>
           new Promise<void>((res) => {
             for (const client of wss.clients) client.terminate();
-            wss.close(() => res());
+            // Close the WS server first (detaches its upgrade handler), then the HTTP server.
+            wss.close(() => httpServer.close(() => res()));
           }),
       });
     });
+
+    httpServer.listen(opts.port, bindHost);
   });
+}
+
+/**
+ * handleHttp — answer a plain (non-upgrade) HTTP request. The only route is the liveness
+ * probe `GET /health` (D6 §8 seam 3): a supervisor polls it for `{state, wake_seq, turn_index}`
+ * as JSON. Everything else gets 404. When no `health` callback is wired the route is absent
+ * (404 too), preserving the prior WS-only posture. A throwing probe degrades to 500 rather
+ * than crashing the server loop. No auth: the probe is read-only liveness, no tree content.
+ */
+function handleHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  health: (() => HealthSnapshot) | undefined,
+): void {
+  // Strip any query string; we only match the path.
+  const path = (req.url ?? '').split('?')[0];
+  if (health !== undefined && req.method === 'GET' && path === '/health') {
+    try {
+      const body = JSON.stringify(health());
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(body);
+    } catch {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end('{"error":"health probe failed"}');
+    }
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end('{"error":"not found"}');
 }

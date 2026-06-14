@@ -19,3 +19,5 @@ export {
   type ConnectionInfo,
 } from './ws_transport.js';
 export { serve, type ServeOptions, type RunningServer } from './serve.js';
+export { main as serveMain, resolveServeConfig } from './bin.js';
+export { type HealthSnapshot } from './session_host.js';

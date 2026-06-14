@@ -227,11 +227,39 @@ export class AgentRuntime {
   private readonly turn_listeners = new Set<TurnListener>();
 
   /** Monotonic wake counter; feeds the deterministic TurnRecord.turn_id (no clock). */
-  private wake_seq = 0;
+  private _wake_seq = 0;
   /** Turn index within the current wake; the second half of TurnRecord.turn_id. */
-  private turn_index = 0;
+  private _turn_index = 0;
   /** The WakeEvent that opened the current wake loop (for TurnRecord.wake_event). */
   private current_wake_event: WakeEvent | null = null;
+
+  /**
+   * Dirty-latch for a wake that arrived WHILE the loop was already `running` (§8 seam 2).
+   * A re-entrant wake is no longer DROPPED: it is parked here and fired once the loop
+   * returns to idle, so an async push (e.g. an IM message landing mid-turn) is never lost.
+   * COALESCED to a single pending wake on purpose — one latch is enough to guarantee the
+   * agent re-renders and observes whatever the wake's source folded into the tree; we do
+   * NOT queue every wake unboundedly (a burst of N IM pushes ⇒ one more loop, which sees
+   * all N already-applied tree changes). The latch holds the MOST RECENT wake so the next
+   * loop's TurnRecord.wake_event reflects the freshest trigger. Cleared when consumed.
+   */
+  private pending_wake: WakeEvent | null = null;
+
+  /**
+   * wake_seq — the monotonic wake counter (read-only). Exposed for an out-of-core liveness
+   * poller (§8 seam 3): a supervisor reads `{state.kind, wake_seq, turn_index}` and treats
+   * `running` with a FROZEN wake_seq over N polls as the unambiguous wedged-turn signal
+   * (a live turn advances turn_index; a fresh wake bumps wake_seq). Telemetry only — never
+   * enters the tree or the prompt.
+   */
+  get wake_seq(): number {
+    return this._wake_seq;
+  }
+
+  /** turn_index — the current turn's index within the active wake (read-only; see wake_seq). */
+  get turn_index(): number {
+    return this._turn_index;
+  }
 
   /**
    * Set when a turn produced commands-only-violating plain text (§4.2). The
@@ -336,15 +364,19 @@ export class AgentRuntime {
     // signal for that park; we fall through into the loop either way, but never
     // start a second concurrent loop.
     if (this.state.kind === 'running') {
-      // Already mid-loop (re-entrant wake, e.g. a system agent firing). Ignore;
-      // the in-flight loop will observe tree changes on its next turn.
+      // Already mid-loop. A re-entrant wake (e.g. an async IM push landing during a
+      // turn) must NOT be dropped — that would let the agent miss the trigger and never
+      // re-render (§8 seam 2). PARK it in the dirty-latch instead; the loop fires it on
+      // return-to-idle below. Coalesced: the most-recent wake wins (one extra loop sees
+      // every already-applied tree change), so a burst can never queue unboundedly.
+      this.pending_wake = event;
       return;
     }
 
     this.state = { kind: 'running', current_event: event };
     this.current_wake_event = event;
-    this.wake_seq += 1;
-    this.turn_index = 0;
+    this._wake_seq += 1;
+    this._turn_index = 0;
 
     try {
       let turns = 0;
@@ -354,7 +386,7 @@ export class AgentRuntime {
       for (;;) {
         if (turns >= this.max_turns_per_wake) break;
         turns += 1;
-        this.turn_index = turns;
+        this._turn_index = turns;
 
         let progressed: boolean;
         try {
@@ -383,6 +415,20 @@ export class AgentRuntime {
       if (this.stateKind() === 'running') {
         this.state = { kind: 'idle' };
       }
+    }
+
+    // RE-LATCH (§8 seam 2): a wake that arrived while we were `running` was parked, not
+    // dropped. Now that we are back at idle, FIRE it so the agent observes the trigger it
+    // would otherwise have missed. We consume the latch BEFORE re-entering (so a wake that
+    // arrives during THIS re-run re-latches afresh, not into the value we are draining),
+    // and only re-enter from a clean idle — a park above already returned, so this is
+    // unreachable while parked. Recursion depth is bounded: each re-run can leave at most
+    // one new pending wake (coalesced), and it only fires while idle, so this is a tail
+    // drain of at most the wakes that genuinely overlapped running turns, not a busy loop.
+    if (this.stateKind() === 'idle' && this.pending_wake !== null) {
+      const next = this.pending_wake;
+      this.pending_wake = null;
+      await this.on_wake(next);
     }
   }
 
@@ -782,7 +828,7 @@ export class AgentRuntime {
     ended_by: TurnEndReason;
   } {
     return {
-      turn_id: `${this.wake_seq}.${this.turn_index}`,
+      turn_id: `${this._wake_seq}.${this._turn_index}`,
       spawn_depth: this.spawn_depth,
       wake_event: this.current_wake_event ?? UNKNOWN_WAKE,
       ended_by,

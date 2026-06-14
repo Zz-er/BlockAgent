@@ -34,6 +34,7 @@ import type {
   RuntimeErrorEvent,
   ThinkingEvent,
   InvokerContext,
+  AgentState,
 } from '@block-agent/core/core/types.js';
 import {
   PROTOCOL_VERSION,
@@ -392,4 +393,40 @@ export class SessionHost {
   get launched(): LaunchedAgent {
     return this.agent;
   }
+
+  /**
+   * health — the poll-able liveness/progress snapshot (D6 §8 seam 3). Returns the runtime's
+   * `{state, wake_seq, turn_index}` for a supervisor to poll: a live turn advances
+   * `turn_index`, a fresh wake bumps `wake_seq`, so `running` with a FROZEN `wake_seq` over
+   * N polls is the unambiguous wedged-turn signal that push-only (onTurn) telemetry cannot
+   * give (a wedged turn and an idle agent are both silent). Pure read of the runtime's
+   * read-only getters — zero side effects, never renders, never enters the tree (INV #1).
+   * This is the trust membrane's READ twin: it exposes no tree content, only liveness.
+   *
+   * WEDGE DETECTION IS `running`-ONLY (important for the platform poller). `state.kind` has
+   * four values; a frozen `wake_seq` only means "wedged" when `state === 'running'`. The two
+   * park states — `waiting_external` (a long off-tree builder) and `paused_for_approval` (a
+   * PolicyEngine `pending` gate) — are LEGITIMATE long-lived states in which `wake_seq` stays
+   * frozen by design; treating a frozen counter there as a wedge would false-positive on a
+   * healthy agent waiting on an external dependency or an operator approval. So the platform
+   * MUST gate its frozen-wake_seq alarm on `state === 'running'` (idle is trivially fine too).
+   */
+  health(): HealthSnapshot {
+    return {
+      state: this.agent.runtime.state.kind,
+      wake_seq: this.agent.runtime.wake_seq,
+      turn_index: this.agent.runtime.turn_index,
+    };
+  }
+}
+
+/**
+ * HealthSnapshot — the poll response shape (D6 §8 seam 3). `state` is the runtime state
+ * discriminant (idle/running/waiting_external/paused_for_approval); `wake_seq` + `turn_index`
+ * are the monotonic progress counters. Liveness only — no tree content, no per-invoker data.
+ */
+export interface HealthSnapshot {
+  state: AgentState['kind'];
+  wake_seq: number;
+  turn_index: number;
 }

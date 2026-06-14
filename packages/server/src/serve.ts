@@ -58,6 +58,9 @@ export async function serve(config: LauncherConfig, opts: ServeOptions): Promise
     port: opts.port,
     ...(opts.host !== undefined ? { host: opts.host } : {}),
     ...(opts.authenticate !== undefined ? { authenticate: opts.authenticate } : {}),
+    // Serve the §8 liveness probe (GET /health) on the same port, reading the host's
+    // runtime snapshot. Always wired — it exposes only liveness counters (no tree content).
+    health: () => host.health(),
   });
   return {
     host,
