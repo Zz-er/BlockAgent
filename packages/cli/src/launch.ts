@@ -727,8 +727,11 @@ function buildProviderOrThrow(config: LauncherConfig): ModelProvider {
       // WRITE path with no key. Checked BEFORE im_proxy (more specific): the vertical enables BOTH
       // im_proxy (the directive arrives via IM) and task_proxy (the action goes to Task), so a
       // task-directive run must select this mock, not the im-echo one. D1/D2a enable im_proxy ONLY,
-      // so they still resolve to the im-echo mock below (behavior unchanged).
-      if (config.apps.task_proxy.enabled) {
+      // so they still resolve to the im-echo mock below (behavior unchanged). EXPLICIT conjunction
+      // (im_proxy AND task_proxy): TaskCreateMock's only directive source is the im_proxy:chat
+      // block, so a task_proxy-only config (no im_proxy) has nothing to react to — it must fall
+      // through to the plain mock, not spin emptily on a missing chat source.
+      if (config.apps.im_proxy.enabled && config.apps.task_proxy.enabled) {
         return new TaskCreateMockProvider();
       }
       if (config.apps.im_proxy.enabled) {
