@@ -96,6 +96,28 @@ npm start -- --dry-run
 
 You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help` for the full list, `/apps` for the blocks). The two ways mix freely; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
 
+## Web chat (browser, optional)
+
+Besides the terminal, you can talk to the agent in a browser. It comes in two layers: a headless backend, `block-agent-serve` (it fronts the same agent over WebSocket), and a Vite + React web frontend (the chat UI). `.env` and `block-agent.config.json` are recognized **exactly as by `npm start`** (the same loader), so the DeepSeek/key you set above is reused as-is here.
+
+Open two terminals, **both from the repo root**:
+
+```bash
+# Terminal 1 — start the backend (port 4317 must match the web default)
+npm run serve -- --name web --port 4317
+# "listening on ws://127.0.0.1:4317" means it's up (it loaded .env + block-agent.config.json)
+
+# Terminal 2 — start the web frontend
+npm run web
+# Vite prints a URL like http://localhost:5173 — open it to chat
+```
+
+A few notes:
+
+- **Use `--port 4317`** — the web frontend connects to `ws://localhost:4317` by default. To use another port, set `VITE_WS_URL` when starting the web, e.g. `VITE_WS_URL=ws://localhost:7345 npm run web`.
+- Use the root script `npm run serve`, **not** `npm run serve -w @block-agent/server` — the latter runs in the package directory and won't find the repo-root `.env` / config file.
+- Loopback only: the backend stamps input as the `user` invoker unconditionally, which is only safe on `localhost`. Don't bind `0.0.0.0` until an auth layer is in place.
+
 ## Tutorial & docs
 
 To build a block of your own, start with the [BlockApp development guide](./doc/blockapp-development.md) — it begins from the project's directory layout (where `apps/` lives, which files make up a block), then walks you file by file through writing your first working block. Full usage & development docs are in [`doc/`](./doc/README.md).

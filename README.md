@@ -96,6 +96,28 @@ npm start -- --dry-run
 
 启动后是一个交互式终端：直接打字 = 给 agent 发消息；以 `/` 开头 = 命令（`/help` 看全部，`/apps` 看 Block）。两种方式可以混用，优先级 flags > 配置文件 > env > 默认。换成 Anthropic 或任意 OpenAI 兼容端点（Ollama / vLLM / 百炼）只需改 provider 与 base_url。
 
+## Web 端对话（浏览器，可选）
+
+除了终端，还可以在浏览器里和 agent 对话。它分两层：一个无界面的后端 `block-agent-serve`（把同一个 agent 用 WebSocket 暴露出来），和一个 Vite + React 的 web 前端（对话界面）。`.env` 与 `block-agent.config.json` 的识别规则与 `npm start` **完全一致**（同一套加载逻辑），所以上面配好的 DeepSeek/key 这里直接复用。
+
+开两个终端，**都在仓库根目录**跑：
+
+```bash
+# 终端 1 —— 启后端（端口 4317 要和 web 默认对上）
+npm run serve -- --name web --port 4317
+# 看到 “listening on ws://127.0.0.1:4317” 即就绪（已加载 .env + block-agent.config.json）
+
+# 终端 2 —— 启 web 前端
+npm run web
+# Vite 打印一个 http://localhost:5173 之类的地址，浏览器打开它即可对话
+```
+
+几点注意：
+
+- **必须 `--port 4317`**——web 前端默认连 `ws://localhost:4317`。想换端口就在跑 web 时设 `VITE_WS_URL`，例：`VITE_WS_URL=ws://localhost:7345 npm run web`。
+- 用根脚本 `npm run serve`，**不要**用 `npm run serve -w @block-agent/server`——后者会把工作目录切到包目录，找不到仓库根的 `.env` 与配置文件。
+- 仅限本机 loopback：后端无条件把输入按"使用者"身份盖章，只在 `localhost` 上是安全的；未加鉴权前不要绑 `0.0.0.0`。
+
 ## 教程与文档
 
 想自己拼一个 Block，从 [BlockApp 开发指南](./doc/blockapp-development.md) 开始——它从整个项目的目录结构讲起，告诉你 `apps/` 在哪、一个 Block 由哪几个文件组成，再逐个文件带你写出第一个可用的 Block。完整的使用与开发文档见 [`doc/`](./doc/README.md)。
