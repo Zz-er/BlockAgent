@@ -17,7 +17,9 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test -w @block-agent/core",
     "dev": "npm run dev -w @block-agent/core",
-    "start": "tsx packages/cli/src/main.tsx"
+    "start": "tsx packages/cli/src/main.tsx",
+    "serve": "tsx packages/server/src/bin.ts",
+    "web": "npm run dev -w web"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

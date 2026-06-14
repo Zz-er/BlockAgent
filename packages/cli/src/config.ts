@@ -135,6 +135,51 @@ function readConfigFile(path: string): Record<string, unknown> {
 }
 
 // ============================================================================
+// .env file source — populate process.env from a repo-root .env (side-effecting)
+// ============================================================================
+
+/**
+ * loadDotenv — load a `.env` file (KEY=VALUE lines) into `process.env`, OVERRIDING any
+ * pre-existing variable of the same name (file > env, matching the config precedence and the
+ * operator's intent: a project's pinned `.env` must not be silently shadowed by a stray shell
+ * var).
+ *
+ * This is the ONE side-effecting export in this module (it mutates process.env); `loadConfig`
+ * itself stays pure. Every entry point calls it ONCE at startup BEFORE `loadConfig`/`launch` —
+ * the Ink CLI (`main.tsx`) AND the headless `block-agent-serve` bin (which fronts the web
+ * inspector) — so a repo-root `.env` takes effect EVERYWHERE, not just for `npm start`. Without
+ * this, `block-agent-serve` only saw the ambient shell env and a `.env`-only key looked like a
+ * "missing key" (the web appeared to force a hard-set provider key).
+ *
+ * The API key still flows the SAME way: `launch.ts` reads `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+ * from `process.env`, which `.env` has now populated — the key is never a flag, never a config
+ * field (the KEY iron law holds). Defensive: a missing or malformed file is a no-op — startup
+ * never throws. `#` comment lines and surrounding single/double quotes are handled.
+ */
+export function loadDotenv(path = '.env'): void {
+  if (!existsSync(path)) return;
+  try {
+    for (const raw of readFileSync(path, 'utf8').split('\n')) {
+      const line = raw.replace(/\r$/, '').trim();
+      if (line.length === 0 || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      let val = line.slice(eq + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (key.length > 0) process.env[key] = val; // override (file > env)
+    }
+  } catch {
+    // A bad .env must never crash startup — fall back to the ambient environment.
+  }
+}
+
+// ============================================================================
 // Narrowing helpers (each source hands us `unknown`; pick values defensively)
 // ============================================================================
 

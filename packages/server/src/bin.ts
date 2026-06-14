@@ -21,13 +21,19 @@
  * bin never touches it; `launch()` reads `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` straight from env.
  * We MUST pass the flags through `loadConfig` (not invent our own parse) so a key can never
  * leak in via a config field.
+ *
+ * DOTENV PARITY WITH THE CLI: like the interactive CLI (`main.tsx`), `main()` calls `loadDotenv()`
+ * ONCE at startup so a repo-root `.env` populates `process.env` BEFORE `launch()` reads the key.
+ * Without it, this bin (which fronts the web inspector) only saw the ambient shell env — a key
+ * living solely in `.env` looked "missing" and the web appeared to require a hard-set key. The key
+ * still flows env-only (the iron law holds); `.env` just populates `process.env`, same as the CLI.
  */
 
 import { join } from 'node:path';
 import { argv } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
-import { loadConfig, parseFlags } from '@block-agent/cli/config.js';
+import { loadConfig, loadDotenv, parseFlags } from '@block-agent/cli/config.js';
 import type { LauncherConfig } from '@block-agent/cli/types.js';
 
 import { serve, type RunningServer } from './serve.js';
@@ -85,6 +91,10 @@ export async function main(
   argv: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
+  // Load a repo-root .env (overriding ambient vars) BEFORE resolving config, so the project's
+  // .env (provider keys, BLOCK_AGENT_*, *_SERVICE_*) takes effect for the web/serve path exactly
+  // as it does for `npm start`. Same loader the CLI uses; the key still flows env-only.
+  loadDotenv();
   const { config, name, port, host } = resolveServeConfig(argv, env);
 
   let server: RunningServer;

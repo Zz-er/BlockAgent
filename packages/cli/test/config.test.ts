@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { DEFAULTS, loadConfig, parseFlags } from '../src/config.js';
+import { DEFAULTS, loadConfig, loadDotenv, parseFlags } from '../src/config.js';
 
 /** An empty env so a stray real env var never leaks into a test's expectations. */
 const EMPTY_ENV: NodeJS.ProcessEnv = {};
@@ -148,5 +148,45 @@ describe('loadConfig config file', () => {
   it('ignores a missing config file', () => {
     const cfg = loadConfig(['--config', join(dir, 'does-not-exist.json')], EMPTY_ENV);
     expect(cfg.provider.kind).toBe(DEFAULTS.provider.kind);
+  });
+});
+
+describe('loadDotenv', () => {
+  let dir: string;
+  // Unique key names so a test's writes never collide with the real environment.
+  const K1 = '__BA_DOTENV_TEST_K1';
+  const K2 = '__BA_DOTENV_TEST_K2';
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'block-agent-dotenv-'));
+    delete process.env[K1];
+    delete process.env[K2];
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env[K1];
+    delete process.env[K2];
+  });
+
+  it('populates process.env from a .env file (KEY=VALUE, comments + quotes)', () => {
+    const file = join(dir, '.env');
+    writeFileSync(file, `# a comment\n${K1}=plain-value\n${K2}="quoted value"\n\n`, 'utf8');
+    loadDotenv(file);
+    expect(process.env[K1]).toBe('plain-value');
+    expect(process.env[K2]).toBe('quoted value'); // surrounding quotes stripped
+  });
+
+  it('OVERRIDES a pre-existing ambient env var (file > env)', () => {
+    process.env[K1] = 'from-shell';
+    const file = join(dir, '.env');
+    writeFileSync(file, `${K1}=from-dotenv`, 'utf8');
+    loadDotenv(file);
+    expect(process.env[K1]).toBe('from-dotenv');
+  });
+
+  it('is a no-op for a missing file (never throws)', () => {
+    process.env[K1] = 'untouched';
+    expect(() => loadDotenv(join(dir, 'does-not-exist'))).not.toThrow();
+    expect(process.env[K1]).toBe('untouched');
   });
 });

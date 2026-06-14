@@ -20,49 +20,11 @@
  * should drive the logic layer — launch()/makeCliChannel — directly, not the UI.)
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-
 import { render } from './ink.js';
-import { loadConfig } from './config.js';
+import { loadConfig, loadDotenv } from './config.js';
 import { launch } from './launch.js';
 import { App } from './ui/App.js';
 import { isMissingProviderKeyError, type MissingProviderKeyError } from './types.js';
-
-/**
- * loadDotenvOverride — load a `.env` file (KEY=VALUE lines) into process.env, OVERRIDING
- * any pre-existing variable of the same name.
- *
- * block-agent has no implicit dotenv, and `npm start` reads only `process.env` — so a
- * repo-root `.env` previously did nothing and the shell's ambient vars were the only
- * source. This makes `.env` actually take effect, and — consistent with the config
- * precedence (file > env) and the operator's intent — a value in `.env` WINS over an
- * ambient shell env var (so a project's pinned `.env` is not silently shadowed). The API
- * key still flows the same way (launch reads it from process.env, which `.env` has now
- * populated). Defensive: a missing or malformed file is a no-op — startup never throws.
- * `#` comment lines and surrounding single/double quotes are handled.
- */
-function loadDotenvOverride(path = '.env'): void {
-  if (!existsSync(path)) return;
-  try {
-    for (const raw of readFileSync(path, 'utf8').split('\n')) {
-      const line = raw.replace(/\r$/, '').trim();
-      if (line.length === 0 || line.startsWith('#')) continue;
-      const eq = line.indexOf('=');
-      if (eq <= 0) continue;
-      const key = line.slice(0, eq).trim();
-      let val = line.slice(eq + 1).trim();
-      if (
-        (val.startsWith('"') && val.endsWith('"')) ||
-        (val.startsWith("'") && val.endsWith("'"))
-      ) {
-        val = val.slice(1, -1);
-      }
-      if (key.length > 0) process.env[key] = val; // override (file > env)
-    }
-  } catch {
-    // A bad .env must never crash startup — fall back to the ambient environment.
-  }
-}
 
 /** A one-screen guide for the no-key case (printed to stderr, not the Ink UI). */
 function printMissingKeyHelp(err: MissingProviderKeyError): void {
@@ -114,8 +76,9 @@ function printNoTtyHelp(): void {
 async function main(): Promise<void> {
   // Load a repo-root .env (overriding ambient vars) BEFORE reading config/env, so the
   // project's .env (provider keys, LETTA_*, BLOCK_AGENT_*) actually takes effect for
-  // `npm start` and wins over a stray shell env var (file > env).
-  loadDotenvOverride();
+  // `npm start` and wins over a stray shell env var (file > env). Shared with the
+  // headless serve bin so the CLI and the web/server path behave identically.
+  loadDotenv();
   const config = loadConfig(process.argv.slice(2), process.env);
   let agent;
   try {
