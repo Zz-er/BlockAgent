@@ -193,16 +193,28 @@ export function contextAppPreview(
  * row-level join. Blocks with no owner builder (the tree root, grouping containers) are
  * skipped — they contribute no rendered content (matches the renderer, §7).
  */
-export function contextBlocks(agent: LaunchedAgent, request_id: string): ContextFrame {
+export async function contextBlocks(agent: LaunchedAgent, request_id: string): Promise<ContextFrame> {
   const snapshot = agent.operations.snapshot();
-  const blocks: BlockAttribution[] = [];
 
+  // The rendered text per block — the builder's OUTPUT, NOT the snapshot's stored
+  // `content_text` (which is empty/placeholder for builder-owned blocks). Reading raw
+  // content_text reported every card as 0 bytes; render_blocks runs the same build pass the
+  // prompt does, so the sidebar's per-block sizes match what the model actually sees. A
+  // renderer without render_blocks (a test double) degrades to the raw-content fallback.
+  const renderedText = new Map<string, string>();
+  if (agent.renderer.render_blocks) {
+    for (const rb of await agent.renderer.render_blocks(snapshot)) renderedText.set(rb.name, rb.text);
+  }
+
+  const blocks: BlockAttribution[] = [];
   const walk = (block: Readonly<Block>): void => {
     const builder = agent.registry.resolve_builder(block.name);
     // Only attribute blocks an app builder owns (the cards the inspector draws). The
     // root + structural containers have no builder and render nothing.
     if (builder !== null) {
-      const text = block.content_text ?? '';
+      // Prefer the rendered text; fall back to the raw stored content if the builder
+      // rendered nothing this snapshot (or render_blocks is unavailable).
+      const text = renderedText.get(block.name) ?? block.content_text ?? '';
       blocks.push({
         name: block.name,
         app_id: builder.app_id ?? null,
@@ -240,33 +252,42 @@ export function contextBlocks(agent: LaunchedAgent, request_id: string): Context
  * absent from the snapshot (so the client can drop a stale card). `text` is content only —
  * no metadata (INV #2). Read-only: walks the frozen snapshot, never mutates, INV #1 intact.
  */
-export function contextBlock(
+export async function contextBlock(
   agent: LaunchedAgent,
   request_id: string,
   block_name: string | undefined,
-): ContextFrame {
-  let found: Readonly<Block> | null = null;
+): Promise<ContextFrame> {
+  // Resolve the block's RENDERED text (builder output) so this body — and its content_hash
+  // — match what the `blocks` layer reported for the same name (the cache-key contract). The
+  // raw snapshot content_text is empty for builder-owned blocks, so hashing it would mismatch
+  // the sidebar and break body caching. Fall back to raw content if render_blocks is absent.
+  let text: string | null = null;
   if (block_name !== undefined) {
-    const snapshot = agent.operations.snapshot();
-    const walk = (block: Readonly<Block>): void => {
-      if (found !== null) return;
-      if (block.name === block_name) {
-        found = block;
-        return;
-      }
-      for (const child of block.children) walk(child);
-    };
-    walk(snapshot.root);
+    if (agent.renderer.render_blocks) {
+      const rb = (await agent.renderer.render_blocks(agent.operations.snapshot())).find(
+        (b) => b.name === block_name,
+      );
+      if (rb) text = rb.text;
+    }
+    if (text === null) {
+      // Not produced by render_blocks (no builder / rendered nothing / no render_blocks):
+      // fall back to the raw stored content if the block exists, else null (drop the card).
+      const snapshot = agent.operations.snapshot();
+      let found: Readonly<Block> | null = null;
+      const walk = (block: Readonly<Block>): void => {
+        if (found !== null) return;
+        if (block.name === block_name) found = block;
+        else for (const child of block.children) walk(child);
+      };
+      walk(snapshot.root);
+      text = found !== null ? ((found as Readonly<Block>).content_text ?? '') : null;
+    }
   }
 
   const body: BlockBody =
-    found === null
+    text === null
       ? { name: block_name ?? '', content_hash: contentHash(''), text: null }
-      : {
-          name: (found as Readonly<Block>).name,
-          content_hash: contentHash((found as Readonly<Block>).content_text ?? ''),
-          text: (found as Readonly<Block>).content_text ?? '',
-        };
+      : { name: block_name ?? '', content_hash: contentHash(text), text };
 
   return {
     kind: 'context',

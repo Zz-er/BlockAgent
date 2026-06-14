@@ -192,6 +192,12 @@ export function useSession(): SessionApi {
         case 'thinking':
           setThinking((t) => [...t, { id: nextId(), text: frame.text, spawn_depth: frame.spawn_depth }]);
           break;
+        case 'reply':
+          // The agent's conversational turn (MessagesApp.onReply). Append to the chat as the
+          // 'agent' role so it renders alongside the user's messages (the optimistic user echo
+          // is added in submit()). This is the only place agent replies enter the chat stream.
+          setChat((c) => [...c, { id: nextId(), role: 'agent', text: frame.content }]);
+          break;
         case 'error':
           setErrors((e) => [...e, { id: nextId(), message: frame.message, phase: frame.phase }]);
           break;

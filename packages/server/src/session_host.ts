@@ -46,6 +46,7 @@ import {
   type ContextFrame,
   type ContextDiffFrame,
   type ErrorFrame,
+  type ReplyFrame,
   type ThinkingFrame,
   type TurnFrame,
 } from '@block-agent/protocol/index.js';
@@ -140,6 +141,24 @@ export class SessionHost {
       agent.runtime.onError((e: RuntimeErrorEvent) => this.broadcast(this.toErrorFrame(e))),
       agent.runtime.onTurn((record: TurnRecord) => this.onTurnRecord(record)),
     );
+
+    // The agent's reply stream (the SAME push channel the CLI subscribes to: cli-design §6).
+    // Each `messages.reply` durably recorded → a `reply` frame so the chat shows the agent's
+    // turn (the `turn`/`context` frames carry telemetry + block bytes, never the reply text).
+    // `messages` is null when the messages app was disabled — then there are no replies to push.
+    if (agent.messages !== null) {
+      this.unsubscribers.push(
+        agent.messages.onReply((e) =>
+          this.broadcast({
+            kind: 'reply',
+            v: PROTOCOL_VERSION,
+            id: e.id,
+            content: e.content,
+            ...(e.reply_to !== undefined ? { reply_to: e.reply_to } : {}),
+          } satisfies ReplyFrame),
+        ),
+      );
+    }
   }
 
   // ── Subscription (transport registers its outbound sink) ──────────────────

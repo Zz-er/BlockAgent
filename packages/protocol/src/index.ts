@@ -386,12 +386,27 @@ export interface AttachResultFrame extends Envelope {
 }
 
 /**
+ * `reply` — one agent reply, pushed when `messages.reply` durably records it (the
+ * MessagesApp.onReply channel — the SAME seam the CLI uses to display replies, cli-design
+ * §6). This is the assistant's conversational turn; thin clients render it in the chat
+ * stream. Distinct from `turn` (per-turn telemetry) and `thinking` (opaque UI-only stream).
+ * Carries the just-assigned reply id, the content, and the optional `reply_to`.
+ */
+export interface ReplyFrame extends Envelope {
+  kind: 'reply';
+  id: string;
+  content: string;
+  reply_to?: string;
+}
+
+/**
  * OutboundFrame — the discriminated union of everything the server may send, keyed by
  * `kind`. Every member is a read-only projection: emitting one never mutates the tree or
  * runtime state.
  */
 export type OutboundFrame =
   | ThinkingFrame
+  | ReplyFrame
   | ErrorFrame
   | TurnFrame
   | ContextFrame
@@ -415,6 +430,7 @@ export type OutboundKind = OutboundFrame['kind'];
  */
 export const V0_EMITS: readonly OutboundKind[] = [
   'thinking',
+  'reply',
   'error',
   'turn',
   'context',

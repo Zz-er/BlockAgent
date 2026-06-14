@@ -536,4 +536,25 @@ export interface Operations {
  */
 export interface Renderer {
   render(snapshot: BlockSnapshot): Promise<RenderedPrompt>;
+  /**
+   * Per-block rendered projection (optional, for inspectors). Runs each block's owner
+   * builder the SAME way `render` does, but returns the per-block rendered text + tier
+   * instead of joining into tier segments — so a UI can show per-block sizes that actually
+   * match the prompt. Reading the snapshot's raw `content_text` is NOT equivalent: for a
+   * builder-owned block the rendered text is the builder's OUTPUT, not the stored content
+   * (which is empty/placeholder). Optional so non-render test doubles need not implement it.
+   */
+  render_blocks?(snapshot: BlockSnapshot): Promise<RenderedBlock[]>;
+}
+
+/**
+ * RenderedBlock — one block's rendered projection (name + tier + the builder-produced
+ * text), the per-block granularity behind `Renderer.render_blocks`. `text` is the SAME
+ * string that feeds the tier segment for this block, so summing a tier's RenderedBlock
+ * byte-lengths reconstructs (modulo the newline joins) that tier's rendered bytes.
+ */
+export interface RenderedBlock {
+  readonly name: BlockName;
+  readonly tier: CacheTier;
+  readonly text: string;
 }

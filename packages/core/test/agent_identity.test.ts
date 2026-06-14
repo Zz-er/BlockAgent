@@ -216,6 +216,22 @@ describe('agent_identity end-to-end (registry + renderer)', () => {
     expect(reg.tier_of(BLOCK_IDENTITY)).toBe('stable');
   });
 
+  it('render_blocks returns the BUILDER-produced text, not the empty seeded content_text', async () => {
+    const { renderer, tree } = setup();
+    // The seeded block carries content_text:'' (a placeholder); the real text is the builder's
+    // OUTPUT. render_blocks must return the rendered text (what an inspector should size), NOT
+    // the empty stored content — this is exactly the per-block bug the web sidebar hit.
+    const seedText = identityPlaceholder().content_text;
+    expect(seedText).toBe(''); // placeholder is empty in the tree
+    const blocks = await renderer.render_blocks!(tree.snapshot());
+    const identity = blocks.find((b) => b.name === BLOCK_IDENTITY)!;
+    expect(identity).toBeTruthy();
+    expect(identity.tier).toBe('stable');
+    expect(identity.text.length).toBeGreaterThan(0); // rendered, not the empty seed
+    expect(identity.text).toContain(SAMPLE.role);
+    expect(identity.text).toContain(SAMPLE.instructions);
+  });
+
   it('is byte-identical across two renders of the same snapshot (INV #1)', async () => {
     const { renderer, tree } = setup();
     const snap = tree.snapshot();

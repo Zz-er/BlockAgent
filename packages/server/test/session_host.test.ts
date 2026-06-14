@@ -94,6 +94,24 @@ describe('SessionHost — submit', () => {
     conn.close();
     host.close();
   });
+
+  it('emits a reply frame carrying the agent reply content (MessagesApp.onReply seam)', async () => {
+    const { host } = await makeHost();
+    const { sink, ofKind } = collectingSink();
+    const conn = connectInProcess(host, sink);
+
+    await conn.send({ kind: 'submit', v: '0', text: 'hello agent' });
+
+    // The agent's reply must reach the chat stream as a `reply` frame (not only as a `turn`
+    // telemetry frame). Without this the web chat shows only the user's own messages.
+    const replies = ofKind('reply');
+    expect(replies.length).toBeGreaterThanOrEqual(1);
+    expect(typeof replies[0]!.id).toBe('string');
+    expect(replies[0]!.content.length).toBeGreaterThan(0);
+
+    conn.close();
+    host.close();
+  });
 });
 
 describe('SessionHost — query is read-only', () => {
@@ -142,6 +160,9 @@ describe('SessionHost — query is read-only', () => {
     const identity = blocks?.blocks?.find((b) => b.name.startsWith('agent_identity:'));
     expect(identity?.app_id).toBe('agent_identity');
     expect(identity?.tier).toBeTruthy();
+    // bytes must be the RENDERED size (builder output), not the snapshot's empty stored
+    // content_text. A regression to raw content_text reports 0 here (the "all 0B" bug).
+    expect(identity?.bytes).toBeGreaterThan(0);
 
     conn.close();
     host.close();
@@ -166,6 +187,9 @@ describe('SessionHost — query is read-only', () => {
     expect(bodyFrame.block?.name).toBe(row.name);
     expect(bodyFrame.block?.content_hash).toBe(row.content_hash);
     expect(typeof bodyFrame.block?.text).toBe('string');
+    // The body is the RENDERED text (builder output), so it is non-empty for a seeded block —
+    // and its hash matches the blocks-layer row's hash (both hash the rendered text).
+    expect((bodyFrame.block?.text ?? '').length).toBeGreaterThan(0);
 
     conn.close();
     host.close();

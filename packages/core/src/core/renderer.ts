@@ -30,6 +30,7 @@ import type {
   BlockSnapshot,
   CacheTier,
   ContentPart,
+  RenderedBlock,
   RenderedPrompt,
   Renderer as RendererContract,
 } from './types.js';
@@ -150,6 +151,29 @@ export class Renderer implements RendererContract {
 
     const snapshot_hash = this.computeSnapshotHash(snapshot, segment_hashes);
     return { segments, snapshot_hash, segment_hashes };
+  }
+
+  /**
+   * render_blocks — the per-block projection behind the inspector's sidebar. Runs the
+   * EXACT same collect → classifyAndBuild path as `render` (so each block's text is the
+   * builder's authoritative output, not the snapshot's empty stored `content_text`), but
+   * returns one `{name, tier, text}` per rendered block instead of joining into tier
+   * segments. A block whose builder returns null / renders nothing is omitted (it
+   * contributes no prompt bytes), matching `render`. Pure + deterministic (INV #1).
+   */
+  async render_blocks(snapshot: BlockSnapshot): Promise<RenderedBlock[]> {
+    const collected = new Map<BlockName, Readonly<Block>>();
+    this.collect(snapshot.root, collected);
+    const names = [...collected.keys()].sort();
+    const classified = await Promise.all(
+      names.map((name) => this.classifyAndBuild(name, collected.get(name)!, snapshot)),
+    );
+    const out: RenderedBlock[] = [];
+    for (const item of classified) {
+      if (item === null) continue;
+      out.push({ name: item.name, tier: item.tier, text: this.blockText(item.block) });
+    }
+    return out;
   }
 
   // --------------------------------------------------------------------------
