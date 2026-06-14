@@ -151,8 +151,12 @@ export interface MemoryLettaConfig {
  * the connection is configured by ENV, read inside each proxy's client uniformly — the
  * endpoint `IM_SERVICE_URL` / `OA_SERVICE_URL` / `TASK_SERVICE_URL` and the bearer token
  * `IM_SERVICE_TOKEN` / `OA_SERVICE_TOKEN` / `TASK_SERVICE_TOKEN` (the token is env-ONLY, the
- * ANTHROPIC_API_KEY rule — never config/flag/log). Unconfigured → the proxy degrades to an
- * empty projection. (The Phase D platform console injects per-instance env per process.)
+ * ANTHROPIC_API_KEY rule — never config/flag/log). `task_proxy` needs a THIRD required var,
+ * `TASK_SERVICE_SELF` = this agent's OA principal_id (for `task.claim` self-assign + the `mine`
+ * block filter); if URL/TOKEN/SELF is incomplete, task_proxy degrades to a READ-ONLY shell
+ * (no net commands) SILENTLY — so a per-instance env set that enables task_proxy must set all
+ * three. Unconfigured → the proxy degrades to an empty projection (never throws). (The Phase D
+ * platform console injects the per-instance env per process.)
  */
 export interface ServiceProxyConfig {
   enabled: boolean;
