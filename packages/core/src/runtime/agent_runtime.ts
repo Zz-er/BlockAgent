@@ -101,6 +101,17 @@ export interface AgentRuntimeOptions {
   /** Hard cap on turns within one wake, to bound a runaway tool-call loop. */
   max_turns_per_wake?: number;
   /**
+   * Idle deadline (ms) for a provider send: if the stream yields NO chunk for this
+   * long (a hung/half-open socket — stalled time-to-first-token or a mid-stream stall),
+   * the send is ABORTED via SendOpts.signal. The abort surfaces as a normal send failure
+   * (the catch in runTurn), so the agent self-heals and stays wake-responsive instead of
+   * wedging FOREVER in `running` (and then silently dropping every later wake). The timer
+   * RE-ARMS on every chunk, so a long-but-streaming generation is never cut off — it
+   * bounds a STALL, not total generation time. A non-positive value DISABLES the timeout
+   * (e.g. for a scripted/mock provider that completes synchronously).
+   */
+  send_timeout_ms?: number;
+  /**
    * The agent-invokable commands to advertise to the provider as `SendOpts.tools`
    * each turn (native tool dispatch, §4.2 / §11.1). For a native-tool-dispatch model
    * (Anthropic / OpenAI / DeepSeek) this is the ONLY way it learns which commands
@@ -157,6 +168,26 @@ export const COMMANDS_ONLY_FEEDBACK_TEXT =
 const DEFAULT_MAX_TURNS_PER_WAKE = 16;
 
 /**
+ * Default idle deadline for a provider send (ms): abort if the stream goes this long
+ * with no chunk. Generous enough for time-to-first-token on a reasoning model, short
+ * enough to detect a hung socket before it wedges the runtime in `running` forever.
+ * Re-armed per chunk, so it bounds STALLS between chunks, not total generation time.
+ */
+const DEFAULT_SEND_TIMEOUT_MS = 120_000;
+
+/**
+ * Abort reason for a provider send that stalled past the idle deadline. It surfaces as a
+ * normal send failure in runTurn (emitError 'send' + a send_error TurnRecord + return to
+ * idle), so the agent SELF-HEALS and stays wake-responsive rather than wedging forever.
+ */
+class ProviderSendTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`provider send timed out after ${ms}ms with no stream activity`);
+    this.name = 'ProviderSendTimeoutError';
+  }
+}
+
+/**
  * Per-provider deadline for a consume-refresh pull (UH-2 §3.7). A slow/hung provider
  * (e.g. a cross-process sandboxed app whose pull degenerates to a sync RPC) must not
  * hijack the snapshot: each provider query is raced against this deadline, and a
@@ -182,6 +213,7 @@ export class AgentRuntime {
   /** Registry handle (R-5): registerSystemBuilder for B1 + future get_app_context. */
   private readonly registry: BuilderRegistry;
   private readonly max_turns_per_wake: number;
+  private readonly send_timeout_ms: number;
   private readonly root_name: BlockName;
   private readonly tool_catalog: (() => ToolCatalog) | undefined;
 
@@ -227,6 +259,7 @@ export class AgentRuntime {
     this.registry = opts.registry;
     this.spawn_depth = opts.spawn_depth ?? 0;
     this.max_turns_per_wake = opts.max_turns_per_wake ?? DEFAULT_MAX_TURNS_PER_WAKE;
+    this.send_timeout_ms = opts.send_timeout_ms ?? DEFAULT_SEND_TIMEOUT_MS;
     this.root_name = opts.root_name ?? DEFAULT_ROOT_NAME;
     this.tool_catalog = opts.tool_catalog;
 
@@ -389,13 +422,35 @@ export class AgentRuntime {
     //    stream) is NOT a command refusal — it aborts the whole turn. We surface it on
     //    the error channel and end the turn (no progress) instead of throwing, so the
     //    caller who submitted a message gets a failure signal rather than silence.
+    //    A hung/half-open stream (no bytes, no FIN) would otherwise block HERE forever,
+    //    pinning the runtime in `running` and silently dropping every later wake. We arm
+    //    an idle deadline that ABORTS the send (via SendOpts.signal) after send_timeout_ms
+    //    of no chunk; the abort surfaces as a send failure below, so the agent self-heals.
+    //    The timer re-arms on every chunk (collect's onChunk), so only a STALL aborts.
     let response: ProviderResponse;
+    const sendAbort = new AbortController();
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const armIdle =
+      this.send_timeout_ms > 0
+        ? (): void => {
+            if (idleTimer !== null) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+              sendAbort.abort(new ProviderSendTimeoutError(this.send_timeout_ms));
+            }, this.send_timeout_ms);
+          }
+        : null;
     try {
-      response = await this.collect(this.provider.send(prompt, this.buildSendOpts()));
+      armIdle?.(); // covers time-to-first-token
+      response = await this.collect(
+        this.provider.send(prompt, this.buildSendOpts(sendAbort.signal)),
+        armIdle,
+      );
     } catch (err) {
       this.emitError(err, 'send');
       this.emitTurn({ ...this.turnEnvelope('send_error'), ...telemetry });
       return false;
+    } finally {
+      if (idleTimer !== null) clearTimeout(idleTimer);
     }
 
     // 3) Extract via the provider's thinking adapter. This is the seam that
@@ -916,17 +971,28 @@ export class AgentRuntime {
    * empty array), which `exactOptionalPropertyTypes` requires and which keeps the
    * request identical to the old no-tools behavior for scripted providers.
    */
-  private buildSendOpts(): SendOpts {
+  private buildSendOpts(signal?: AbortSignal): SendOpts {
     const tools = this.tool_catalog?.();
-    return tools && tools.length > 0 ? { tools } : {};
+    const opts: SendOpts = {};
+    if (tools && tools.length > 0) opts.tools = tools;
+    if (signal) opts.signal = signal;
+    return opts;
   }
 
-  /** Accumulate a provider stream into one ProviderResponse for the adapter. */
-  private async collect(stream: AsyncIterable<ProviderChunk>): Promise<ProviderResponse> {
+  /**
+   * Accumulate a provider stream into one ProviderResponse for the adapter. `onChunk`
+   * (the runtime's idle-timeout re-arm, §send-timeout) fires on EVERY chunk, so the send
+   * deadline bounds a STALL between chunks, never a long-but-streaming generation.
+   */
+  private async collect(
+    stream: AsyncIterable<ProviderChunk>,
+    onChunk?: (() => void) | null,
+  ): Promise<ProviderResponse> {
     let done: ProviderResponse | null = null;
     let input_tokens: number | undefined;
     let output_tokens: number | undefined;
     for await (const chunk of stream) {
+      onChunk?.();
       switch (chunk.kind) {
         case 'done':
           done = chunk.response;
