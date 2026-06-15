@@ -25,7 +25,11 @@ import type {
   Block,
   BlockName,
   CacheTier,
+  CommandEvent,
+  CommandListener,
   ContentPart,
+  InputDescriptor,
+  InputListener,
   InvokerContext,
   Operations,
   Renderer,
@@ -143,18 +147,8 @@ export interface AgentRuntimeOptions {
 /** The block name the runtime writes commands-only rejection feedback to (§4.2). */
 export const COMMANDS_ONLY_FEEDBACK_BLOCK: BlockName = 'runtime:commands_only_feedback';
 
-/** The block name the runtime projects recent command failures into (§8.1). */
-export const COMMAND_ERROR_BLOCK: BlockName = 'runtime:command_error';
-
 /** Default root block name (matches the empty-tree boot in core/block.ts). */
 const DEFAULT_ROOT_NAME: BlockName = 'root:root';
-
-/**
- * Upper bound on the command-error ring the runtime keeps (CM-6, INV #16). Older
- * failures fall off the front so `recent_errors` never grows unbounded; the
- * `runtime:command_error` projection renders them oldest→newest deterministically.
- */
-const MAX_RECENT_COMMAND_ERRORS = 8;
 
 /**
  * The exact feedback text written when an agent emits disallowed plain text (§4.2).
@@ -233,6 +227,20 @@ export class AgentRuntime {
   /** UI subscribers on the tool-call channel (one event per agent command invoked). */
   private readonly tool_call_listeners = new Set<ToolCallListener>();
 
+  /**
+   * Subscribers on the command channel (actions §2.1): one CommandEvent per agent
+   * command — WITH content (args + result/error). Unlike tool_call_listeners (name+ok
+   * only), this feeds an out-of-core sink (the `actions` ledger) the action↔observation
+   * pair. Fed ONLY from the agent lane (invokeCommand); never fires for invoker:'app'.
+   */
+  private readonly command_listeners = new Set<CommandListener>();
+
+  /**
+   * Subscribers on the input channel (actions §2.1): one InputDescriptor per external
+   * input an app reports via `ctx.report_input`. Pure telemetry, like the others.
+   */
+  private readonly input_listeners = new Set<InputListener>();
+
   /** Monotonic wake counter; feeds the deterministic TurnRecord.turn_id (no clock). */
   private _wake_seq = 0;
   /** Turn index within the current wake; the second half of TurnRecord.turn_id. */
@@ -277,16 +285,6 @@ export class AgentRuntime {
    */
   private pending_feedback: string | null = null;
 
-  /**
-   * Recent non-policy command failures, oldest→newest, bounded to
-   * `MAX_RECENT_COMMAND_ERRORS` (CM-6). The command-error system builder (B1)
-   * projects these into a SINGLE `runtime:command_error` block; like
-   * `pending_feedback` they are state, never written to the tree directly. `id` is
-   * the failing tool_call id (kept for de-dup/debuggability); `text` is the rendered
-   * line. Replaces the old per-id `runtime:command_error.<id>` tree blocks.
-   */
-  private readonly recent_errors: { id: string; text: string }[] = [];
-
   constructor(opts: AgentRuntimeOptions) {
     this.ops = opts.operations;
     this.renderer = opts.renderer;
@@ -298,15 +296,15 @@ export class AgentRuntime {
     this.root_name = opts.root_name ?? DEFAULT_ROOT_NAME;
     this.tool_catalog = opts.tool_catalog;
 
-    // B1 (CM-5): register the runtime's two bookkeeping system builders AFTER all
-    // state fields exist (the builders close over `this.pending_feedback` /
-    // `this.recent_errors`). They belong to no installed App, so they go through the
-    // registry's `registerSystemBuilder` seam (F3: the registry stays the single
-    // owner of builder ownership). Once registered, `seedProjectionBlocks` will seed
-    // their output names and the Renderer projects live runtime state each turn —
-    // no runtime block is ever written to the tree directly.
+    // B1 (CM-5): register the runtime's commands-only feedback system builder AFTER all
+    // state fields exist (it closes over `this.pending_feedback`). It belongs to no
+    // installed App, so it goes through the registry's `registerSystemBuilder` seam (F3:
+    // the registry stays the single owner of builder ownership). Once registered,
+    // `seedProjectionBlocks` will seed its output name and the Renderer projects live
+    // runtime state each turn — no runtime block is ever written to the tree directly.
+    // (The command-error builder was removed: command failures now flow out the
+    // `onCommand` channel to the `actions` ledger, not into a runtime block — actions §2.4.)
     this.registry.registerSystemBuilder(this.makeFeedbackBuilder());
-    this.registry.registerSystemBuilder(this.makeCommandErrorBuilder());
   }
 
   /**
@@ -366,6 +364,32 @@ export class AgentRuntime {
   onToolCall(listener: ToolCallListener): () => void {
     this.tool_call_listeners.add(listener);
     return () => this.tool_call_listeners.delete(listener);
+  }
+
+  /**
+   * onCommand — subscribe to the command channel: one CommandEvent per agent command run
+   * this turn, WITH content (full args + result on success / error on failure). The seam an
+   * out-of-core sink (the `actions` ledger) reads to record the action↔observation pair the
+   * agent never otherwise sees. Symmetric to onToolCall; the returned thunk unsubscribes.
+   *
+   * Fires ONLY in the agent lane (invokeCommand) — user/app commands reach the tree via
+   * Operations.invoke_command directly and never surface here, so `actions.record`
+   * (invoker:'app') produces zero CommandEvents (no recursion). INV #13: it feeds an
+   * app-side sink, never the prompt.
+   */
+  onCommand(listener: CommandListener): () => void {
+    this.command_listeners.add(listener);
+    return () => this.command_listeners.delete(listener);
+  }
+
+  /**
+   * onInput — subscribe to the input channel: one InputDescriptor per external input an app
+   * reports via `ctx.report_input`. The boot connects this to `actions.record(kind:'input')`.
+   * Pure telemetry, symmetric to onToolCall; the returned thunk unsubscribes.
+   */
+  onInput(listener: InputListener): () => void {
+    this.input_listeners.add(listener);
+    return () => this.input_listeners.delete(listener);
   }
 
   /**
@@ -811,6 +835,44 @@ export class AgentRuntime {
   }
 
   /**
+   * emitCommand — publish one agent CommandEvent (name + args + result/error) to the command
+   * channel (actions §2.1). Fire-and-forget + listener-isolated like emitToolCall; carries
+   * the command CONTENT (unlike emitToolCall) for an out-of-core ledger sink — INV #13 holds
+   * because it never writes the tree and is never re-scanned for commands. No-op when nobody
+   * is subscribed. Called ONLY from the agent lane (invokeCommand, success :950 / failure
+   * :964) — NEVER from operations.ts (the universal chokepoint would loop on every
+   * invoker:'app' actions.record).
+   */
+  private emitCommand(event: CommandEvent): void {
+    if (this.command_listeners.size === 0) return;
+    for (const listener of this.command_listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A faulty subscriber never breaks the turn loop (fire-and-forget).
+      }
+    }
+  }
+
+  /**
+   * emitInput — publish one external-input InputDescriptor to the input channel (actions
+   * §2.1). PUBLIC (unlike the other emit*): it is driven from OUTSIDE the turn loop — the
+   * boot wires `registry.inputHook = (d) => runtime.emitInput(d)`, so an app's
+   * `ctx.report_input` reaches the channel. Fire-and-forget + listener-isolated; pure
+   * telemetry (never the tree, never the prompt). No-op when nobody is subscribed.
+   */
+  emitInput(d: InputDescriptor): void {
+    if (this.input_listeners.size === 0) return;
+    for (const listener of this.input_listeners) {
+      try {
+        listener(d);
+      } catch {
+        // A faulty subscriber never breaks the turn loop (fire-and-forget).
+      }
+    }
+  }
+
+  /**
    * emitError — publish a failed-turn event to the error channel. Like emitThoughts
    * it is fire-and-forget: each listener is isolated in try/catch so a faulty
    * subscriber never breaks the (already failing) turn. Normalizes the thrown value
@@ -948,6 +1010,20 @@ export class AgentRuntime {
       // Any OTHER executed command (memory.write, task.add, a denied command…) → surface it
       // to the tool-call channel for a UI to group under the turn (name + ok, never args).
       this.emitToolCall(call.name, res.ok);
+      // SUCCESS site (actions §2.1): publish the full action↔observation pair to the command
+      // channel for the `actions` ledger — args + result (CommandResult.data), no error. This
+      // is the signal the agent never otherwise sees (its own success). end_turn/parked
+      // already returned above, so they never reach here. `invoker` is always 'agent' (the
+      // agent lane); a denied command (res.ok:false, no throw) emits too, with no result.
+      this.emitCommand({
+        name: call.name,
+        args: call.args,
+        ok: res.ok,
+        ...(res.ok ? { result: res.data, ...refOf(res.data) } : {}),
+        ...(res.ok ? {} : { error: res.error }),
+        invoker: 'agent',
+        spawn_depth: this.spawn_depth,
+      });
       // Otherwise a deny/failed command is not fatal: Operations already recorded
       // the refusal as the CommandResult; the owning App's block (or the result's
       // own error surfaced to the agent next turn) reflects it. Nothing to do here
@@ -959,10 +1035,19 @@ export class AgentRuntime {
         this.state = { kind: 'paused_for_approval', gateway_token: token };
         return 'parked';
       }
-      // Non-policy error: surface the failed call to the UI channel (ok:false), then record
-      // it so the agent sees it next turn (§8.1).
+      // FAILURE site (actions §2.1): surface the failed call to the UI channel (ok:false), then
+      // publish it to the command channel (ok:false + error, no result) so the `actions` ledger
+      // records the failure — replacing the removed `runtime:command_error` block (§2.4). Only
+      // `err` is in scope here; normalize it the way recordCommandError did.
       this.emitToolCall(call.name, false);
-      await this.recordCommandError(call, err);
+      this.emitCommand({
+        name: call.name,
+        args: call.args,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        invoker: 'agent',
+        spawn_depth: this.spawn_depth,
+      });
       return 'done';
     }
   }
@@ -981,25 +1066,6 @@ export class AgentRuntime {
    */
   private async writeCommandsOnlyFeedback(): Promise<void> {
     this.pending_feedback = COMMANDS_ONLY_FEEDBACK_TEXT;
-  }
-
-  /**
-   * recordCommandError — record a non-policy command failure (§8.1). B1: pushes a
-   * line onto the bounded `recent_errors` ring (oldest evicted past
-   * `MAX_RECENT_COMMAND_ERRORS`, CM-6) instead of writing a per-id tree block. The
-   * command-error system builder projects the ring into the single
-   * `runtime:command_error` block next render, so the agent reads its recent failures.
-   */
-  private async recordCommandError(call: ToolCall, err: unknown): Promise<void> {
-    const message = err instanceof Error ? err.message : String(err);
-    this.recent_errors.push({
-      id: call.id,
-      text: `command ${call.name} failed: ${message}`,
-    });
-    // Bound the ring: drop the oldest entries so it never grows without limit.
-    while (this.recent_errors.length > MAX_RECENT_COMMAND_ERRORS) {
-      this.recent_errors.shift();
-    }
   }
 
   // --------------------------------------------------------------------------
@@ -1027,29 +1093,6 @@ export class AgentRuntime {
         this.pending_feedback === null
           ? null
           : projectionBlock(ctx, COMMANDS_ONLY_FEEDBACK_BLOCK, this.pending_feedback),
-    };
-  }
-
-  /**
-   * makeCommandErrorBuilder — the `runtime:command_error` system builder (B1). A
-   * closure over this runtime: each render it projects the bounded `recent_errors`
-   * ring (oldest→newest, CM-6 ordering) into ONE block, or returns `null` when there
-   * are no errors. Same discipline as the feedback builder (system owner, volatile,
-   * deterministic). Replaces the old per-id `runtime:command_error.<id>` blocks.
-   */
-  private makeCommandErrorBuilder(): BuilderManifest {
-    return {
-      name: 'runtime.command_error',
-      version: '1.0.0',
-      owner: 'system',
-      inputs: [],
-      outputs: [COMMAND_ERROR_BLOCK],
-      cache_tier: 'volatile',
-      build: async (ctx: BuildContext): Promise<Block | null> => {
-        if (this.recent_errors.length === 0) return null;
-        const text = this.recent_errors.map((e) => e.text).join('\n');
-        return projectionBlock(ctx, COMMAND_ERROR_BLOCK, text);
-      },
     };
   }
 
@@ -1225,4 +1268,23 @@ function pendingTokenOf(res: CommandResult): string | null {
     if (d.policy === 'pending' && typeof d.token === 'string') return d.token;
   }
   return null;
+}
+
+/**
+ * refOf — best-effort dig of a target id out of a CommandResult.data for the CommandEvent
+ * `ref` (actions §2.1). Nothing in CommandResult is a STRUCTURED target id, so this is a
+ * pure heuristic: a top-level string `id` / `ref` / `block` on a plain-object data. Absent
+ * (no object, no recognized key) → `{}`, so the row degrades to `verb → ok` (still the
+ * "I did this, it worked" signal). Returned as a spreadable partial so the call site stays
+ * one expression and never sets `ref: undefined` (exactOptionalPropertyTypes-clean).
+ */
+function refOf(data: unknown): { ref?: string } {
+  if (data && typeof data === 'object') {
+    const d = data as Record<string, unknown>;
+    for (const key of ['ref', 'id', 'block'] as const) {
+      const v = d[key];
+      if (typeof v === 'string' && v.length > 0) return { ref: v };
+    }
+  }
+  return {};
 }

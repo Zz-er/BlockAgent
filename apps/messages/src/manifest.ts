@@ -109,6 +109,13 @@ const DEFAULT_SUMMARIZE: Summarizer = (folded, priorSummary) => {
   return priorSummary.length === 0 ? note : `${priorSummary}\n${note}`;
 };
 
+/**
+ * Hard cap for the one-line `preview` reported to the `actions` ledger (§3.3). The app's
+ * own `input_char_limit` governs how that preview RENDERS; this is just a sane short form
+ * carried in the descriptor (the full body travels in `content`).
+ */
+const INPUT_PREVIEW_MAX = 80;
+
 /** Collapse to a single line and hard-cap length (deterministic; for the placeholder). */
 function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
@@ -1032,6 +1039,20 @@ export class MessagesApp {
       ref: input.id,
     };
     ctx.wake?.(event);
+    // (4) report this external input into the `actions` ledger (actions-app §3.3). Generic
+    // seam — messages does not know `actions` exists; the boot connects onInput → actions.record.
+    // Guarded with `?.` like `wake` (inert if no runtime is wired). `ts` is stamped here at the
+    // ingest boundary (clock legal — this is a handler, not a builder, so INV #16 is not engaged;
+    // the pure render builder only READS the stored string). `preview` is a one-line hard-capped
+    // short form (body still lives verbatim in `messages:recent`, so default render shows no dup);
+    // `content` carries the full body for actions' input_detail=3 + jsonl audit.
+    ctx.report_input?.({
+      source: 'messages',
+      sender: input.from ?? 'user',
+      ts: new Date().toISOString(),
+      preview: oneLine(input.content, INPUT_PREVIEW_MAX),
+      content: input.content,
+    });
     return event;
   }
 }

@@ -24,6 +24,7 @@ import type {
   BlockOp,
   BlockView,
   CacheTier,
+  InputDescriptor,
   InvokerContext,
   WakeEvent,
 } from '../core/types.js';
@@ -1105,10 +1106,10 @@ export class AppRegistry
 
   /**
    * registerSystemBuilder (R-5 / B1) — register a builder that belongs to NO installed
-   * App. The runtime's bookkeeping builder (a closure over its `pending_feedback` /
-   * `recent_errors` state) is registered here AFTER the runtime is constructed (CM-5),
-   * so that `resolve_builder` / `tier_of` / `list_builders` hit it and
-   * `seedProjectionBlocks` (which reads `ownerByBlockName`) seeds its output names.
+   * App. The runtime's bookkeeping builder (a closure over its `pending_feedback` state)
+   * is registered here AFTER the runtime is constructed (CM-5), so that `resolve_builder` /
+   * `tier_of` / `list_builders` hit it and `seedProjectionBlocks` (which reads
+   * `ownerByBlockName`) seeds its output names.
    *
    * The registry stays the SINGLE owner of `ownerByBlockName` (F3): system builders go
    * through the same INV #4 (owner≠'agent') guard as App builders and the same INV #3
@@ -1431,6 +1432,16 @@ export class AppRegistry
         // durably recorded the triggering fact (e.g. appended to inbox.jsonl).
         registry.wakeHook?.(event);
       },
+
+      report_input(d: InputDescriptor): void {
+        // actions §2.1 input seam. Clone of `wake` above: the runtime injects
+        // `inputHook` at boot; until then this is inert (an App installed without a
+        // running runtime — e.g. a builder-only test — does not throw). The App calls
+        // this in its ingest handler AFTER mapping its input into the public fields.
+        // Pure telemetry: it never mutates the tree (asymmetric to `wake`, which drives
+        // on_wake behavior — `inputHook` drives only a telemetry `emitInput`).
+        registry.inputHook?.(d);
+      },
     };
   }
 
@@ -1471,6 +1482,14 @@ export class AppRegistry
    * `on_wake` at boot; backs `AppContext.wake`. Until set, `ctx.wake` is inert.
    */
   wakeHook?: (event: WakeEvent) => void;
+
+  /**
+   * Reports an external input to the runtime (actions §2.1). The runtime sets this to a
+   * thunk over its own `emitInput` at boot; backs `AppContext.report_input`. Until set,
+   * `ctx.report_input` is inert. Mirrors `wakeHook` (late-injected), but drives a PURE
+   * telemetry emit — it carries no tree mutation and no `on_wake` behavior.
+   */
+  inputHook?: (d: InputDescriptor) => void;
 
   /**
    * Builds the carrier AppHost for a child-process (resolveHost-derived) app (UH-2/SS3c).

@@ -100,13 +100,14 @@ function capture(): { setView: (v: CtxView) => void; last: () => CtxView | null 
 // ============================================================================
 
 describe('BUILTIN_APP_CATALOG', () => {
-  it('contains exactly 7 entries (the 5 originals + the contract-model task / stats)', () => {
+  it('contains exactly 8 entries (the 5 originals + actions + the contract-model task / stats)', () => {
     const ids = BUILTIN_APP_CATALOG.map((e) => e.id);
-    expect(ids).toHaveLength(7);
+    expect(ids).toHaveLength(8);
     expect(ids).toContain('agent_identity');
     expect(ids).toContain('messages');
     expect(ids).toContain('tools');
     expect(ids).toContain('memory');
+    expect(ids).toContain('actions');
     expect(ids).toContain('memory_letta');
     expect(ids).toContain('task');
     expect(ids).toContain('stats');
@@ -435,6 +436,49 @@ describe('/app command dispatch', () => {
     const v = cap.last() as Extract<CtxView, { kind: 'command_result' }>;
     expect(v.ok).toBe(false);
     expect(v.text).toContain('not installed');
+  });
+
+  // ── F1: protected-app uninstall guard (actions-app §6) ──────────────────────
+
+  it('F1: /app uninstall actions is rejected (observation floor) — no hotUninstall, no config write', async () => {
+    // hotUninstall must NOT be called and the config must NOT be written: the guard fires
+    // BEFORE both. `actions` is installed here so we are not just hitting the not-installed path.
+    const hotCalls: string[] = [];
+    const fakeHot = async (id: string): Promise<HotUninstallResult> => {
+      hotCalls.push(id);
+      return { ok: true };
+    };
+    const agent = makeFakeAgent({
+      installedIds: ['actions'],
+      configPath: cfgPath,
+      hotUninstall: fakeHot,
+    });
+
+    const cap = capture();
+    await dispatch(agent, '/app uninstall actions', cap.setView);
+    const v = cap.last() as Extract<CtxView, { kind: 'command_result' }>;
+
+    expect(v.ok).toBe(false);
+    // Message names the app + the reason it is protected.
+    expect(v.text).toContain('actions');
+    expect(v.text).toContain('observation floor');
+    // The guard short-circuits: hotUninstall never ran, config never written.
+    expect(hotCalls).toEqual([]);
+    expect(existsSync(cfgPath)).toBe(false);
+  });
+
+  it('F1: the guard fires even when actions is NOT installed (protected by id, not state)', async () => {
+    // The guard is keyed on the id, so it rejects before the not-installed check — a user
+    // can never uninstall the observation floor regardless of current install state.
+    const agent = makeFakeAgent({ installedIds: [], configPath: cfgPath });
+    const cap = capture();
+    await dispatch(agent, '/app uninstall actions', cap.setView);
+    const v = cap.last() as Extract<CtxView, { kind: 'command_result' }>;
+    expect(v.ok).toBe(false);
+    expect(v.text).toContain('observation floor');
+    // Reaches the guard message, not the generic "not installed" rejection.
+    expect(v.text).not.toContain('not installed');
+    expect(existsSync(cfgPath)).toBe(false);
   });
 
   // ── swap ──────────────────────────────────────────────────────────────────

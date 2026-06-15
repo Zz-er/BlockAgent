@@ -40,6 +40,7 @@ import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.j
 import { MessagesApp } from '@block-agent/app-messages/manifest.js';
 import { ToolsApp } from '@block-agent/app-tools/manifest.js';
 import { MemoryApp } from '@block-agent/app-memory/manifest.js';
+import { ActionsApp } from '@block-agent/app-actions/manifest.js';
 import { TaskApp } from '@block-agent/app-task/manifest.js';
 import { StatsApp } from '@block-agent/app-stats/manifest.js';
 import { MemoryLettaApp } from '@block-agent/app-memory_letta/memory_letta_app.js';
@@ -238,6 +239,8 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     dispatch_event: (_app_id, event, payload) => registry.dispatch_app_event(event, payload),
     // wake — scheduling signal (not policy-gated).
     wake: (event) => registry.wakeHook?.(event),
+    // report_input — input telemetry (actions §2.1; not policy-gated, like wake).
+    report_input: (d) => registry.inputHook?.(d),
     // The cross-process taint chain start point: ALS does not cross the fork, so the
     // host re-establishes 'sandboxed' around the child's framed callbacks (澄清#5).
     run_sandboxed: (fn) => run_in_chain('sandboxed', fn),
@@ -311,6 +314,47 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   runtime.onTurn((record) => {
     void operations
       .invoke_command('focus.record', { turn_record: record }, { invoker: 'app' })
+      .catch(() => undefined);
+  });
+
+  // 5d) actions ledger subscriptions (actions-app §2.2 / §9). Two telemetry channels feed
+  //     the unified action/observation ledger, both routed through the app-only
+  //     `actions.record` command so they re-enter Operations + PolicyEngine (no bypass, INV
+  //     #11) — the focus-distiller pattern. The ledger is a dumb sink; the agent cannot forge
+  //     it (`record` is invoker:'app' only).
+  //
+  //     RECURSION-FREE (hard constraint, §2.2): `onCommand` fires ONLY inside the runtime's
+  //     private invokeCommand (the agent lane). `actions.record` (invoker:'app') reaches the
+  //     system via Operations.invoke_command DIRECTLY, which never traverses invokeCommand →
+  //     never emits onCommand → no loop. (A no-recursion test guards this.)
+  //
+  //     `inputHook`: connect the registry's generic `report_input` seam (an app's
+  //     `ctx.report_input(d)`) to the runtime's `onInput` emit. Until this is set, an app's
+  //     report_input is inert — so this is the wiring that turns messages.ingest's report into
+  //     an onInput event. Mirrors the wakeHook late-injection, but drives a pure telemetry emit.
+  registry.inputHook = (d) => runtime.emitInput(d);
+
+  //     onCommand → actions.record(kind:'command'). Stamp the wall-clock `ts` HERE at the
+  //     subscription boundary as an ISO string (the clock is legal on the out-of-core
+  //     telemetry seam — INV #16 only forbids it inside a builder's build; matches the
+  //     string `ts` the record command + ActionLogRecord expect, and the messages ingest
+  //     `ts` format, so command + input rows share one timestamp shape). Fire-and-forget +
+  //     `.catch` so a record failure never breaks the turn loop.
+  runtime.onCommand((e) => {
+    void operations
+      .invoke_command(
+        'actions.record',
+        { kind: 'command', ...e, ts: new Date().toISOString() },
+        { invoker: 'app' },
+      )
+      .catch(() => undefined);
+  });
+
+  //     onInput → actions.record(kind:'input'). The InputDescriptor already carries its `ts`
+  //     (stamped at the ingest handler, §3.3) — do NOT re-stamp here. Fire-and-forget + `.catch`.
+  runtime.onInput((d) => {
+    void operations
+      .invoke_command('actions.record', { kind: 'input', ...d }, { invoker: 'app' })
       .catch(() => undefined);
   });
 
@@ -465,6 +509,15 @@ function installEnabledApps(
   // seeded into the app's config (file seed + launcher overrides).
   if (config.apps.memory.enabled) {
     registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
+  }
+  // actions (built-in; core, zero dependency). The unified action/observation ledger
+  // (actions-app §3): a bounded `actions:recent` projection + a full off-tree jsonl audit
+  // under `<base>/actions/`. Default-ON like memory/tools — it takes over the display role
+  // of tools:recent + runtime:command_error. The two telemetry feeds (onCommand / onInput)
+  // are subscribed near the runtime construction (below); runtime uninstall is guarded (F1,
+  // commands.ts). `base` is the APPS_DIR root (the ActionsApp ctor appends `actions/`).
+  if (config.apps.actions.enabled) {
+    registry.install(new ActionsApp(base).manifest());
   }
   // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
   // @block-agent/app-memory_letta — core never imports it (DR-M4). base_url comes from

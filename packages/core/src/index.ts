@@ -118,9 +118,11 @@ async function main(): Promise<void> {
   ]);
 
   // 6) Runtime, driving the real Operations + Renderer + provider directly. It takes
-  //    the registry handle (R-5) and, in its constructor, registers its two bookkeeping
-  //    system builders (`runtime:commands_only_feedback` / `runtime:command_error`, B1)
-  //    via registry.registerSystemBuilder — so they must exist BEFORE we seed (below).
+  //    the registry handle (R-5) and, in its constructor, registers its commands-only
+  //    feedback system builder (`runtime:commands_only_feedback`, B1) via
+  //    registry.registerSystemBuilder — so it must exist BEFORE we seed (below).
+  //    (Command failures no longer get a runtime block; they flow out the `onCommand`
+  //    channel to the `actions` ledger — actions §2.4.)
   const runtime = new AgentRuntime({
     operations,
     renderer,

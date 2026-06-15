@@ -74,6 +74,7 @@ function fakeDeps(over: Partial<HostDeps> = {}): HostDeps & { run_sandboxed_call
     read_blocks: vi.fn(() => []),
     dispatch_event: vi.fn(),
     wake: vi.fn(),
+    report_input: vi.fn(),
     run_sandboxed,
     run_sandboxed_calls,
     ...over,

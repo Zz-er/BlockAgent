@@ -81,6 +81,7 @@ function wire() {
     read_blocks: (name) => ops.find(name).map((b) => structuredClone(b)),
     dispatch_event: (_id, ev, p) => registry.dispatch_app_event(ev, p),
     wake: (ev) => registry.wakeHook?.(ev),
+    report_input: (d) => registry.inputHook?.(d),
     run_sandboxed: (fn) => run_in_chain('sandboxed', fn),
   };
   const hosts: ChildProcessHost[] = [];

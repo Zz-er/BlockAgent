@@ -29,12 +29,13 @@ export interface BuiltinAppEntry {
 }
 
 /**
- * BUILTIN_APP_CATALOG — the full set of installable first-party apps (7).
+ * BUILTIN_APP_CATALOG — the full set of installable first-party apps (8).
  *
- * Order: four always-on apps first (agent_identity / messages / tools / memory),
- * then the optional external-dep app (memory_letta), then the contract-model pair
- * (task / stats). This mirrors the boot install order in launch.ts and the
- * DEFAULTS.apps key order; `default_enabled` MUST match DEFAULTS.apps (tests assert it).
+ * Order: four always-on apps first (agent_identity / messages / tools / memory), then
+ * the always-on observation ledger (actions), then the optional external-dep app
+ * (memory_letta), then the contract-model pair (task / stats). This mirrors the boot
+ * install order in launch.ts and the DEFAULTS.apps key order; `default_enabled` MUST
+ * match DEFAULTS.apps (tests assert it).
  */
 export const BUILTIN_APP_CATALOG: readonly BuiltinAppEntry[] = [
   {
@@ -55,6 +56,11 @@ export const BUILTIN_APP_CATALOG: readonly BuiltinAppEntry[] = [
   {
     id: 'memory',
     summary: '本地 JSONL 记忆库（零依赖、离线）：agent 笔记 + 用户画像，全文/子串兜底召回（无向量，语义召回用 memory_letta）。',
+    default_enabled: true,
+  },
+  {
+    id: 'actions',
+    summary: '统一动作/观测账本：记录每条 agent 命令的结果（成功+失败）与外部输入，替代 tools:recent 与 command_error 的展示，让 agent 看见“我刚做了什么、成功了吗”。',
     default_enabled: true,
   },
   {

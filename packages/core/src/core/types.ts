@@ -353,6 +353,72 @@ export interface ToolCallEvent {
 }
 
 /**
+ * CommandEvent — one agent command the runtime ran this turn, emitted on the runtime's
+ * command channel (`AgentRuntime.onCommand`). UNLIKE the lightweight ToolCallEvent (which
+ * carries only name+ok), this carries the command's CONTENT — full args, plus the result on
+ * success or the error on failure — so an out-of-core sink (the `actions` ledger) can record
+ * the action↔observation pair the agent never otherwise sees (its own successes). It is
+ * emitted at TWO sites in invokeCommand: the success site (`result` set, no `error`) and the
+ * failure site (`error` set, no `result`). The two optional fields make one shape serve both.
+ *
+ * INV #13: this feeds an app-side sink, never the prompt — emitting it does not write the tree
+ * and is never re-scanned for commands. It fires ONLY in the agent lane (invokeCommand), so
+ * `invoker` is effectively always 'agent' here; user/app commands reach the tree via
+ * Operations.invoke_command directly and never surface on this channel (external inputs are
+ * covered by `onInput` instead). The field is kept for forward-compat.
+ */
+export interface CommandEvent {
+  /** Full command name, e.g. `task.add`. */
+  name: string;
+  /** Full args the command was invoked with (jsonl always; rendered per command_detail). */
+  args: unknown;
+  /** Whether the command succeeded. */
+  ok: boolean;
+  /** CommandResult.data — present on the SUCCESS site only. */
+  result?: unknown;
+  /** Normalized failure message (err.message) — present on the FAILURE site only. */
+  error?: string;
+  /** Best-effort target id heuristically dug from the result; OPTIONAL (often absent). */
+  ref?: string;
+  /** Always 'agent' at this seam (the agent lane); kept as a field for forward-compat. */
+  invoker: 'agent';
+  /** runtime.spawn_depth; 0 = the main agent. */
+  spawn_depth: number;
+}
+
+/** A subscriber on the runtime's command channel; see `AgentRuntime.onCommand`. */
+export type CommandListener = (event: CommandEvent) => void;
+
+/**
+ * InputDescriptor — an external input an app reports into the runtime's input channel via
+ * `AppContext.report_input` (emitted on `AgentRuntime.onInput`). External inputs (e.g. a
+ * message ingested with `invoker:'user'`) enter via Operations.invoke_command, NOT the agent
+ * lane, and the body+sender exist only at the receiving app — so the app maps its input into
+ * these public fields and reports it. The receiving app defines its own mapping; the `actions`
+ * sink stays content-agnostic and renders by public field only. Any further app-specific
+ * fields ride along (jsonl-only) and are never parsed by core or by `actions`.
+ *
+ * `ts` is stamped at the ingest site (a handler, where the clock is legal — not a builder), so
+ * INV #1/#16 hold: the pure render builder only READS the stored `ts` string (data, not
+ * generated). INV #13: this feeds an app-side sink, never the prompt.
+ */
+export interface InputDescriptor {
+  /** Source app/channel, e.g. `messages` | `im_proxy`. */
+  source: string;
+  /** Principal id / 'user'. */
+  sender?: string;
+  /** Stamped at the ingest site (clock legal — it's a handler, not a build). */
+  ts: string;
+  /** One-line short preview (the app truncates; rendered at input_detail=2). */
+  preview: string;
+  /** Full body (rendered at input_detail=3 + jsonl); optional. */
+  content?: string;
+}
+
+/** A subscriber on the runtime's input channel; see `AgentRuntime.onInput`. */
+export type InputListener = (event: InputDescriptor) => void;
+
+/**
  * RuntimeErrorEvent — a turn that failed unexpectedly, emitted on the runtime's
  * error channel (`AgentRuntime.onError`), symmetric to the thinking channel.
  *

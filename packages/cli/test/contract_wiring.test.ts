@@ -41,6 +41,7 @@ function fourAppConfig(dir: string): LauncherConfig {
       messages: { enabled: true },
       tools: { enabled: false }, // not under test here; keep the catalog small
       memory: { enabled: false },
+      actions: { enabled: false },
       memory_letta: { enabled: false },
       task: { enabled: true },
       stats: { enabled: true },

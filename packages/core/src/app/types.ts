@@ -29,6 +29,7 @@ import type {
   BlockView,
   BlockSnapshot,
   CacheTier,
+  InputDescriptor,
   InvokerContext,
   WakeEvent,
 } from '../core/types.js';
@@ -479,6 +480,22 @@ export interface AppContext<TState = unknown> {
    * running runtime (e.g. in a builder-only test) does not throw.
    */
   wake?(event: WakeEvent): void;
+
+  /**
+   * Report an external input into the runtime's input telemetry channel (actions §2.1).
+   * An ingest app (e.g. `messages`) calls this in its handler — right beside `ctx.wake` —
+   * after mapping its input into the public `InputDescriptor` fields, so an out-of-core
+   * sink (the `actions` ledger) can record the input that triggered the agent. Unlike
+   * `wake` (which drives the runtime's `on_wake` behavior), this is a PURE telemetry emit:
+   * it never mutates the tree and is not routed through PolicyEngine.
+   *
+   * The runtime injects the concrete hook at boot (late-injection, like `wake`); until
+   * then it is a no-op. An App MUST tolerate `report_input` being absent/inert (guard with
+   * `ctx.report_input?.(...)`); installing an App without a running runtime does not throw.
+   * The app does not know `actions` exists — it calls this generic seam; the boot connects
+   * `onInput → actions.record`.
+   */
+  report_input?(d: InputDescriptor): void;
 }
 
 // ============================================================================

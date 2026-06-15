@@ -98,6 +98,16 @@ export interface TaskConfig {
  * (message_count + task_count) whose `stats:summary` block is hidden until the
  * operator turns it on AND `show_block` is true (the builder renders null otherwise).
  */
+/**
+ * actions ledger launcher toggle. The app's own knobs (window_size / command_detail /
+ * input_detail / char limits) live in the app's seed config, not here — this only gates
+ * boot install. Trusted, default-ON; runtime uninstall is guarded (F1), config-level
+ * disable at boot is allowed.
+ */
+export interface ActionsConfig {
+  enabled: boolean;
+}
+
 export interface StatsConfig {
   enabled: boolean;
   /**
@@ -175,6 +185,8 @@ export interface LauncherConfig {
     messages: MessagesConfig;
     tools: ToolsConfig;
     memory: MemoryConfig;
+    /** The unified action/observation ledger; enabled by default (runtime uninstall guarded, F1). */
+    actions: ActionsConfig;
     memory_letta: MemoryLettaConfig;
     /** §4.2 task tracker (local jsonl); enabled by default. */
     task: TaskConfig;

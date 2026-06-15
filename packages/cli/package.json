@@ -27,6 +27,7 @@
     "@block-agent/app-messages": "*",
     "@block-agent/app-tools": "*",
     "@block-agent/app-memory": "*",
+    "@block-agent/app-actions": "*",
     "@block-agent/app-task": "*",
     "@block-agent/app-stats": "*",
     "@block-agent/app-memory_letta": "*",

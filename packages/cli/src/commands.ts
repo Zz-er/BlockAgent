@@ -248,6 +248,23 @@ const appCommand: SlashCommand = {
         setView({ kind: 'command_result', ok: false, text: 'usage: /app uninstall <id>' });
         return;
       }
+      // F1 (actions-app §6): `actions` is the observation FLOOR — it is the sole carrier of
+      // failure + tool-result visibility once runtime:command_error and tools:recent (display)
+      // are removed. Runtime uninstall would silently drop both from the prompt (a regression
+      // worse than today, since "default-enabled" only covers a fresh boot). Reject it here,
+      // mirroring the reserved-`core`-id protection. Config-level disable at boot stays allowed
+      // (apps.actions.enabled:false) — only the runtime uninstall path is guarded.
+      if (id === 'actions') {
+        setView({
+          kind: 'command_result',
+          ok: false,
+          text:
+            "Cannot uninstall 'actions': it is the observation floor — failure + tool-result " +
+            'visibility live only here. To run without it, set apps.actions.enabled:false at ' +
+            'boot and accept losing both.',
+        });
+        return;
+      }
       if (agent.registry.get(id) === null) {
         setView({
           kind: 'command_result',

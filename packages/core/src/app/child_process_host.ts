@@ -37,7 +37,13 @@
 
 import type { AppContext, CommandResult } from './types.js';
 import type { AppHost } from './app_host.js';
-import type { Block, BlockName, InvokerContext, WakeEvent } from '../core/types.js';
+import type {
+  Block,
+  BlockName,
+  InputDescriptor,
+  InvokerContext,
+  WakeEvent,
+} from '../core/types.js';
 import { FramedRpcChannel, type RpcChannel } from './rpc/channel.js';
 import { parentTransport, type ChildProcessLike } from './rpc/child_process_transport.js';
 
@@ -66,6 +72,8 @@ export interface HostDeps {
   dispatch_event(app_id: string, event: string, payload: unknown): void;
   /** Wake the runtime (scheduling signal, not policy-gated). */
   wake(event: WakeEvent): void;
+  /** Report an external input to the runtime's input telemetry channel (actions §2.1). */
+  report_input(d: InputDescriptor): void;
   /**
    * Run `fn` inside the sandboxed taint chain (ALS). Injected from core/taint so this
    * file does not import the store directly; it is the cross-process taint splice
@@ -245,6 +253,13 @@ export class ChildProcessHost implements AppHost {
       return null;
     });
 
+    // report_input → input telemetry (actions §2.1; not policy-gated, like wake).
+    channel.on('report_input', async (payload): Promise<null> => {
+      const { descriptor } = payload as { descriptor: InputDescriptor };
+      this.deps.report_input(descriptor);
+      return null;
+    });
+
     // __ready / spawn_system_agent stubs: ack so the child's handshake/spawn calls
     // resolve. spawn_system_agent's real wiring is a follow-up (in-process is a v3.0 stub
     // too); we return an id so the proxy handle is well-formed.
@@ -293,6 +308,7 @@ export class ChildProcessHost implements AppHost {
       emit: (event: string, payload: unknown) => host.deps.dispatch_event(app_id, event, payload),
       spawn_system_agent: () => ({ id: `${app_id}:system_agent:0`, stop: () => undefined }),
       wake: (event: WakeEvent) => host.deps.wake(event),
+      report_input: (d: InputDescriptor) => host.deps.report_input(d),
     };
   }
 }

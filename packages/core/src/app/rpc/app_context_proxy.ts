@@ -5,7 +5,7 @@
  * the app code is unaware it is out-of-process ("interface orthogonal to carrier").
  *
  * ── Whitelist parity (Raven SS3 hard-gate) ─────────────────────────────────────────
- * The proxy exposes EXACTLY the in-process AppContext's 12 members and NOTHING else —
+ * The proxy exposes EXACTLY the in-process AppContext's members and NOTHING else —
  * never the RpcChannel, the transport, an Operations/apply handle, the AppHost, or the
  * taint write-end (`run_in_chain`/`taintStore`). The shared whitelist assertion
  * (test/_support/appcontext_whitelist) pins both carriers to one set. The channel is a
@@ -42,7 +42,13 @@ import type {
   SystemAgentHandle,
   TokenBudget,
 } from '../types.js';
-import type { Block, BlockName, BlockView, WakeEvent } from '../../core/types.js';
+import type {
+  Block,
+  BlockName,
+  BlockView,
+  InputDescriptor,
+  WakeEvent,
+} from '../../core/types.js';
 
 /** Handshake payload the child receives to seed the proxy (by-value, no functions). */
 export interface ProxySeed<TState = unknown> {
@@ -170,6 +176,12 @@ export function makeAppContextProxy<TState = unknown>(
     // command; not routed through PolicyEngine).
     wake(event: WakeEvent): void {
       void call('wake', { event });
+    },
+
+    // report_input: frame to the main process → AppRegistry.inputHook (input telemetry,
+    // actions §2.1; not a command, not routed through PolicyEngine — like wake).
+    report_input(d: InputDescriptor): void {
+      void call('report_input', { descriptor: d });
     },
   };
 }

@@ -27,6 +27,7 @@ export const APP_CONTEXT_WHITELIST: readonly string[] = [
   'emit',
   'spawn_system_agent',
   'wake',
+  'report_input',
 ];
 
 /** Every member NAME reachable on an object, including its whole prototype chain. */

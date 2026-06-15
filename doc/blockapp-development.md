@@ -405,8 +405,9 @@ registry.install(makeTodoApp());
 - `ctx.read(blockname)` —— 读别的 app 暴露的块（返回**拷贝**，按值）。
 - `ctx.on(event, handler)` / `ctx.emit(event, payload)` —— 事件订阅/发布（fire-and-forget，**不得在 handler 里加阻塞关口**）。
 - `ctx.wake(event)` —— 把 runtime 从 idle 唤醒（如新消息到达后）。fire-and-forget，不过鉴权关口（是调度信号不是命令）。
+- `ctx.report_input(descriptor)` —— **上报一条外部输入**到 `actions` 时间线（fire-and-forget，可选/late-injected，像 `wake` 一样 `?.` 守卫）。**任何接收外部数据的 app**（消息、推送、webhook…）都应在其 ingest handler 里调它,把输入映射成 `{source, sender?, ts, preview, content?}`（你自己定义字段含义),否则该来源的输入**不会出现在 agent 的动作账本里**(agent 可能因看不到"已收到这条"而重复处理)。正文留在你自己的块里(如 `messages:recent`),这里只给紧凑预览,不重复。
 
-> 跨 app 交互**全部 by-value**：阻塞关口（写入闸 / 脱敏）走 `invoke_command`；通知走 `emit`；`read` 返回拷贝。app 内部访问自己的数据用普通引用。
+> 跨 app 交互**全部 by-value**：阻塞关口（写入闸 / 脱敏）走 `invoke_command`；通知走 `emit`；`read` 返回拷贝；唤醒走 `wake`；外部输入上报走 `report_input`。app 内部访问自己的数据用普通引用。
 
 ---
 
@@ -446,5 +447,6 @@ registry.install(makeTodoApp());
 - [ ] 命令用 `ctx.set_state` 改 state，或返回 `ops`；不直接碰树。
 - [ ] id 用内容寻址，不用随机/时钟。
 - [ ] 工厂内部 typed `AppManifest<TState>`，return 时 `as AppManifest`。
+- [ ] **接收外部输入的 app**（消息/推送/webhook…）在 ingest handler 里调了 `ctx.report_input?.({source, sender?, ts, preview, content?})`，让该来源的输入进入 `actions` 时间线(否则静默缺失)。
 
 下一步：把 app 装进去、管理它的生命周期 → [blockapp-lifecycle.md](./blockapp-lifecycle.md)。

@@ -10,7 +10,7 @@
  * .block-agent.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -30,6 +30,7 @@ function mockConfig(dir: string): LauncherConfig {
       messages: { enabled: true },
       tools: { enabled: true },
       memory: { enabled: true },
+      actions: { enabled: false }, // not under test here; off keeps the catalog minimal
       memory_letta: { enabled: false }, // needs an external server; off in tests
       task: { enabled: true },
       stats: { enabled: false },
@@ -94,5 +95,118 @@ describe('launch tool catalog', () => {
     expect(names).toContain('memory.recall');
     // user-only memory config command is NOT advertised to the agent.
     expect(names).not.toContain('memory.set_config');
+  });
+});
+
+// ============================================================================
+// actions ledger wiring smoke (actions-app §2.2 / §9): the onInput + onCommand
+// subscriptions + inputHook turn one real turn into durable ledger records.
+// ============================================================================
+
+describe('launch actions ledger wiring', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'block-agent-actions-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Read every JSON line from the actions jsonl audit log (empty if the file is absent). */
+  function readActionsLog(): Array<Record<string, unknown>> {
+    const path = join(dir, '.block-agent', 'apps', 'actions', 'log.jsonl');
+    let raw: string;
+    try {
+      raw = readFileSync(path, 'utf8');
+    } catch {
+      return [];
+    }
+    return raw
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  }
+
+  it('installs actions and records the external input from one turn (onInput wiring)', async () => {
+    const cfg = mockConfig(dir);
+    cfg.apps.actions = { enabled: true };
+    const agent = await launch(cfg);
+
+    // Boot installed the ledger.
+    expect(agent.registry.get('actions')).not.toBeNull();
+
+    // Drive one real turn: messages.ingest → ctx.report_input → onInput → actions.record.
+    await makeCliChannel(agent).submit('hello actions');
+
+    const records = readActionsLog();
+
+    // The external input was reported into the ledger (report_input → inputHook → onInput →
+    // actions.record → store.append — the full input-channel wiring is live).
+    const inputs = records.filter((r) => r['kind'] === 'input');
+    expect(inputs.length).toBeGreaterThanOrEqual(1);
+    expect(inputs[0]?.['source']).toBe('messages');
+    expect(typeof inputs[0]?.['ts']).toBe('string');
+
+    // Any command rows that DID land are well-formed (note: the mock's lone `messages.reply`
+    // is `end_turn`, which the onCommand emit site excludes by design — §2.1 — so a turn that
+    // only replies records no command. The onCommand wiring itself is proven by the
+    // no-recursion test below, which observes the channel directly.)
+    for (const c of records.filter((r) => r['kind'] === 'command')) {
+      expect(typeof c['name']).toBe('string');
+      expect(typeof c['ts']).toBe('string');
+    }
+  });
+
+  it('no-recursion (#1 correctness guard): actions.record via Operations emits ZERO onCommand', async () => {
+    // The arch doc's airtight-recursion claim, made a real test (actions-app §2.2). The launch
+    // onCommand subscription feeds actions.record; if actions.record itself emitted onCommand,
+    // it would re-trigger the subscription → infinite loop. The guarantee: onCommand fires ONLY
+    // inside the runtime's private invokeCommand (the agent lane); actions.record (invoker:'app')
+    // reaches the tree via Operations.invoke_command DIRECTLY, which never traverses invokeCommand
+    // → never emits onCommand. We prove it by driving the command directly and counting the channel.
+    const cfg = mockConfig(dir);
+    cfg.apps.actions = { enabled: true };
+    const agent = await launch(cfg);
+
+    let onCommandCount = 0;
+    const off = agent.runtime.onCommand(() => {
+      onCommandCount += 1;
+    });
+
+    // Drive actions.record DIRECTLY through Operations, invoker:'app' (the exact path the launch
+    // subscription uses). Both record kinds, to exercise the whole sink.
+    const inputRes = await agent.operations.invoke_command(
+      'actions.record',
+      { kind: 'input', source: 'messages', sender: 'user', ts: new Date().toISOString(), preview: 'hi' },
+      { invoker: 'app' },
+    );
+    const cmdRes = await agent.operations.invoke_command(
+      'actions.record',
+      { kind: 'command', name: 'memory.remember', args: { content: 'x' }, ok: true, invoker: 'agent', spawn_depth: 0, ts: new Date().toISOString() },
+      { invoker: 'app' },
+    );
+    off();
+
+    // The records actually applied (the sink works)…
+    expect(inputRes.ok).toBe(true);
+    expect(cmdRes.ok).toBe(true);
+    // …and emitted EXACTLY ZERO onCommand events — no self-feed, no loop.
+    expect(onCommandCount).toBe(0);
+  });
+
+  it('no-recursion: a full turn never surfaces actions.record on onCommand either', async () => {
+    const cfg = mockConfig(dir);
+    cfg.apps.actions = { enabled: true };
+    const agent = await launch(cfg);
+
+    const seen: string[] = [];
+    const off = agent.runtime.onCommand((e) => seen.push(e.name));
+    await makeCliChannel(agent).submit('hi');
+    off();
+
+    // Whatever agent commands fired this turn, NONE may be actions.record (the ledger never
+    // appears in the agent lane it records).
+    expect(seen).not.toContain('actions.record');
   });
 });

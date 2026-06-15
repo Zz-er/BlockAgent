@@ -14,10 +14,10 @@ import { PolicyEngine } from '../src/core/policy.js';
 import { MockProvider } from '../src/provider/mock.js';
 import {
   AgentRuntime,
-  COMMAND_ERROR_BLOCK,
   COMMANDS_ONLY_FEEDBACK_BLOCK,
   COMMANDS_ONLY_FEEDBACK_TEXT,
 } from '../src/runtime/agent_runtime.js';
+import type { CommandEvent } from '../src/core/types.js';
 import {
   TestBuilderRegistry,
   TestCommandRegistry,
@@ -297,10 +297,10 @@ describe('end_turn (a reply-style command ends the turn, §8.1)', () => {
 
 /**
  * Wire a runtime whose only command `boom.go` always THROWS, so each call drives the
- * runtime's recordCommandError path. The throw propagates out of TestOperations.route
- * into the runtime's invokeCommand catch (a non-policy error), exactly as a real
- * command failure would. Shares the renderer's builder registry as the runtime's
- * `registry` handle (so the B1 builders register into it).
+ * runtime's failure path. The throw propagates out of TestOperations.route into the
+ * runtime's invokeCommand catch (a non-policy error) — which emits onCommand(ok:false,
+ * error) (actions §2.1), exactly as a real command failure would. Shares the renderer's
+ * builder registry as the runtime's `registry` handle (so the B1 builder registers into it).
  */
 function wireFailing(provider: MockProvider) {
   const tree = makeEmptyTree();
@@ -323,15 +323,15 @@ function wireFailing(provider: MockProvider) {
 describe('B1 bookkeeping projection (state → builder, no tree writes)', () => {
   it('the feedback builder owns runtime:commands_only_feedback and is registered at construction', () => {
     const { builders } = wire(new MockProvider([{}]));
-    // The runtime registered both system builders in its constructor (CM-5), so the
-    // registry resolves their owners — proving registerSystemBuilder was wired.
+    // The runtime registered its feedback system builder in its constructor (CM-5), so the
+    // registry resolves its owner — proving registerSystemBuilder was wired. (The
+    // command-error builder was removed: failures now flow out the onCommand channel to the
+    // `actions` ledger — actions §2.4.)
     expect(builders.resolve_builder(COMMANDS_ONLY_FEEDBACK_BLOCK)?.name).toBe(
       'runtime.commands_only_feedback',
     );
-    expect(builders.resolve_builder(COMMAND_ERROR_BLOCK)?.name).toBe('runtime.command_error');
-    // Both are volatile (never poison the stable cache prefix).
+    // Volatile (never poison the stable cache prefix).
     expect(builders.tier_of(COMMANDS_ONLY_FEEDBACK_BLOCK)).toBe('volatile');
-    expect(builders.tier_of(COMMAND_ERROR_BLOCK)).toBe('volatile');
   });
 
   it('a violation is NOT written to the tree — only projected by the builder (INV#1 by construction)', async () => {
@@ -362,34 +362,58 @@ describe('B1 bookkeeping projection (state → builder, no tree writes)', () => 
     expect(text).not.toContain(COMMANDS_ONLY_FEEDBACK_BLOCK);
   });
 
-  it('command errors project into a single block, bounded recent-N, oldest→newest (CM-6)', async () => {
-    // 10 failing calls in one wake (each its own turn) — exceeds the recent-N bound
-    // (8). The command_error builder must project exactly the LAST 8, in order.
-    const failing = Array.from({ length: 10 }, (_v, i) => ({
-      tool_calls: [{ id: `t${i}`, name: 'boom.go', args: {} }],
-    }));
-    const provider = new MockProvider([...failing, {}]);
-    const { runtime, ops, builders, renderer } = wireFailing(provider);
+  it('a command failure emits onCommand(ok:false, error) — the actions ledger replaces command_error (§2.4)', async () => {
+    // The removed runtime:command_error block is replaced by the onCommand channel: a
+    // non-policy throw surfaces as a CommandEvent with ok:false + the normalized error and
+    // NO result, carrying the args, for the actions ledger to record.
+    const provider = new MockProvider([{ tool_calls: [{ id: 't0', name: 'boom.go', args: { x: 1 } }] }, {}]);
+    const { runtime } = wireFailing(provider);
+
+    const seen: CommandEvent[] = [];
+    runtime.onCommand((e) => seen.push(e));
 
     await runtime.on_wake(WAKE);
 
-    const text = await seedAndRenderText(ops, runtime, builders, renderer);
-    // Recent-N bound = 8: the two oldest (call 0,1) fell off; calls 2..9 remain.
-    expect(text).toContain(COMMAND_ERROR_BLOCK);
-    expect(text).toContain('command boom.go failed: kaboom');
-    // Exactly 8 error lines in the projected block (one per retained failure).
-    const errorLines = text.split('\n').filter((l) => l === 'command boom.go failed: kaboom');
-    expect(errorLines).toHaveLength(8);
+    expect(seen).toHaveLength(1);
+    const e = seen[0]!;
+    expect(e).toMatchObject({
+      name: 'boom.go',
+      args: { x: 1 },
+      ok: false,
+      error: 'kaboom',
+      invoker: 'agent',
+      spawn_depth: 0,
+    });
+    expect(e.result).toBeUndefined(); // failure site carries no result
+    expect('ref' in e).toBe(false);
   });
 
-  it('command_error builder projects nothing when there are no errors', async () => {
-    const provider = new MockProvider([{}]);
-    const { ops, runtime, builders, renderer } = wire(provider);
+  it('a successful command emits onCommand(ok:true, result) with the args+data (the success signal)', async () => {
+    // The asymmetry actions closes: a SUCCESS now surfaces on the command channel with the
+    // full args + CommandResult.data (reply.say returns {echoed}). No error; ref absent
+    // because the result has no id/ref/block key (the row degrades to verb → ok).
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'reply.say', args: { text: 'hi' } }] },
+      {},
+    ]);
+    const { runtime } = wire(provider);
+
+    const seen: CommandEvent[] = [];
+    runtime.onCommand((e) => seen.push(e));
 
     await runtime.on_wake(WAKE);
 
-    const text = await seedAndRenderText(ops, runtime, builders, renderer);
-    expect(text).not.toContain(COMMAND_ERROR_BLOCK);
+    expect(seen).toHaveLength(1);
+    const e = seen[0]!;
+    expect(e).toMatchObject({
+      name: 'reply.say',
+      args: { text: 'hi' },
+      ok: true,
+      result: { echoed: 'hi' },
+      invoker: 'agent',
+    });
+    expect(e.error).toBeUndefined();
+    expect('ref' in e).toBe(false); // no id/ref/block key in data → degrades cleanly
   });
 
   it('the seeded bookkeeping placeholders attach under the actual tree root (CM-4 guard)', async () => {

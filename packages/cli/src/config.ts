@@ -36,6 +36,12 @@ export const DEFAULTS: LauncherConfig = {
     messages: { enabled: true },
     tools: { enabled: true },
     memory: { enabled: true },
+    // actions: the unified action/observation ledger (the agent's "did my command
+    // succeed" floor). Trusted, default-ON like the other always-on apps — it takes over
+    // the display role of tools:recent + runtime:command_error, so a default boot must
+    // ship it. Runtime uninstall is guarded (F1, commands.ts); config-level disable at
+    // boot stays allowed (sets enabled:false here).
+    actions: { enabled: true },
     memory_letta: { enabled: false },
     // task: local jsonl tracker, zero dependency → on by default like memory.
     task: { enabled: true },
@@ -335,6 +341,7 @@ export function loadConfig(
       messages: resolveMessages(flags, fileApps),
       tools: resolveTools(flags, fileApps),
       memory: resolveMemory(flags, fileApps),
+      actions: resolveActions(flags, fileApps),
       memory_letta: resolveMemoryLetta(flags, fileApps, env),
       task: resolveTask(flags, fileApps),
       stats: resolveStats(flags, fileApps),
@@ -469,6 +476,23 @@ function resolveTask(
   return {
     enabled: appEnabled(flags, f, 'no-task'),
     ...(list_limit !== undefined ? { list_limit } : {}),
+  };
+}
+
+/**
+ * resolveActions — the `actions` ledger app config. DEFAULT-ENABLED (like task/memory):
+ * on unless `--no-actions` or file `apps.actions.enabled:false`. Only the boot toggle
+ * lives here; the app's own knobs (window_size / command_detail / input_detail / char
+ * limits) are seeded inside the app, not the launcher config. Runtime uninstall is
+ * separately guarded (F1, commands.ts) — config-level disable at boot is allowed.
+ */
+function resolveActions(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['actions'] {
+  const f = pickObject(fileApps['actions']);
+  return {
+    enabled: appEnabled(flags, f, 'no-actions'),
   };
 }
 
