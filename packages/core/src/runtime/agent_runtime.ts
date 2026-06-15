@@ -147,6 +147,9 @@ export interface AgentRuntimeOptions {
 /** The block name the runtime writes commands-only rejection feedback to (§4.2). */
 export const COMMANDS_ONLY_FEEDBACK_BLOCK: BlockName = 'runtime:commands_only_feedback';
 
+/** The block name the runtime writes loop/stall-guard feedback to (§8.1 stall-guard). */
+export const LOOP_FEEDBACK_BLOCK: BlockName = 'runtime:loop_feedback';
+
 /** Default root block name (matches the empty-tree boot in core/block.ts). */
 const DEFAULT_ROOT_NAME: BlockName = 'root:root';
 
@@ -164,6 +167,22 @@ export const COMMANDS_ONLY_FEEDBACK_TEXT =
   '请使用提供给你的命令工具来行动或回复用户，不要直接输出纯文本。';
 
 const DEFAULT_MAX_TURNS_PER_WAKE = 16;
+
+/**
+ * LOOP_FEEDBACK_TEXT — the exact feedback written when the stall-guard detects NO
+ * PROGRESS (§8.1 stall-guard): a turn whose tool_calls were ALL exact repeats
+ * (same name + same args) of commands already issued this wake. A weaker model can
+ * otherwise loop the same tool_call until DEFAULT_MAX_TURNS_PER_WAKE (16) — burning
+ * ~48 calls without ever replying. On the FIRST stall the runtime projects this text
+ * so the agent sees it next turn and can self-correct (reply or do something
+ * different); on the SECOND consecutive stall it breaks the wake. App-agnostic in
+ * spirit but names `messages.reply` / `base:recent` as the canonical reply/recent
+ * surfaces (mirroring agent_identity's operating constraints).
+ */
+export const LOOP_FEEDBACK_TEXT =
+  '你这一轮重复了已经做过的动作（见 `base:recent`），没有产生新进展。' +
+  '如果请求已完成，请调用回复命令（如 `messages.reply`）回复用户并结束这一轮；' +
+  '否则换一个不同的动作。';
 
 /**
  * Default idle deadline for a provider send (ms): abort if the stream goes this long
@@ -285,6 +304,35 @@ export class AgentRuntime {
    */
   private pending_feedback: string | null = null;
 
+  /**
+   * Set when the stall-guard detected a no-progress turn (§8.1 stall-guard). The
+   * loop-feedback system builder PROJECTS this into `runtime:loop_feedback`: non-null
+   * → render the loop-feedback text, null → render nothing. Mirrors `pending_feedback`
+   * exactly (B1: state is the source of truth; the builder is its only reader). It
+   * persists across wakes until the next progressing turn clears it, so the nudge
+   * the agent saw before a stall-break still projects on the next wake.
+   */
+  private pending_loop_feedback: string | null = null;
+
+  /**
+   * Per-wake set of command SIGNATURES issued so far this wake (§8.1 stall-guard).
+   * A signature is `name + ' ' + stableStringify(args)` (sorted keys), so the SAME
+   * command name with DIFFERENT args is a DIFFERENT signature = different work (never
+   * flagged); only an EXACT (name+args) repeat counts. RESET at the start of each
+   * wake — this is per-wake telemetry that never enters the rendered prompt (it only
+   * drives `pending_loop_feedback`). A `Set` because membership is all we test.
+   */
+  private wake_signatures = new Set<string>();
+
+  /**
+   * Count of CONSECUTIVE no-progress turns this wake (§8.1 stall-guard). A turn that
+   * issued tool_calls but ZERO new signatures is a stall → increment; any turn that
+   * did NEW work (or replied/idled) resets it to 0. The wake loop breaks once this
+   * reaches 2, bounding a runaway to ~3 turns instead of `max_turns_per_wake`. Reset
+   * per wake alongside `wake_signatures`.
+   */
+  private stall_turns = 0;
+
   constructor(opts: AgentRuntimeOptions) {
     this.ops = opts.operations;
     this.renderer = opts.renderer;
@@ -305,6 +353,10 @@ export class AgentRuntime {
     // (The command-error builder was removed: command failures now flow out the
     // `onCommand` channel to the `actions` ledger, not into a runtime block — actions §2.4.)
     this.registry.registerSystemBuilder(this.makeFeedbackBuilder());
+    // Stall-guard (§8.1): the loop-feedback system builder projects
+    // `pending_loop_feedback` into `runtime:loop_feedback`. Same shape/ownership as
+    // the commands-only feedback builder — pure, volatile, owner='system'.
+    this.registry.registerSystemBuilder(this.makeLoopFeedbackBuilder());
   }
 
   /**
@@ -419,6 +471,12 @@ export class AgentRuntime {
     this.current_wake_event = event;
     this._wake_seq += 1;
     this._turn_index = 0;
+    // Stall-guard per-wake state (§8.1): a fresh signature set + zeroed stall counter.
+    // Per-wake, NOT global — distinct work across separate wakes is never conflated.
+    // (pending_loop_feedback is NOT reset here: it persists until the next progressing
+    // turn clears it, so a stall-break still projects its nudge on the next wake.)
+    this.wake_signatures = new Set<string>();
+    this.stall_turns = 0;
 
     try {
       let turns = 0;
@@ -448,6 +506,14 @@ export class AgentRuntime {
         // (read via stateKind() so TS does not narrow away the mutation runTurn
         // performed — `this.state` was 'running' on entry but runTurn may park.)
         if (this.stateKind() === 'paused_for_approval') return;
+
+        // Stall-guard (§8.1): a THIRD early-exit, alongside max_turns (:429) and
+        // !progressed below. runTurn set `stall_turns` per turn (incremented on a
+        // no-progress turn, reset on any new work / reply / idle). On the 1st stall it
+        // already projected the loop-feedback nudge; on the 2nd CONSECUTIVE stall we
+        // break the wake (the agent ignored the nudge), bounding a runaway to ~3 turns
+        // instead of max_turns. The loop feedback persists and projects next wake.
+        if (this.stall_turns >= 2) break;
 
         if (!progressed) break;
       }
@@ -546,6 +612,21 @@ export class AgentRuntime {
     const { thoughts, tool_calls, raw_text } =
       this.provider.thinking_adapter.extract(response);
 
+    // Stall-guard signature tracking (§8.1): count how many of this turn's tool_calls
+    // are NEW (a (name+args) signature not yet seen this wake), then record them all.
+    // A turn that issued ONLY repeats (tool_calls.length > 0 && newCount === 0) made NO
+    // progress. The SAME name with DIFFERENT args has a DIFFERENT signature → counts as
+    // new → never false-flagged as a stall. Computed here (after extract, before
+    // dispatch) so it sees the full call set even if dispatch parks midway.
+    let newCount = 0;
+    for (const call of tool_calls) {
+      const sig = commandSignature(call.name, call.args);
+      if (!this.wake_signatures.has(sig)) {
+        newCount += 1;
+        this.wake_signatures.add(sig);
+      }
+    }
+
     let progressed = false;
 
     // 4a) thinking → UI thinking channel (§4.3). The text is OPAQUE: we EMIT it to
@@ -570,9 +651,29 @@ export class AgentRuntime {
     // The agent finished responding (a command set end_turn, e.g. messages.reply): stop
     // the loop and return to idle to await the next event, instead of running another
     // turn and re-replying. Multi-step tool use (no end_turn) keeps looping as before.
+    // A clean reply is NOT a stall — reset the counter + clear any pending nudge (the
+    // wake ends here anyway).
     if (end_turn) {
+      this.stall_turns = 0;
+      this.pending_loop_feedback = null;
       this.emitTurn({ ...this.turnEnvelope('reply'), ...telemetry, ...usage });
       return false;
+    }
+
+    // Stall-guard verdict (§8.1): this turn made NO progress iff it issued tool_calls
+    // that were ALL exact repeats (newCount === 0). On the 1st stall, nudge (project the
+    // loop-feedback so the agent self-corrects next turn) but keep going. On any turn
+    // that did NEW work — or replied/idled (no tool_calls) — reset the counter. The wake
+    // loop reads `stall_turns >= 2` after this returns and breaks (the 2nd consecutive
+    // stall). Parked already returned above, so a parked turn is never a stall.
+    if (tool_calls.length > 0 && newCount === 0) {
+      this.stall_turns += 1;
+      if (this.stall_turns === 1) this.pending_loop_feedback = LOOP_FEEDBACK_TEXT;
+    } else {
+      // Progress (new work) or a no-op turn → not stalling. Clear the nudge so a stale
+      // loop-feedback block never lingers once the agent is making progress again.
+      this.stall_turns = 0;
+      this.pending_loop_feedback = null;
     }
 
     // 4c) plain text (not in thinking, not a tool_use) → commands-only REJECTION
@@ -1097,6 +1198,30 @@ export class AgentRuntime {
   }
 
   /**
+   * makeLoopFeedbackBuilder — the `runtime:loop_feedback` system builder (§8.1
+   * stall-guard). A closure over this runtime that mirrors makeFeedbackBuilder
+   * EXACTLY: each render it reads `this.pending_loop_feedback` and projects the
+   * loop-feedback text when a stall was detected, or returns `null` (render nothing)
+   * otherwise. owner='system' (INV #4 — never 'agent'), no `app_id`, volatile tier so
+   * it never poisons the stable cache prefix. PURE: identical `pending_loop_feedback`
+   * → byte-identical block (INV #1 / #16); no clock/random/env.
+   */
+  private makeLoopFeedbackBuilder(): BuilderManifest {
+    return {
+      name: 'runtime.loop_feedback',
+      version: '1.0.0',
+      owner: 'system',
+      inputs: [],
+      outputs: [LOOP_FEEDBACK_BLOCK],
+      cache_tier: 'volatile',
+      build: async (ctx: BuildContext): Promise<Block | null> =>
+        this.pending_loop_feedback === null
+          ? null
+          : projectionBlock(ctx, LOOP_FEEDBACK_BLOCK, this.pending_loop_feedback),
+    };
+  }
+
+  /**
    * buildSendOpts — assemble the per-turn SendOpts. Currently this is just the tool
    * catalog (the agent-invokable commands advertised so the model can call them). We
    * omit `tools` entirely when the catalog is absent/empty (rather than passing an
@@ -1183,6 +1308,33 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
       },
     );
   });
+}
+
+/**
+ * commandSignature — the stall-guard's identity for one issued command (§8.1):
+ * `name + ' ' + stableStringify(args)`. Two calls share a signature iff they have the
+ * SAME command name AND structurally-equal args (key order ignored), so the same
+ * command with DIFFERENT args is a DIFFERENT signature = different work — only an EXACT
+ * repeat is flagged as no-progress. Pure (no clock/random/IO).
+ */
+function commandSignature(name: string, args: unknown): string {
+  return `${name} ${stableStringify(args)}`;
+}
+
+/**
+ * stableStringify — JSON serialization with object keys sorted recursively, so
+ * `{a:1,b:2}` and `{b:2,a:1}` serialize identically. Non-object args (primitive,
+ * array, null) serialize via plain `JSON.stringify` (arrays preserve order — element
+ * order IS meaningful). Arrays nested anywhere keep their order; only object KEYS are
+ * sorted. Pure and total for JSON-shaped command args. Used only by commandSignature.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const parts = keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`);
+  return `{${parts.join(',')}}`;
 }
 
 /**
