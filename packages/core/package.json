@@ -27,7 +27,7 @@
   "devDependencies": {
     "@block-agent/app-agent_identity": "*",
     "@block-agent/app-messages": "*",
-    "@block-agent/app-tools": "*",
+    "@block-agent/app-base": "*",
     "@block-agent/app-memory": "*",
     "@block-agent/app-task": "*",
     "@block-agent/app-stats": "*",

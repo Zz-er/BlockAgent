@@ -26,9 +26,8 @@ function mockConfig(storage_dir: string): LauncherConfig {
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: true },
       memory: { enabled: false },
-      actions: { enabled: false },
+      base: { enabled: false },
       memory_letta: { enabled: false },
       task: { enabled: false },
       stats: { enabled: false },

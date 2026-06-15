@@ -1,5 +1,5 @@
 /**
- * test/actions.test.ts — the actions BlockApp (ai_com/design/actions-app-architecture.md).
+ * test/base.test.ts — the base BlockApp (ai_com/design/actions-app-architecture.md).
  *
  * App-local coverage (§9 / §10.9). The cross-process no-recursion test and the full
  * end-to-end (launch wiring + messages report_input) are INTEGRATION and live in core —
@@ -31,12 +31,12 @@ import type { AppContext, BuildContext } from '@block-agent/core/app/types.js';
 import type { Block, InvokerContext } from '@block-agent/core/core/types.js';
 
 import {
-  ActionsApp,
+  BaseApp,
   ActionLogStore,
   RECENT_BLOCK,
   DEFAULT_CONFIG,
-  type ActionsState,
-  type ActionsConfig,
+  type BaseState,
+  type BaseConfig,
   type ActionRow,
   type ActionLogRecord,
 } from '../src/manifest.js';
@@ -59,12 +59,12 @@ const APP: InvokerContext = { invoker: 'app', identity: 'runtime' };
 
 /** The jsonl ledger path the app uses under a temp base dir. */
 function logPath(): string {
-  return join(dir, 'actions', 'log.jsonl');
+  return join(dir, 'base', 'log.jsonl');
 }
 
-/** Wire an ActionsApp through the REAL Operations + default PolicyEngine (the gates). */
-function wire(config?: Partial<ActionsConfig>) {
-  const app = new ActionsApp(dir);
+/** Wire an BaseApp through the REAL Operations + default PolicyEngine (the gates). */
+function wire(config?: Partial<BaseConfig>) {
+  const app = new BaseApp(dir);
   const reg = new AppRegistry();
   reg.install(app.manifest());
   const root: Block = {
@@ -77,8 +77,8 @@ function wire(config?: Partial<ActionsConfig>) {
 }
 
 /** The live state through the installed AppContext. */
-function liveState(reg: AppRegistry): ActionsState {
-  return reg.get_app_context('actions')?.state as ActionsState;
+function liveState(reg: AppRegistry): BaseState {
+  return reg.get_app_context('base')?.state as BaseState;
 }
 
 /** A command event arg (kind:'command' + ts), the shape the launch subscription passes. */
@@ -137,9 +137,9 @@ function fakeBuildContext(): BuildContext {
 }
 
 /** A minimal AppContext carrying a fixed state — all the builder reads (INV #16). */
-function stateCtx(state: ActionsState): AppContext<ActionsState> {
+function stateCtx(state: BaseState): AppContext<BaseState> {
   return {
-    app_id: 'actions',
+    app_id: 'base',
     state,
     set_state: () => undefined,
     list_commands: () => [],
@@ -150,13 +150,13 @@ function stateCtx(state: ActionsState): AppContext<ActionsState> {
     on: () => undefined,
     emit: () => undefined,
     spawn_system_agent: () => ({ id: 'x', stop: () => undefined }),
-  } as unknown as AppContext<ActionsState>;
+  } as unknown as AppContext<BaseState>;
 }
 
-/** Render `actions:recent` via its registered builder against the live state. */
-async function renderRecentBlock(reg: AppRegistry, state: ActionsState): Promise<Block | null> {
+/** Render `base:recent` via its registered builder against the live state. */
+async function renderRecentBlock(reg: AppRegistry, state: BaseState): Promise<Block | null> {
   const builder = reg.resolve_builder(RECENT_BLOCK as never);
-  if (builder === null) throw new Error('no builder for actions:recent');
+  if (builder === null) throw new Error('no builder for base:recent');
   return builder.build(fakeBuildContext(), stateCtx(state));
 }
 
@@ -173,12 +173,12 @@ describe('record → render round-trip', () => {
   it('a command + an input interleave in the window, sorted by seq', async () => {
     const { reg, ops } = wire();
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       inputArg('messages', '帮我记一下 A', { sender: 'user', ts: '14:30' }),
       APP,
     );
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       commandArg('memory.remember', { content: 'API 地址' }, true, {
         result: { id: 'note#7' },
         ref: 'memory:note#7',
@@ -202,7 +202,7 @@ describe('record → render round-trip', () => {
   it('command_detail=3 (default) preserves the result body; level 1 drops it', async () => {
     const { reg, ops } = wire();
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       commandArg('read_file', { path: '/etc/hosts' }, true, { result: 'the file body here' }),
       APP,
     );
@@ -220,9 +220,9 @@ describe('record → render round-trip', () => {
     // like the jsonl). Dropping command_detail to 1 (user-only) applies to NEW rows: a
     // command recorded after the retune drops the successful result body but keeps the
     // verb→ok signal. (The already-recorded L3 row keeps its body until it scrolls out.)
-    await ops.invoke_command('actions.set_config', { command_detail: 1 }, USER);
+    await ops.invoke_command('base.set_config', { command_detail: 1 }, USER);
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       commandArg('grep', { pattern: 'x' }, true, { result: 'a secret match body' }),
       APP,
     );
@@ -244,9 +244,9 @@ describe('failure → actions (the removed command_error counterpart)', () => {
   it('a failed command renders error at every detail level', async () => {
     for (const detail of [1, 2, 3] as const) {
       const { reg, ops } = wire();
-      if (detail !== 3) await ops.invoke_command('actions.set_config', { command_detail: detail }, USER);
+      if (detail !== 3) await ops.invoke_command('base.set_config', { command_detail: detail }, USER);
       await ops.invoke_command(
-        'actions.record',
+        'base.record',
         commandArg('task.add', { title: 'x' }, false, { error: 'backend 404' }),
         APP,
       );
@@ -268,7 +268,7 @@ describe('input does not duplicate messages', () => {
     const { reg, ops } = wire();
     expect(DEFAULT_CONFIG.input_detail).toBe(2);
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       inputArg('messages', 'short preview', { sender: 'user', content: 'THE FULL BODY lives in messages:recent' }),
       APP,
     );
@@ -281,9 +281,9 @@ describe('input does not duplicate messages', () => {
 
   it('input_detail=3 renders the full content', async () => {
     const { reg, ops } = wire();
-    await ops.invoke_command('actions.set_config', { input_detail: 3 }, USER);
+    await ops.invoke_command('base.set_config', { input_detail: 3 }, USER);
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       inputArg('messages', 'preview', { sender: 'user', content: 'THE FULL BODY' }),
       APP,
     );
@@ -299,9 +299,9 @@ describe('input does not duplicate messages', () => {
 describe('bounded window + overflow scroll-out', () => {
   it('window caps at window_size; older rows scroll out; compacted_seq advances; jsonl keeps all', async () => {
     const { reg, ops } = wire();
-    await ops.invoke_command('actions.set_config', { window_size: 3 }, USER);
+    await ops.invoke_command('base.set_config', { window_size: 3 }, USER);
     for (let i = 0; i < 6; i += 1) {
-      await ops.invoke_command('actions.record', commandArg(`cmd.${i}`, { i }, true), APP);
+      await ops.invoke_command('base.record', commandArg(`cmd.${i}`, { i }, true), APP);
     }
     const state = liveState(reg);
     // bounded to 3: only the last 3 seqs (3,4,5) remain in the window.
@@ -315,8 +315,8 @@ describe('bounded window + overflow scroll-out', () => {
 
   it('window_size=0 renders nothing but still logs + advances compacted_seq', async () => {
     const { reg, ops } = wire();
-    await ops.invoke_command('actions.set_config', { window_size: 0 }, USER);
-    await ops.invoke_command('actions.record', commandArg('x.y', {}, true), APP);
+    await ops.invoke_command('base.set_config', { window_size: 0 }, USER);
+    await ops.invoke_command('base.record', commandArg('x.y', {}, true), APP);
     const state = liveState(reg);
     expect(state.recent).toEqual([]);
     expect(state.compacted_seq).toBe(0);
@@ -333,9 +333,9 @@ describe('bounded window + overflow scroll-out', () => {
 describe('byte-identical render (INV #1 / #16)', () => {
   it('same state → byte-identical bytes; the builder reads no clock/random', async () => {
     const { reg, ops } = wire();
-    await ops.invoke_command('actions.record', inputArg('messages', 'hi', { sender: 'user' }), APP);
+    await ops.invoke_command('base.record', inputArg('messages', 'hi', { sender: 'user' }), APP);
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       commandArg('task.add', { title: 't' }, true, { ref: 'task#7' }),
       APP,
     );
@@ -362,9 +362,9 @@ describe('restart-from-jsonl seq seed (messages precedent)', () => {
     // First boot: write 4 records, scrolling some out of a window of 2.
     {
       const { reg, ops } = wire();
-      await ops.invoke_command('actions.set_config', { window_size: 2 }, USER);
+      await ops.invoke_command('base.set_config', { window_size: 2 }, USER);
       for (let i = 0; i < 4; i += 1) {
-        await ops.invoke_command('actions.record', commandArg(`a.${i}`, { i }, true), APP);
+        await ops.invoke_command('base.record', commandArg(`a.${i}`, { i }, true), APP);
       }
       expect(liveState(reg).recent.map((r) => r.seq)).toEqual([2, 3]);
     }
@@ -372,7 +372,7 @@ describe('restart-from-jsonl seq seed (messages precedent)', () => {
     // reuse of a seq that rolled out of the window.
     {
       const { reg, ops } = wire();
-      await ops.invoke_command('actions.record', commandArg('a.new', {}, true), APP);
+      await ops.invoke_command('base.record', commandArg('a.new', {}, true), APP);
       const state = liveState(reg);
       expect(state.recent[state.recent.length - 1]!.seq).toBe(4);
     }
@@ -383,7 +383,7 @@ describe('restart-from-jsonl seq seed (messages precedent)', () => {
   it('the window boots EMPTY (a live projection, not a restart-restore)', async () => {
     {
       const { ops } = wire();
-      await ops.invoke_command('actions.record', commandArg('a.0', {}, true), APP);
+      await ops.invoke_command('base.record', commandArg('a.0', {}, true), APP);
     }
     const { reg } = wire();
     expect(liveState(reg).recent).toEqual([]); // empty until new records arrive
@@ -397,28 +397,28 @@ describe('restart-from-jsonl seq seed (messages precedent)', () => {
 describe('invoker gates', () => {
   it('record is app-only: agent + user are denied', async () => {
     const { ops } = wire();
-    const asAgent = await ops.invoke_command('actions.record', commandArg('x.y', {}, true), AGENT);
-    const asUser = await ops.invoke_command('actions.record', commandArg('x.y', {}, true), USER);
+    const asAgent = await ops.invoke_command('base.record', commandArg('x.y', {}, true), AGENT);
+    const asUser = await ops.invoke_command('base.record', commandArg('x.y', {}, true), USER);
     expect(asAgent.ok).toBe(false);
     expect(asUser.ok).toBe(false);
-    const asApp = await ops.invoke_command('actions.record', commandArg('x.y', {}, true), APP);
+    const asApp = await ops.invoke_command('base.record', commandArg('x.y', {}, true), APP);
     expect(asApp.ok).toBe(true);
   });
 
   it('set_config is user-only: agent + app are denied (anti-self-mod)', async () => {
     const { ops } = wire();
-    const asAgent = await ops.invoke_command('actions.set_config', { window_size: 5 }, AGENT);
-    const asApp = await ops.invoke_command('actions.set_config', { window_size: 5 }, APP);
+    const asAgent = await ops.invoke_command('base.set_config', { window_size: 5 }, AGENT);
+    const asApp = await ops.invoke_command('base.set_config', { window_size: 5 }, APP);
     expect(asAgent.ok).toBe(false);
     expect(asApp.ok).toBe(false);
-    const asUser = await ops.invoke_command('actions.set_config', { window_size: 5 }, USER);
+    const asUser = await ops.invoke_command('base.set_config', { window_size: 5 }, USER);
     expect(asUser.ok).toBe(true);
   });
 
   it('set_config clamps out-of-range knobs (window_size, detail)', async () => {
     const { reg, ops } = wire();
     await ops.invoke_command(
-      'actions.set_config',
+      'base.set_config',
       { window_size: 9999, command_detail: 7, input_detail: 0 },
       USER,
     );
@@ -433,28 +433,28 @@ describe('invoker gates', () => {
 // show — full-record retrieval by seq
 // ---------------------------------------------------------------------------
 
-describe('actions.show', () => {
+describe('base.show', () => {
   it('pulls the full persisted record by seq (user + app, NOT the agent)', async () => {
     const { ops } = wire();
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       commandArg('task.add', { title: 'big payload' }, true, { result: { id: 't_7' } }),
       APP,
     );
-    const asUser = await ops.invoke_command('actions.show', { seq: 0 }, USER);
+    const asUser = await ops.invoke_command('base.show', { seq: 0 }, USER);
     expect(asUser.ok).toBe(true);
     const record = (asUser.data as { record: ActionLogRecord }).record;
     expect(record.name).toBe('task.add');
     expect(record.args).toEqual({ title: 'big payload' });
 
     // The agent is not in show's allowed_invokers.
-    const asAgent = await ops.invoke_command('actions.show', { seq: 0 }, AGENT);
+    const asAgent = await ops.invoke_command('base.show', { seq: 0 }, AGENT);
     expect(asAgent.ok).toBe(false);
   });
 
   it('a missing seq returns ok:false', async () => {
     const { ops } = wire();
-    const res = await ops.invoke_command('actions.show', { seq: 999 }, USER);
+    const res = await ops.invoke_command('base.show', { seq: 999 }, USER);
     expect(res.ok).toBe(false);
   });
 });
@@ -491,9 +491,9 @@ describe('ActionLogStore mechanics', () => {
 describe('input app-arbitrary extras', () => {
   it('extra fields land in the jsonl audit only, never in the rendered row', async () => {
     const { reg, ops } = wire();
-    await ops.invoke_command('actions.set_config', { input_detail: 3 }, USER);
+    await ops.invoke_command('base.set_config', { input_detail: 3 }, USER);
     await ops.invoke_command(
-      'actions.record',
+      'base.record',
       inputArg('im_proxy', 'hi', { sender: 'a2', content: 'body', conv_id: 'c1', mentions: ['x'] }),
       APP,
     );

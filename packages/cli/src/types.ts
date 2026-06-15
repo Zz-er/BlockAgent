@@ -70,13 +70,6 @@ export interface MessagesConfig {
   display_count?: number;
 }
 
-/** tools app config knobs. */
-export interface ToolsConfig {
-  enabled: boolean;
-  /** Subset of builtin tools to enable; absent → all enabled. */
-  enabled_tools?: string[];
-}
-
 /**
  * `task` app config knobs (§4.2). Enabled by default (zero dependency, local jsonl
  * store like `memory`). The agent can never retune these at runtime
@@ -98,13 +91,20 @@ export interface TaskConfig {
  * operator turns it on AND `show_block` is true (the builder renders null otherwise).
  */
 /**
- * actions ledger launcher toggle. The app's own knobs (window_size / command_detail /
- * input_detail / char limits) live in the app's seed config, not here — this only gates
- * boot install. Trusted, default-ON; runtime uninstall is guarded (F1), config-level
- * disable at boot is allowed.
+ * base app launcher toggle (formerly `actions`). The app's own ledger knobs (window_size /
+ * command_detail / input_detail / char limits) live in the app's seed config, not here —
+ * this only gates boot install. Trusted, default-ON; runtime uninstall is guarded (F1),
+ * config-level disable at boot is allowed.
+ *
+ * `enabled_tools` — the enabled-tool subset for the built-in tool commands (read_file /
+ * grep / bash / http_request), merged in from the former `tools` app. Absent → all four
+ * builtins enabled. Config-seeded only (the base app reads it at construction); the
+ * agent can never retune it.
  */
-export interface ActionsConfig {
+export interface BaseConfig {
   enabled: boolean;
+  /** Subset of builtin tools to enable; absent → all enabled. */
+  enabled_tools?: string[];
 }
 
 export interface StatsConfig {
@@ -182,10 +182,9 @@ export interface LauncherConfig {
   apps: {
     agent_identity: IdentityConfig;
     messages: MessagesConfig;
-    tools: ToolsConfig;
     memory: MemoryConfig;
-    /** The unified action/observation ledger; enabled by default (runtime uninstall guarded, F1). */
-    actions: ActionsConfig;
+    /** The unified action/observation ledger + built-in tools (formerly `actions`); enabled by default (runtime uninstall guarded, F1). */
+    base: BaseConfig;
     memory_letta: MemoryLettaConfig;
     /** §4.2 task tracker (local jsonl); enabled by default. */
     task: TaskConfig;

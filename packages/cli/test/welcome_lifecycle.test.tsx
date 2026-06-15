@@ -37,9 +37,8 @@ function mockLauncherConfig(dir: string, overrides: Partial<LauncherConfig> = {}
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: true },
       memory: { enabled: true },
-      actions: { enabled: false },
+      base: { enabled: false },
       memory_letta: { enabled: false },
       task: { enabled: false },
       stats: { enabled: false },

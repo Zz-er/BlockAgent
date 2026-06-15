@@ -100,17 +100,20 @@ function capture(): { setView: (v: CtxView) => void; last: () => CtxView | null 
 // ============================================================================
 
 describe('BUILTIN_APP_CATALOG', () => {
-  it('contains exactly 8 entries (the 5 originals + actions + the contract-model task / stats)', () => {
+  it('contains exactly 7 entries (the originals minus the merged-away tools, + base + the contract-model task / stats)', () => {
     const ids = BUILTIN_APP_CATALOG.map((e) => e.id);
-    expect(ids).toHaveLength(8);
+    expect(ids).toHaveLength(7);
     expect(ids).toContain('agent_identity');
     expect(ids).toContain('messages');
-    expect(ids).toContain('tools');
     expect(ids).toContain('memory');
-    expect(ids).toContain('actions');
+    expect(ids).toContain('base');
     expect(ids).toContain('memory_letta');
     expect(ids).toContain('task');
     expect(ids).toContain('stats');
+    // the `tools` app was merged into `base` (execution + display) and deleted; `actions`
+    // was renamed to `base`.
+    expect(ids).not.toContain('tools');
+    expect(ids).not.toContain('actions');
   });
 
   it('default_enabled values mirror DEFAULTS.apps', () => {
@@ -133,8 +136,8 @@ describe('BUILTIN_APP_CATALOG', () => {
     expect(letta!.requires!.length).toBeGreaterThan(0);
   });
 
-  it('all four core apps have default_enabled=true', () => {
-    for (const id of ['agent_identity', 'messages', 'tools', 'memory'] as const) {
+  it('the always-on core apps have default_enabled=true', () => {
+    for (const id of ['agent_identity', 'messages', 'memory', 'base'] as const) {
       const entry = BUILTIN_APP_CATALOG.find((e) => e.id === id);
       expect(entry?.default_enabled).toBe(true);
     }
@@ -438,41 +441,41 @@ describe('/app command dispatch', () => {
     expect(v.text).toContain('not installed');
   });
 
-  // ── F1: protected-app uninstall guard (actions-app §6) ──────────────────────
+  // ── F1: protected-app uninstall guard (base-app §6, formerly actions) ────────
 
-  it('F1: /app uninstall actions is rejected (observation floor) — no hotUninstall, no config write', async () => {
+  it('F1: /app uninstall base is rejected (observation floor) — no hotUninstall, no config write', async () => {
     // hotUninstall must NOT be called and the config must NOT be written: the guard fires
-    // BEFORE both. `actions` is installed here so we are not just hitting the not-installed path.
+    // BEFORE both. `base` is installed here so we are not just hitting the not-installed path.
     const hotCalls: string[] = [];
     const fakeHot = async (id: string): Promise<HotUninstallResult> => {
       hotCalls.push(id);
       return { ok: true };
     };
     const agent = makeFakeAgent({
-      installedIds: ['actions'],
+      installedIds: ['base'],
       configPath: cfgPath,
       hotUninstall: fakeHot,
     });
 
     const cap = capture();
-    await dispatch(agent, '/app uninstall actions', cap.setView);
+    await dispatch(agent, '/app uninstall base', cap.setView);
     const v = cap.last() as Extract<CtxView, { kind: 'command_result' }>;
 
     expect(v.ok).toBe(false);
     // Message names the app + the reason it is protected.
-    expect(v.text).toContain('actions');
+    expect(v.text).toContain('base');
     expect(v.text).toContain('observation floor');
     // The guard short-circuits: hotUninstall never ran, config never written.
     expect(hotCalls).toEqual([]);
     expect(existsSync(cfgPath)).toBe(false);
   });
 
-  it('F1: the guard fires even when actions is NOT installed (protected by id, not state)', async () => {
+  it('F1: the guard fires even when base is NOT installed (protected by id, not state)', async () => {
     // The guard is keyed on the id, so it rejects before the not-installed check — a user
     // can never uninstall the observation floor regardless of current install state.
     const agent = makeFakeAgent({ installedIds: [], configPath: cfgPath });
     const cap = capture();
-    await dispatch(agent, '/app uninstall actions', cap.setView);
+    await dispatch(agent, '/app uninstall base', cap.setView);
     const v = cap.last() as Extract<CtxView, { kind: 'command_result' }>;
     expect(v.ok).toBe(false);
     expect(v.text).toContain('observation floor');

@@ -34,14 +34,15 @@ export const DEFAULTS: LauncherConfig = {
   apps: {
     agent_identity: { enabled: true },
     messages: { enabled: true },
-    tools: { enabled: true },
     memory: { enabled: true },
-    // actions: the unified action/observation ledger (the agent's "did my command
-    // succeed" floor). Trusted, default-ON like the other always-on apps — it takes over
-    // the display role of tools:recent + runtime:command_error, so a default boot must
-    // ship it. Runtime uninstall is guarded (F1, commands.ts); config-level disable at
-    // boot stays allowed (sets enabled:false here).
-    actions: { enabled: true },
+    // base: the unified action/observation ledger (the agent's "did my command succeed"
+    // floor; formerly `actions`) PLUS the built-in tool commands (read_file / grep / bash /
+    // http_request — the former `tools` app, merged in). Trusted, default-ON like the
+    // other always-on apps — it takes over the display role of tools:recent +
+    // runtime:command_error AND owns the agent's tools, so a default boot must ship it.
+    // Runtime uninstall is guarded (F1, commands.ts); config-level disable at boot stays
+    // allowed (sets enabled:false here).
+    base: { enabled: true },
     memory_letta: { enabled: false },
     // task: local jsonl tracker, zero dependency → on by default like memory.
     task: { enabled: true },
@@ -339,9 +340,8 @@ export function loadConfig(
     apps: {
       agent_identity: resolveIdentity(flags, fileApps),
       messages: resolveMessages(flags, fileApps),
-      tools: resolveTools(flags, fileApps),
       memory: resolveMemory(flags, fileApps),
-      actions: resolveActions(flags, fileApps),
+      base: resolveBase(flags, fileApps),
       memory_letta: resolveMemoryLetta(flags, fileApps, env),
       task: resolveTask(flags, fileApps),
       stats: resolveStats(flags, fileApps),
@@ -420,18 +420,6 @@ function resolveMessages(
   };
 }
 
-function resolveTools(
-  flags: ParsedFlags,
-  fileApps: Record<string, unknown>,
-): LauncherConfig['apps']['tools'] {
-  const f = pickObject(fileApps['tools']);
-  const enabled_tools = pick(asStringArray(flags['enabled-tools']), asStringArray(f['enabled_tools']));
-  return {
-    enabled: appEnabled(flags, f, 'no-tools'),
-    ...(enabled_tools !== undefined ? { enabled_tools } : {}),
-  };
-}
-
 /**
  * resolveMemory — the built-in `memory` app config. Enabled by default (zero
  * dependency, offline). `--no-memory` disables it. notes/user char limits and the
@@ -475,19 +463,26 @@ function resolveTask(
 }
 
 /**
- * resolveActions — the `actions` ledger app config. DEFAULT-ENABLED (like task/memory):
- * on unless `--no-actions` or file `apps.actions.enabled:false`. Only the boot toggle
- * lives here; the app's own knobs (window_size / command_detail / input_detail / char
- * limits) are seeded inside the app, not the launcher config. Runtime uninstall is
+ * resolveBase — the `base` app config (formerly `actions`). DEFAULT-ENABLED (like
+ * task/memory): on unless `--no-base` or file `apps.base.enabled:false`. The boot toggle
+ * lives here; the app's own ledger knobs (window_size / command_detail / input_detail /
+ * char limits) are seeded inside the app, not the launcher config. Runtime uninstall is
  * separately guarded (F1, commands.ts) — config-level disable at boot is allowed.
+ *
+ * `enabled_tools` — the enabled-tool subset for the built-in tool commands (read_file /
+ * grep / bash / http_request), merged in from the former `tools` app. Flag `--enabled-tools
+ * a,b,c` > file `apps.base.enabled_tools`; absent → the app seeds all four builtins. It
+ * is config-seeded only (not command-tunable), so the base app reads it at construction.
  */
-function resolveActions(
+function resolveBase(
   flags: ParsedFlags,
   fileApps: Record<string, unknown>,
-): LauncherConfig['apps']['actions'] {
-  const f = pickObject(fileApps['actions']);
+): LauncherConfig['apps']['base'] {
+  const f = pickObject(fileApps['base']);
+  const enabled_tools = pick(asStringArray(flags['enabled-tools']), asStringArray(f['enabled_tools']));
   return {
-    enabled: appEnabled(flags, f, 'no-actions'),
+    enabled: appEnabled(flags, f, 'no-base'),
+    ...(enabled_tools !== undefined ? { enabled_tools } : {}),
   };
 }
 

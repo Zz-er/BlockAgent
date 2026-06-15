@@ -248,20 +248,21 @@ const appCommand: SlashCommand = {
         setView({ kind: 'command_result', ok: false, text: 'usage: /app uninstall <id>' });
         return;
       }
-      // F1 (actions-app §6): `actions` is the observation FLOOR — it is the sole carrier of
-      // failure + tool-result visibility once runtime:command_error and tools:recent (display)
-      // are removed. Runtime uninstall would silently drop both from the prompt (a regression
-      // worse than today, since "default-enabled" only covers a fresh boot). Reject it here,
+      // F1 (base-app §6, formerly `actions`): `base` is the observation FLOOR — it is the
+      // sole carrier of failure + tool-result visibility once runtime:command_error and the
+      // old tools:recent (display) are removed, AND it now owns the agent's built-in tools.
+      // Runtime uninstall would silently drop all of that from the prompt (a regression worse
+      // than today, since "default-enabled" only covers a fresh boot). Reject it here,
       // mirroring the reserved-`core`-id protection. Config-level disable at boot stays allowed
-      // (apps.actions.enabled:false) — only the runtime uninstall path is guarded.
-      if (id === 'actions') {
+      // (apps.base.enabled:false) — only the runtime uninstall path is guarded.
+      if (id === 'base') {
         setView({
           kind: 'command_result',
           ok: false,
           text:
-            "Cannot uninstall 'actions': it is the observation floor — failure + tool-result " +
-            'visibility live only here. To run without it, set apps.actions.enabled:false at ' +
-            'boot and accept losing both.',
+            "Cannot uninstall 'base': it is the observation floor (and owns the built-in " +
+            'tools) — failure + tool-result visibility live only here. To run without it, set ' +
+            'apps.base.enabled:false at boot and accept losing both.',
         });
         return;
       }

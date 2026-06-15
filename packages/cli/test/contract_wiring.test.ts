@@ -39,9 +39,8 @@ function fourAppConfig(dir: string): LauncherConfig {
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: false }, // not under test here; keep the catalog small
       memory: { enabled: false },
-      actions: { enabled: false },
+      base: { enabled: false },
       memory_letta: { enabled: false },
       task: { enabled: true },
       stats: { enabled: true },

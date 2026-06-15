@@ -1039,8 +1039,8 @@ export class MessagesApp {
       ref: input.id,
     };
     ctx.wake?.(event);
-    // (4) report this external input into the `actions` ledger (actions-app §3.3). Generic
-    // seam — messages does not know `actions` exists; the boot connects onInput → actions.record.
+    // (4) report this external input into the `base` ledger (base-app §3.3). Generic
+    // seam — messages does not know `base` exists; the boot connects onInput → base.record.
     // Guarded with `?.` like `wake` (inert if no runtime is wired). `ts` is stamped here at the
     // ingest boundary (clock legal — this is a handler, not a builder, so INV #16 is not engaged;
     // the pure render builder only READS the stored string). `preview` is a one-line hard-capped

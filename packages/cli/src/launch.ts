@@ -38,9 +38,8 @@ import { TaskCreateMockProvider } from '@block-agent/core/provider/task_create_m
 import { OaResolveMockProvider } from '@block-agent/core/provider/oa_resolve_mock.js';
 import { makeAgentIdentityApp } from '@block-agent/app-agent_identity/manifest.js';
 import { MessagesApp } from '@block-agent/app-messages/manifest.js';
-import { ToolsApp } from '@block-agent/app-tools/manifest.js';
 import { MemoryApp } from '@block-agent/app-memory/manifest.js';
-import { ActionsApp } from '@block-agent/app-actions/manifest.js';
+import { BaseApp } from '@block-agent/app-base/manifest.js';
 import { TaskApp } from '@block-agent/app-task/manifest.js';
 import { StatsApp } from '@block-agent/app-stats/manifest.js';
 import { MemoryLettaApp } from '@block-agent/app-memory_letta/memory_letta_app.js';
@@ -239,7 +238,7 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     dispatch_event: (_app_id, event, payload) => registry.dispatch_app_event(event, payload),
     // wake — scheduling signal (not policy-gated).
     wake: (event) => registry.wakeHook?.(event),
-    // report_input — input telemetry (actions §2.1; not policy-gated, like wake).
+    // report_input — input telemetry (base §2.1; not policy-gated, like wake).
     report_input: (d) => registry.inputHook?.(d),
     // The cross-process taint chain start point: ALS does not cross the fork, so the
     // host re-establishes 'sandboxed' around the child's framed callbacks (澄清#5).
@@ -257,7 +256,7 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
     });
 
   // 4) Renderer over the live App-context provider so state-driven projection builders
-  //    (messages:recent / tools:recent) read post-mutation state each render.
+  //    (messages:recent / base:recent) read post-mutation state each render.
   const renderer = new Renderer(registry, {
     app_context_provider: (app_id) => registry.get_app_context(app_id),
   });
@@ -317,14 +316,14 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
       .catch(() => undefined);
   });
 
-  // 5d) actions ledger subscriptions (actions-app §2.2 / §9). Two telemetry channels feed
-  //     the unified action/observation ledger, both routed through the app-only
-  //     `actions.record` command so they re-enter Operations + PolicyEngine (no bypass, INV
+  // 5d) base ledger subscriptions (base-app, formerly actions, §2.2 / §9). Two telemetry
+  //     channels feed the unified action/observation ledger, both routed through the app-only
+  //     `base.record` command so they re-enter Operations + PolicyEngine (no bypass, INV
   //     #11) — the focus-distiller pattern. The ledger is a dumb sink; the agent cannot forge
   //     it (`record` is invoker:'app' only).
   //
   //     RECURSION-FREE (hard constraint, §2.2): `onCommand` fires ONLY inside the runtime's
-  //     private invokeCommand (the agent lane). `actions.record` (invoker:'app') reaches the
+  //     private invokeCommand (the agent lane). `base.record` (invoker:'app') reaches the
   //     system via Operations.invoke_command DIRECTLY, which never traverses invokeCommand →
   //     never emits onCommand → no loop. (A no-recursion test guards this.)
   //
@@ -334,7 +333,7 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //     an onInput event. Mirrors the wakeHook late-injection, but drives a pure telemetry emit.
   registry.inputHook = (d) => runtime.emitInput(d);
 
-  //     onCommand → actions.record(kind:'command'). Stamp the wall-clock `ts` HERE at the
+  //     onCommand → base.record(kind:'command'). Stamp the wall-clock `ts` HERE at the
   //     subscription boundary as an ISO string (the clock is legal on the out-of-core
   //     telemetry seam — INV #16 only forbids it inside a builder's build; matches the
   //     string `ts` the record command + ActionLogRecord expect, and the messages ingest
@@ -343,18 +342,18 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   runtime.onCommand((e) => {
     void operations
       .invoke_command(
-        'actions.record',
+        'base.record',
         { kind: 'command', ...e, ts: new Date().toISOString() },
         { invoker: 'app' },
       )
       .catch(() => undefined);
   });
 
-  //     onInput → actions.record(kind:'input'). The InputDescriptor already carries its `ts`
+  //     onInput → base.record(kind:'input'). The InputDescriptor already carries its `ts`
   //     (stamped at the ingest handler, §3.3) — do NOT re-stamp here. Fire-and-forget + `.catch`.
   runtime.onInput((d) => {
     void operations
-      .invoke_command('actions.record', { kind: 'input', ...d }, { invoker: 'app' })
+      .invoke_command('base.record', { kind: 'input', ...d }, { invoker: 'app' })
       .catch(() => undefined);
   });
 
@@ -501,23 +500,25 @@ function installEnabledApps(
     messages = new MessagesApp({ dir: join(base, 'messages'), configBase: base });
     registry.install(messages.manifest());
   }
-  if (config.apps.tools.enabled) {
-    registry.install(new ToolsApp(base).manifest());
-  }
-  // Built-in memory (core; zero dependency). State-driven projection like tools, so
+  // The former `tools` app was merged into `base` (display AND execution): its 4 tool
+  // commands now install as `base.read_file` / `base.grep` / `base.bash` /
+  // `base.http_request`. No separate tools install — the base app (below) provides them.
+  // Built-in memory (core; zero dependency). State-driven projection, so
   // seedProjectionBlocks covers its `memory:*` blocks. Char limits / recall limit are
   // seeded into the app's config (file seed + launcher overrides).
   if (config.apps.memory.enabled) {
     registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
   }
-  // actions (built-in; core, zero dependency). The unified action/observation ledger
-  // (actions-app §3): a bounded `actions:recent` projection + a full off-tree jsonl audit
-  // under `<base>/actions/`. Default-ON like memory/tools — it takes over the display role
-  // of tools:recent + runtime:command_error. The two telemetry feeds (onCommand / onInput)
-  // are subscribed near the runtime construction (below); runtime uninstall is guarded (F1,
-  // commands.ts). `base` is the APPS_DIR root (the ActionsApp ctor appends `actions/`).
-  if (config.apps.actions.enabled) {
-    registry.install(new ActionsApp(base).manifest());
+  // base (built-in; core, zero dependency; formerly `actions`). The unified action/
+  // observation ledger (§3): a bounded `base:recent` projection + a full off-tree jsonl
+  // audit under `<appsBase>/base/`, PLUS the agent's built-in tool commands (read_file /
+  // grep / bash / http_request, merged from the former `tools` app). Default-ON like
+  // memory — it takes over the display role of the old tools:recent + runtime:command_error
+  // AND owns the agent's tools. The two telemetry feeds (onCommand / onInput) are subscribed
+  // near the runtime construction (above); runtime uninstall is guarded (F1, commands.ts).
+  // `base` (the variable) is the APPS_DIR root (the BaseApp ctor appends `base/`).
+  if (config.apps.base.enabled) {
+    registry.install(new BaseApp(base).manifest());
   }
   // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
   // @block-agent/app-memory_letta — core never imports it (DR-M4). base_url comes from
@@ -615,7 +616,7 @@ function capabilityCeilingFor(level: AppTrustLevel): ReadonlySet<string> {
  * CommandManifest's name/description/args_schema.
  *
  * USER-ONLY commands — those whose `allowed_invokers` is set and excludes `'agent'`
- * (e.g. agent_identity.set, messages.set_config, tools.set_config) — are filtered OUT:
+ * (e.g. agent_identity.set, messages.set_config, base.set_config) — are filtered OUT:
  * the PolicyEngine denies them to the agent at step 0 regardless, so advertising them
  * would only invite refused calls and waste a turn. Commands are static per install in
  * v3.0, so this is computed once at launch (the runtime holds it behind a thunk so a
@@ -692,9 +693,9 @@ async function applyAppConfigOverrides(
     }
   }
 
-  // tools no longer has a set_config command: its recent-N display moved to the
-  // `actions` app, so there is no tool_history_count to seed. (`enabled_tools` is a
-  // CLI-only config that is not applied via a runtime command.)
+  // The former `tools` app merged into `base` (display + execution). The enabled-tools
+  // subset is seeded inside the base app from its config (the `enabled_tools` config key,
+  // moved under `apps.base`); it is not command-tunable, so nothing is applied here.
 
   if (config.apps.memory.enabled) {
     const m = config.apps.memory;

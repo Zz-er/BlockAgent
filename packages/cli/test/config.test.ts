@@ -28,8 +28,8 @@ describe('parseFlags', () => {
   });
 
   it('treats a flag followed by another flag as boolean', () => {
-    const f = parseFlags(['--no-tools', '--model', 'm']);
-    expect(f['no-tools']).toBe(true);
+    const f = parseFlags(['--no-memory', '--model', 'm']);
+    expect(f['no-memory']).toBe(true);
     expect(f['model']).toBe('m');
   });
 });
@@ -41,7 +41,7 @@ describe('loadConfig precedence', () => {
     expect(cfg.provider.model).toBe(DEFAULTS.provider.model);
     expect(cfg.apps.agent_identity.enabled).toBe(true);
     expect(cfg.apps.messages.enabled).toBe(true);
-    expect(cfg.apps.tools.enabled).toBe(true);
+    expect(cfg.apps.base.enabled).toBe(true);
   });
 
   it('env overrides defaults; flags override env', () => {
@@ -65,8 +65,8 @@ describe('loadConfig precedence', () => {
   });
 
   it('--no-<app> disables an app', () => {
-    const cfg = loadConfig(['--no-tools', '--no-messages'], EMPTY_ENV);
-    expect(cfg.apps.tools.enabled).toBe(false);
+    const cfg = loadConfig(['--no-memory', '--no-messages'], EMPTY_ENV);
+    expect(cfg.apps.memory.enabled).toBe(false);
     expect(cfg.apps.messages.enabled).toBe(false);
     expect(cfg.apps.agent_identity.enabled).toBe(true);
   });

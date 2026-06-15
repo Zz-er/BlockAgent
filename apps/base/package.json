@@ -1,0 +1,34 @@
+{
+  "name": "@block-agent/app-base",
+  "version": "1.0.0",
+  "description": "base BlockApp (formerly actions, with the former tools app merged in): the unified action/observation ledger (agent command results + external inputs) PLUS the agent's built-in tool commands (read_file / grep / bash / http_request), so the agent sees its successes, not only its failures.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-base/manifest.js'.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "base",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": true,
+    "summary": "动作/观察统一台账 + 内置工具（read_file / grep / bash / http_request）：把智能体每条命令结果与每条外部输入记入有界窗口 + 完整 jsonl，让智能体既看到失败也看到成功。",
+    "provides": [],
+    "requires": null
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

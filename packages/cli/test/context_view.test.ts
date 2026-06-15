@@ -23,9 +23,8 @@ function mockConfig(storage_dir: string): LauncherConfig {
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: true },
       memory: { enabled: false },
-      actions: { enabled: false },
+      base: { enabled: true },
       memory_letta: { enabled: false },
       task: { enabled: false },
       stats: { enabled: false },
@@ -76,7 +75,7 @@ describe('context_view', () => {
   it('appsView reflects each app id, version, blocks, and commands (installed segment)', () => {
     const { installed, available } = appsView(agent);
     const ids = installed.map((a) => a.id);
-    expect(ids).toEqual(expect.arrayContaining(['agent_identity', 'messages', 'tools']));
+    expect(ids).toEqual(expect.arrayContaining(['agent_identity', 'messages', 'base']));
 
     const messages = installed.find((a) => a.id === 'messages')!;
     // messages owns the recent + summary projection blocks.

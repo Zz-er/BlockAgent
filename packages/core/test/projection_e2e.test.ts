@@ -25,7 +25,7 @@ import { Operations } from '../src/core/operations.js';
 import { Renderer } from '../src/core/renderer.js';
 import { AppRegistry } from '../src/app/registry.js';
 import { MessagesApp, RECENT_BLOCK as MSG_RECENT } from '@block-agent/app-messages/manifest.js';
-import { ToolsApp } from '@block-agent/app-tools/manifest.js';
+import { BaseApp } from '@block-agent/app-base/manifest.js';
 import {
   makeAgentIdentityApp,
   BLOCK_IDENTITY,
@@ -75,21 +75,22 @@ describe('live-AppContext projection seam (real Renderer + Registry path)', () =
     expect(text).toContain('deploy the staging build please');
   });
 
-  it('a tools command executes and returns its body in CommandResult.data (display lives in actions)', async () => {
+  it('a base tool command executes and returns its body in CommandResult.data', async () => {
     const reg = new AppRegistry();
-    // tools is display-free now: it renders no block. The tool body reaches the agent
-    // via CommandResult.data (which the `actions` app records), not a tools:recent block.
-    reg.install(new ToolsApp(join(dir, 'tools')).manifest());
+    // The former `tools` app merged into `base` (display AND execution). The tool body
+    // reaches the agent via CommandResult.data (which the base ledger records via
+    // onCommand) under the `base.<tool>` names — there is no separate tools app/block.
+    reg.install(new BaseApp(join(dir, 'base')).manifest());
     const ops = Operations.with_default_policy({ tree: new BlockTree(), registry: reg });
 
     // read THIS test file — a real, deterministic read.
     const path = new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
-    const res = await ops.invoke_command('tools.read_file', { path, invocation_id: 't1' }, USER);
+    const res = await ops.invoke_command('base.read_file', { path, invocation_id: 't1' }, USER);
     expect(res.ok).toBe(true);
     const data = res.data as { tool?: string; result?: string };
     expect(data.tool).toBe('read_file');
     expect(data.result).toContain('live-AppContext projection seam'); // a line from THIS file
-    // tools owns no projection block.
+    // no tools app exists anymore — no tools:recent block.
     expect(reg.resolve_builder('tools:recent' as BlockName)).toBeNull();
   });
 
@@ -155,7 +156,6 @@ describe('AppRegistry.seedProjectionBlocks (empty-tree boot is non-empty)', () =
     reg.install(makeAgentIdentityApp({ role: 'a release manager', persona: 'terse', instructions: 'ship safely' }));
     const msgs = new MessagesApp({ dir: join(dir, 'messages-seed') });
     reg.install(msgs.manifest());
-    reg.install(new ToolsApp(join(dir, 'tools-seed')).manifest());
     const tree = new BlockTree(); // empty-tree boot → synthetic core:root, no children
     const ops = Operations.with_default_policy({ tree, registry: reg });
     reg.commandRouter = (fn, a, inv) => ops.invoke_command(fn, a, inv);

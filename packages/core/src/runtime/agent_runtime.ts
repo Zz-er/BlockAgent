@@ -373,7 +373,7 @@ export class AgentRuntime {
    * agent never otherwise sees. Symmetric to onToolCall; the returned thunk unsubscribes.
    *
    * Fires ONLY in the agent lane (invokeCommand) — user/app commands reach the tree via
-   * Operations.invoke_command directly and never surface here, so `actions.record`
+   * Operations.invoke_command directly and never surface here, so `base.record`
    * (invoker:'app') produces zero CommandEvents (no recursion). INV #13: it feeds an
    * app-side sink, never the prompt.
    */
@@ -384,7 +384,7 @@ export class AgentRuntime {
 
   /**
    * onInput — subscribe to the input channel: one InputDescriptor per external input an app
-   * reports via `ctx.report_input`. The boot connects this to `actions.record(kind:'input')`.
+   * reports via `ctx.report_input`. The boot connects this to `base.record(kind:'input')`.
    * Pure telemetry, symmetric to onToolCall; the returned thunk unsubscribes.
    */
   onInput(listener: InputListener): () => void {
@@ -841,7 +841,7 @@ export class AgentRuntime {
    * because it never writes the tree and is never re-scanned for commands. No-op when nobody
    * is subscribed. Called ONLY from the agent lane (invokeCommand, success :950 / failure
    * :964) — NEVER from operations.ts (the universal chokepoint would loop on every
-   * invoker:'app' actions.record).
+   * invoker:'app' base.record).
    */
   private emitCommand(event: CommandEvent): void {
     if (this.command_listeners.size === 0) return;

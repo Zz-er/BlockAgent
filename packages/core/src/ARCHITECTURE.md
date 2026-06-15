@@ -259,7 +259,7 @@ triggering fact (e.g. the messages App appends `inbox.jsonl`, then wakes).
 
 ### live-AppContext projection seam (Renderer ↔ AppRegistry) — LOCKED 2026-05-26
 
-State-driven render-builders (`messages:summary` / `messages:recent` / `tools:recent`)
+State-driven render-builders (`messages:summary` / `messages:recent` / `base:recent`)
 project from `app_ctx.state`. The Renderer must read the SAME live AppContext the
 App's commands mutate, or it renders stale/empty after a `set_state`. The gap: the
 Renderer only had a STATIC `RendererOptions.app_contexts` Map (captured at
@@ -279,7 +279,7 @@ its live contexts at all.
   own type; the accessor is a new public method on AppRegistry).
 - **ACCEPTANCE GATE — `test/projection_e2e.test.ts`** (lead-mandated): proves the seam
   on the REAL Renderer+Registry path (NOT injected app_ctx) for all three projections —
-  `messages:recent` after `ingest`, `tools:recent` after `tools.read_file` via
+  `messages:recent` after `ingest`, `base:recent` after `base.read_file` via
   Operations, `agent_identity:identity` after `agent_identity.set` via Operations —
   plus a NEGATIVE guard (no seam wired ⇒ body absent) so the test can't false-pass.
   This is the standing regression guard for the "green unit tests but broken real loop"
@@ -384,6 +384,8 @@ becomes a conversation-history manager with automatic incremental compaction.
   jsonl stays full (compaction does not shrink the durable log).
 
 ### impl-tools → `src/apps/tools.ts` (§6.7) — recent-N projection (replaces per-id prefix-scan)
+
+> ⚠ **SUPERSEDED (2026-06-15).** The `tools` app was merged into the new **`base`** app and DELETED. The 4 tool commands are now `base.read_file` / `base.grep` / `base.bash` / `base.http_request` (capability gates unchanged). `tools:recent` was REMOVED — tool calls + results now flow through the core `onCommand` channel into `base`'s unified action/observation ledger (`base:recent`), which also replaced `runtime:command_error` (failures). The recent-N projection narrative below is historical; the current design is `ai_com/design/actions-app-architecture.md`.
 
 Keep the 4 tools + capability gating; CHANGE only the result projection.
 

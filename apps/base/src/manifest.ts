@@ -1,5 +1,6 @@
 /**
- * apps/actions — the `actions` BlockApp: the unified action/observation ledger.
+ * apps/base — the `base` BlockApp (formerly `actions`, with the former `tools` app merged
+ * in): the unified action/observation ledger PLUS the agent's built-in tool commands.
  *
  * Authoritative design: ai_com/design/actions-app-architecture.md (§3 data model,
  * §4 render, §5 commands, §7 overflow, §9 file list, §10 steps 3-6).
@@ -14,11 +15,11 @@
  * TWO LAYERS (§3):
  *   - LAYER 1 — full jsonl ledger off-tree (`ActionLogStore`): every record in FULL,
  *     append-only, ≤64KB/line throw-not-tear, startup tail-truncate, single-writer.
- *     This is the audit log `actions.show({seq})` joins on. Mechanics cloned from
- *     tools' `ToolHistoryStore` (apps/tools/src/manifest.ts:186-236).
- *   - LAYER 2 — bounded render state (`ActionsState.recent`): a count-bounded window
- *     of rendered rows (command + input, interleaved), the SAME bound `tools:recent`
- *     uses (INV #14). `RecentActionsBuilder` projects it into one block `actions:recent`.
+ *     This is the audit log `base.show({seq})` joins on. (Mechanics originally cloned
+ *     from the former `tools` app's history store, now merged away.)
+ *   - LAYER 2 — bounded render state (`BaseState.recent`): a count-bounded window
+ *     of rendered rows (command + input, interleaved), a count-bounded render window
+ *     (INV #14). `RecentActionsBuilder` projects it into one block `base:recent`.
  *
  * SEQ — the MESSAGES precedent, NOT tools' content-hash id. `seq` is a deterministic
  * monotonic counter; its high-water is seeded by scanning the jsonl tail for
@@ -38,15 +39,30 @@
  *     can never change how much of its own trajectory it sees (the `tools.set_config`
  *     / `messages.set_config` gate).
  *
+ * THE TOOL COMMANDS (merged from the former `tools` app): actions also AGGREGATES the
+ * agent's concrete tools — `base.read_file` / `base.grep` / `base.bash` /
+ * `base.http_request` (formerly `tools.*`). The `tools` app was deleted and folded
+ * here: a tool is just a command, available to every invoker, with per-invoker strictness
+ * decided by PolicyEngine (§9.4). Each tool command (a) refuses if not in `state.enabled`,
+ * (b) runs its handler, and (c) returns the result body in `CommandResult.data`
+ * (`{ tool, id, result }`) — which is the SINGLE path the tool output reaches the agent:
+ * the actions ledger captures it via `onCommand` at `command_detail=3`. The tool commands
+ * are commands (not builders), so a real fs read is fine (build-determinism INV #16
+ * constrains builders, not commands). CAPABILITIES are UNCHANGED: `bash` declares
+ * `op:dangerous` (agent → pending/approval), `http_request` declares `net:http` (host
+ * allowlist host-side), `read_file`/`grep` are real reads (no cap). NO RECURSION: a tool
+ * command on the agent lane fires onCommand → the launch sub calls `base.record`
+ * (invoker:'app') via Operations DIRECTLY (never the agent lane) → never re-emits onCommand.
+ *
  * INVARIANTS held here:
  *   #1 / #16  `RecentActionsBuilder` is PURE: reads `state.recent` only — never the
  *             jsonl, never a clock / random. `ts`/`seq` are STORED data (stamped at
  *             the boundary outside any build). Same state → byte-identical bytes.
  *    #4       builder owner is `system` ('agent' is illegal).
- *   #14       `ActionsState` is bounded JSON (window count-capped; full log is jsonl).
+ *   #14       `BaseState` is bounded JSON (window count-capped; full log is jsonl).
  *    #5       overflow archives to jsonl; no physical delete path.
- *   #11       `actions.record` re-enters Operations + PolicyEngine (the launch subs).
- *   #15       block name `actions:recent` (colon); commands dotted.
+ *   #11       `base.record` re-enters Operations + PolicyEngine (the launch subs).
+ *   #15       block name `base:recent` (colon); commands dotted.
  *
  * Contracts only: imports `app/types.js` + `core/types.js` + the architect-owned
  * `_app_config.js` helper; never the registry or a sibling app. House style (§0.5):
@@ -89,30 +105,30 @@ import { APPS_DIR, readAppConfig } from '@block-agent/core/apps/_app_config.js';
 // ============================================================================
 
 /** App id and tree namespace (§2). Block names use the bare id prefix (INV #15). */
-export const ACTIONS_APP_ID = 'actions' as const;
-const TREE_NAMESPACE = '/actions' as const;
+export const BASE_APP_ID = 'base' as const;
+const TREE_NAMESPACE = '/base' as const;
 
 /**
  * The ONE block this App renders: the recent-actions window. cache_tier `volatile`
  * — it changes every recorded action, so it renders at the tail next to
  * `messages:recent` (§4).
  */
-export const RECENT_BLOCK: BlockName = 'actions:recent';
+export const RECENT_BLOCK: BlockName = 'base:recent';
 
-/** The off-tree jsonl ledger file under `.block-agent/apps/actions/` (§3.1). */
+/** The off-tree jsonl ledger file under `.block-agent/apps/base/` (§3.1). */
 const LOG_FILE = 'log.jsonl' as const;
 
 /** §3.1 / §12.2: each jsonl line MUST be ≤ 64KB (a longer record is rejected, not torn). */
 const MAX_LINE_BYTES = 64 * 1024;
 
 // ============================================================================
-// The two telemetry payloads `actions.record` consumes (§2.1 / §3.3)
+// The two telemetry payloads `base.record` consumes (§2.1 / §3.3)
 // ============================================================================
 //
 // core owns the canonical shapes (`CommandEvent` / `InputDescriptor`, core/types.ts).
-// The launch subscriptions hand them to `actions.record` plus a `kind` discriminator
+// The launch subscriptions hand them to `base.record` plus a `kind` discriminator
 // (and, for commands, a boundary-stamped `ts` — InputDescriptor already carries its
-// own ts from the ingest site). `actions.record` is the DUMB SINK: it discriminates on
+// own ts from the ingest site). `base.record` is the DUMB SINK: it discriminates on
 // `kind` and reads only the public fields below. We alias the core types so a field
 // rename in core surfaces as a typecheck error here (tight coupling to the contract),
 // never a silent drift.
@@ -158,22 +174,35 @@ export type ActionRow =
     };
 
 /**
- * ActionsState (§3.2) — the bounded render state. `recent` is the count-bounded
+ * BaseState (§3.2) — the bounded render state. `recent` is the count-bounded
  * interleaved window; `config` carries the tunable knobs (schema-validated, INV #14);
  * `compacted_seq` is the high-water below which every seq has scrolled out / folded.
  */
-export interface ActionsState {
+export interface BaseState {
   recent: ActionRow[];
-  config: ActionsConfig;
+  config: BaseConfig;
   compacted_seq: number;
+  /**
+   * The set of enabled tool names (the `enabled` subset gate, merged from the former
+   * `tools` app). A string ARRAY not a Set — a Set is a class instance, rejected by INV
+   * #14 state validation; the array carries the same meaning ("the set of enabled tool
+   * names"). Config-seeded (BUILTIN_TOOLS by default); a tool command refuses if its name
+   * is not in this list, INDEPENDENT of policy (policy gates by invoker; `enabled` gates
+   * the tool category itself). Not command-tunable (tools' wasn't either).
+   */
+  enabled: string[];
 }
+
+/** The tools shipped enabled by default. Read-only reads first, then gated tools. */
+export const BUILTIN_TOOLS = ['read_file', 'grep', 'bash', 'http_request'] as const;
+export type BuiltinTool = (typeof BUILTIN_TOOLS)[number];
 
 // ----------------------------------------------------------------------------
 // Config (§3.4) — file-seeded + user-only command; CLAMP like tools.
 // ----------------------------------------------------------------------------
 
-/** Config knobs seeded from `.block-agent/apps/actions/config.json` (§3.4). */
-export interface ActionsConfig {
+/** Config knobs seeded from `.block-agent/apps/base/config.json` (§3.4). */
+export interface BaseConfig {
   /** Bounded render window (count) — CLAMP like tools' tool_history_count. */
   window_size: number;
   /** Overflow ratio (0..1), messages precedent. */
@@ -189,7 +218,7 @@ export interface ActionsConfig {
 }
 
 /** Compiled defaults (§3.4 — command_detail=3 / input_detail=2 are the locked v1 defaults). */
-export const DEFAULT_CONFIG: ActionsConfig = {
+export const DEFAULT_CONFIG: BaseConfig = {
   window_size: 20,
   compression_threshold: 0.8,
   command_detail: 3,
@@ -223,7 +252,7 @@ function clampRatio(n: unknown, fallback: number): number {
 }
 
 /** Clamp a whole config into range (boot seed + set_config both run this). */
-function clampConfig(cfg: ActionsConfig): ActionsConfig {
+function clampConfig(cfg: BaseConfig): BaseConfig {
   return {
     window_size: clampInt(cfg.window_size, MIN_WINDOW, MAX_WINDOW, DEFAULT_CONFIG.window_size),
     compression_threshold: clampRatio(cfg.compression_threshold, DEFAULT_CONFIG.compression_threshold),
@@ -251,10 +280,11 @@ function clampConfig(cfg: ActionsConfig): ActionsConfig {
  */
 const STATE_SCHEMA: JsonSchema = {
   type: 'object',
-  required: ['recent', 'config', 'compacted_seq'],
+  required: ['recent', 'config', 'compacted_seq', 'enabled'],
   properties: {
     recent: { type: 'array' },
     compacted_seq: { type: 'number' },
+    enabled: { type: 'array', items: { type: 'string' } },
     config: {
       type: 'object',
       required: [
@@ -297,7 +327,7 @@ export interface ActionLogRecord {
   result?: unknown;
   error?: string;
   ref?: string;
-  /** Input-only public fields (mirrored here for the jsonl audit + actions.show). */
+  /** Input-only public fields (mirrored here for the jsonl audit + base.show). */
   source?: string;
   sender?: string;
   preview?: string;
@@ -335,7 +365,7 @@ export class ActionLogStore {
     appendFileSync(this.path, line);
   }
 
-  /** Read all complete records currently in the file (seq seed / `actions.show` / tests). */
+  /** Read all complete records currently in the file (seq seed / `base.show` / tests). */
   readAll(): ActionLogRecord[] {
     if (!existsSync(this.path)) return [];
     const text = readFileSync(this.path, 'utf8');
@@ -351,7 +381,7 @@ export class ActionLogStore {
     return out;
   }
 
-  /** The full record for one `seq` (the `actions.show` join), or null if absent. */
+  /** The full record for one `seq` (the `base.show` join), or null if absent. */
   findBySeq(seq: number): ActionLogRecord | null {
     // Scan from the tail — recent records are the common lookup, and seqs are unique.
     const all = this.readAll();
@@ -400,6 +430,178 @@ export class ActionLogStore {
 /** Ordinary tree write — `record` + `set_config` both write the projection / config. */
 const CAP_BLOCK_WRITE: Capability = { name: 'block:write' };
 
+// ----------------------------------------------------------------------------
+// Tool capability tokens (merged from the former `tools` app, §9.4 — UNCHANGED)
+// ----------------------------------------------------------------------------
+//
+// Names match core/policy.ts CAP.* exactly; re-declared here as strings rather than
+// importing the policy impl (contracts-only rule). The engine special-cases:
+//   - `net:http`     — agent: granted-but-host-scoped (host allowlisting is a host-side
+//                      concern, §9.4 H2).
+//   - `op:dangerous` — agent: → `pending` (approval, §9.4 "危险命令 → 触发审批流").
+
+/** Outbound HTTP — `http_request` needs it (§9.4 出站网络 host). */
+const CAP_NET_HTTP: Capability = { name: 'net:http' };
+/** Marks a destructive command → agent invoker resolves to `pending` (§9.4). */
+const CAP_DANGEROUS: Capability = { name: 'op:dangerous' };
+
+// ============================================================================
+// Tool implementations (merged from `tools`) — each produces a ToolCallRecord
+// ============================================================================
+//
+// A tool handler returns a ToolCallRecord; the command wrapper (below) returns it as
+// `CommandResult.data`. NO handler writes a block op (display is the actions ledger via
+// onCommand), and `build` never runs here — these are command-path handlers, so a real
+// fs read is fine (build-determinism INV #16 constrains builders, not commands).
+
+/**
+ * One tool call's result (request + result), returned to the caller in
+ * `CommandResult.data` and captured by the actions ledger via `onCommand`. Not persisted
+ * separately — the record exists only for the duration of one command.
+ */
+export interface ToolCallRecord {
+  /** Stable invocation id (caller-supplied tool_call id, or derived — see below). */
+  id: string;
+  tool: BuiltinTool;
+  /** The request args, normalized to a plain JSON object (or null if none). */
+  request: Record<string, unknown> | null;
+  ok: boolean;
+  /** The result body text (what the agent reads back); empty on error. */
+  result: string;
+  /** Set when ok === false. */
+  error?: string;
+}
+
+/** Build a success record for a tool call. */
+function toolOk(
+  tool: BuiltinTool,
+  id: string,
+  request: Record<string, unknown> | null,
+  result: string,
+): ToolCallRecord {
+  return { id, tool, request, ok: true, result };
+}
+
+/** Build a failure record for a tool call (result body empty, error set). */
+function toolFail(
+  tool: BuiltinTool,
+  id: string,
+  request: Record<string, unknown> | null,
+  error: string,
+): ToolCallRecord {
+  return { id, tool, request, ok: false, result: '', error: `${tool}: ${error}` };
+}
+
+/** `read_file` — read a UTF-8 text file. Real, side-effect-free read. */
+async function readFileTool(id: string, args: unknown): Promise<ToolCallRecord> {
+  const request = asRecord(args);
+  const path = stringArg(args, 'path');
+  if (path === null) return toolFail('read_file', id, request, 'missing string arg `path`');
+  try {
+    const { readFile: fsReadFile } = await import('node:fs/promises');
+    const text = await fsReadFile(path, 'utf8');
+    return toolOk('read_file', id, request, text);
+  } catch (err) {
+    return toolFail('read_file', id, request, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** `grep` — search a file's lines for a literal substring (deterministic). */
+async function grepTool(id: string, args: unknown): Promise<ToolCallRecord> {
+  const request = asRecord(args);
+  const pattern = stringArg(args, 'pattern');
+  const path = stringArg(args, 'path');
+  if (pattern === null) return toolFail('grep', id, request, 'missing string arg `pattern`');
+  if (path === null) return toolFail('grep', id, request, 'missing string arg `path`');
+  try {
+    const { readFile: fsReadFile } = await import('node:fs/promises');
+    const text = await fsReadFile(path, 'utf8');
+    const lines = text.split('\n');
+    const matches: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? '';
+      if (line.includes(pattern)) matches.push(`${i + 1}:${line}`);
+    }
+    return toolOk('grep', id, request, matches.join('\n'));
+  } catch (err) {
+    return toolFail('grep', id, request, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * `bash` — run a shell command. DANGEROUS: declares `op:dangerous`, so the agent invoker
+ * is gated to `pending` BEFORE this runs (§9.4). v3.0 SAFE STUB: records the requested
+ * command, does NOT spawn a shell.
+ */
+async function bashTool(id: string, args: unknown): Promise<ToolCallRecord> {
+  const request = asRecord(args);
+  const command = stringArg(args, 'command');
+  if (command === null) return toolFail('bash', id, request, 'missing string arg `command`');
+  return toolOk('bash', id, request, `[bash stub] would run: ${command}`);
+}
+
+/**
+ * `http_request` — make an outbound HTTP call. Declares `net:http` (§9.4): the agent is
+ * granted the token but the host must be allowlisted host-side. v3.0 SAFE STUB: records the
+ * requested (method, url), does NOT open a socket.
+ */
+async function httpRequestTool(id: string, args: unknown): Promise<ToolCallRecord> {
+  const request = asRecord(args);
+  const url = stringArg(args, 'url');
+  if (url === null) return toolFail('http_request', id, request, 'missing string arg `url`');
+  const method = stringArg(args, 'method') ?? 'GET';
+  return toolOk('http_request', id, request, `[http_request stub] would ${method} ${url}`);
+}
+
+// ----------------------------------------------------------------------------
+// Tool command wrapper — enabled gate → run → return result in CommandResult.data
+// ----------------------------------------------------------------------------
+//
+// Each tool command (a) refuses if the tool is not in `state.enabled` (independent of
+// policy), (b) runs the handler, and (c) returns the record body in `CommandResult.data`
+// (`{ tool, id, result }`). That returned data is the ONLY path the tool output reaches the
+// agent — the actions ledger captures it via `onCommand` at `command_detail=3`. The tool
+// command writes NO block and keeps NO state.
+
+/** The runner signature each tool exposes. */
+type ToolRunner = (id: string, args: unknown) => Promise<ToolCallRecord>;
+
+function toolCommand(
+  tool: BuiltinTool,
+  description: string,
+  capabilities: Capability[],
+  run: ToolRunner,
+  argsSchema: JsonSchema,
+): CommandManifest<BaseState> {
+  return {
+    name: tool,
+    description,
+    args_schema: argsSchema,
+    capabilities,
+    async invoke(
+      args: unknown,
+      ctx: AppContext<BaseState>,
+      _invoker: InvokerContext,
+    ): Promise<CommandResult> {
+      // A disabled tool refuses before doing anything — independent of policy (policy
+      // gates by invoker; `enabled` gates the tool category itself).
+      if (!ctx.state.enabled.includes(tool)) {
+        return { ok: false, error: `${tool}: tool '${tool}' is not enabled`, data: { tool } };
+      }
+
+      const id = invocationIdFor(tool, args);
+      const record = await run(id, args);
+
+      // Return the record as data — the actions ledger captures `{ tool, id, result }` via
+      // onCommand (command_detail=3). No block op, no state mutation: the command executes
+      // the tool, the ledger displays it.
+      return record.ok
+        ? { ok: true, data: { tool, id, result: record.result } }
+        : { ok: false, error: record.error ?? `${tool} failed`, data: { tool, id } };
+    },
+  };
+}
+
 // ============================================================================
 // Pure row-building helpers (no IO, no clock, no random)
 // ============================================================================
@@ -421,6 +623,39 @@ function canonicalJson(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(',')}}`;
 }
 
+// ----------------------------------------------------------------------------
+// Tool-arg helpers (merged from `tools`) — no IO, no clock, no random
+// ----------------------------------------------------------------------------
+
+/** Read a string-valued arg by key from an args record; null if absent/non-string. */
+function stringArg(args: unknown, key: string): string | null {
+  const rec = asRecord(args);
+  if (rec === null) return null;
+  const v = rec[key];
+  return typeof v === 'string' ? v : null;
+}
+
+/**
+ * Pull the caller-supplied invocation id, or derive a stable one (no clock/random). A
+ * turn's tool_call id maps 1:1 to its record; absent → FNV-1a over (tool, args) so replays
+ * of the same call are byte-identical.
+ */
+function invocationIdFor(tool: BuiltinTool, args: unknown): string {
+  const explicit = stringArg(args, 'invocation_id');
+  if (explicit !== null) return explicit;
+  return `${tool}.${fnv1a(`${tool}:${canonicalJson(args)}`)}`;
+}
+
+/** FNV-1a 32-bit hex — a stable, dependency-free content hash for invocation ids. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
 /**
  * Build the bounded command ROW for `state.recent` from a full command event, applying
  * the `command_detail` level (§4):
@@ -430,7 +665,7 @@ function canonicalJson(value: unknown): string {
  * The full record is always in the jsonl regardless of level; errors render at ALL
  * levels (the failure signal is never lost — only successful result bodies drop below 3).
  */
-function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: ActionsConfig): ActionRow {
+function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: BaseConfig): ActionRow {
   const row: ActionRow = {
     seq,
     kind: 'command',
@@ -457,7 +692,7 @@ function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: A
  * the `input_detail` level: L1 = source + sender + ts; L2 = + truncated preview (the
  * full body stays in `messages:recent` — no dup at the default); L3 = + full content.
  */
-function buildInputRow(seq: number, ts: string, d: InputDescriptorLike, config: ActionsConfig): ActionRow {
+function buildInputRow(seq: number, ts: string, d: InputDescriptorLike, config: BaseConfig): ActionRow {
   const row: ActionRow = {
     seq,
     kind: 'input',
@@ -506,7 +741,7 @@ function asRecord(args: unknown): Record<string, unknown> | null {
 }
 
 /**
- * actions.record — the DUMB SINK (§5). `allowed_invokers:['app']`: only the two launch
+ * base.record — the DUMB SINK (§5). `allowed_invokers:['app']`: only the two launch
  * subscriptions (onCommand / onInput, both fired with `invoker:'app'`) reach it; the
  * agent can never forge the ledger. Discriminates on `kind`:
  *   - kind:'command' → append the full CommandEvent (+ts) to jsonl; push a bounded
@@ -514,12 +749,12 @@ function asRecord(args: unknown): Record<string, unknown> | null {
  *   - kind:'input'   → append the full InputDescriptor (+ts +extras) to jsonl; push a
  *     bounded input row into state.recent.
  * On overflow the oldest rows scroll out of the window and `compacted_seq` advances to
- * the max scrolled-out seq (§7) — the jsonl keeps everything (INV #5; `actions.show`).
+ * the max scrolled-out seq (§7) — the jsonl keeps everything (INV #5; `base.show`).
  *
  * `ctx.config` is NOT used for the window/detail — those live in `state.config` (so
  * they are schema-validated and user-retunable at runtime, the tools precedent).
  */
-function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): CommandManifest<ActionsState> {
+function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): CommandManifest<BaseState> {
   return {
     name: 'record',
     description: 'Append one action/input to the ledger (app/runtime only).',
@@ -536,7 +771,7 @@ function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): Co
     },
     async invoke(
       args: unknown,
-      ctx: AppContext<ActionsState>,
+      ctx: AppContext<BaseState>,
       _invoker: InvokerContext,
     ): Promise<CommandResult> {
       const a = asRecord(args);
@@ -572,7 +807,7 @@ function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): Co
         if (d.content !== undefined) logRecord.content = d.content;
         // Carry any app-arbitrary extras into the jsonl audit (everything except the
         // framing keys + the public fields the typed record already names). `actions`
-        // never parses them — they ride along for the full-record audit / `actions.show`.
+        // never parses them — they ride along for the full-record audit / `base.show`.
         for (const key of Object.keys(a)) {
           if (key === 'kind' || key === 'ts' || key === 'source' || key === 'sender') continue;
           if (key === 'preview' || key === 'content') continue;
@@ -597,18 +832,18 @@ function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): Co
   };
 }
 
-/** Args for `actions.show`. */
+/** Args for `base.show`. */
 interface ShowArgs {
   seq?: number;
 }
 
 /**
- * actions.show({ seq }) — readonly retrieval of the FULL persisted record by seq (§5).
+ * base.show({ seq }) — readonly retrieval of the FULL persisted record by seq (§5).
  * `allowed_invokers:['user','app']`, readonly (no ops). NOT in the agent catalog (the
  * agent reads the rendered window; full bodies are an operator/host concern). Joins on
  * the jsonl audit log via `ActionLogStore.findBySeq`.
  */
-function showCommand(store: ActionLogStore): CommandManifest<ActionsState> {
+function showCommand(store: ActionLogStore): CommandManifest<BaseState> {
   return {
     name: 'show',
     description: 'Show the full persisted record for one `seq` (user/app readonly).',
@@ -621,7 +856,7 @@ function showCommand(store: ActionLogStore): CommandManifest<ActionsState> {
     },
     async invoke(
       args: unknown,
-      _ctx: AppContext<ActionsState>,
+      _ctx: AppContext<BaseState>,
       _invoker: InvokerContext,
     ): Promise<CommandResult> {
       const a = args as ShowArgs | undefined;
@@ -634,7 +869,7 @@ function showCommand(store: ActionLogStore): CommandManifest<ActionsState> {
   };
 }
 
-/** Args for `actions.set_config` — every knob optional (retune just what you name). */
+/** Args for `base.set_config` — every knob optional (retune just what you name). */
 interface SetConfigArgs {
   window_size?: number;
   compression_threshold?: number;
@@ -645,7 +880,7 @@ interface SetConfigArgs {
 }
 
 /**
- * actions.set_config(...) — user-only runtime retune of the window/threshold/detail/
+ * base.set_config(...) — user-only runtime retune of the window/threshold/detail/
  * char-limits (§5). `allowed_invokers:['user']` makes PolicyEngine DENY invoker `agent`
  * (and `app`) on the invoker gate (the same anti-self-mod gate as `tools.set_config` /
  * `messages.set_config` — the agent can never change how much of its own trajectory it
@@ -659,7 +894,7 @@ interface SetConfigArgs {
  * trimmed). This keeps the render a pure function of the stored rows (INV #1) and avoids
  * re-deriving content the row no longer holds.
  */
-function setConfigCommand(): CommandManifest<ActionsState> {
+function setConfigCommand(): CommandManifest<BaseState> {
   return {
     name: 'set_config',
     description:
@@ -679,14 +914,14 @@ function setConfigCommand(): CommandManifest<ActionsState> {
     },
     async invoke(
       args: unknown,
-      ctx: AppContext<ActionsState>,
+      ctx: AppContext<BaseState>,
       _invoker: InvokerContext,
     ): Promise<CommandResult> {
       const a = (args as SetConfigArgs | undefined) ?? {};
       if (Object.keys(a).length === 0)
         return { ok: false, error: 'set_config requires at least one knob to retune' };
       ctx.set_state((s) => {
-        const merged = clampConfig({ ...s.config, ...a } as ActionsConfig);
+        const merged = clampConfig({ ...s.config, ...a } as BaseConfig);
         const ws = merged.window_size;
         return {
           ...s,
@@ -694,17 +929,17 @@ function setConfigCommand(): CommandManifest<ActionsState> {
           recent: ws <= 0 ? [] : s.recent.slice(Math.max(0, s.recent.length - ws)),
         };
       });
-      return { ok: true, data: { config: (ctx.state as ActionsState).config } };
+      return { ok: true, data: { config: (ctx.state as BaseState).config } };
     },
   };
 }
 
 // ============================================================================
-// RecentActionsBuilder — the single volatile owner of `actions:recent`
+// RecentActionsBuilder — the single volatile owner of `base:recent`
 // ============================================================================
 
 /**
- * RecentActionsBuilder — owns the single block `actions:recent` (INV #3: one owner per
+ * RecentActionsBuilder — owns the single block `base:recent` (INV #3: one owner per
  * name) and renders the bounded interleaved window. cache_tier `volatile` — it changes
  * every recorded action, so it renders at the tail next to `messages:recent` (§4).
  * owner `'system'` (never 'agent', INV #4).
@@ -719,12 +954,12 @@ function recentActionsBuilder(): BuilderManifest {
     name: 'RecentActionsBuilder',
     version: '1.0.0',
     owner: 'system', // INV #4: 'agent' is illegal.
-    app_id: ACTIONS_APP_ID,
+    app_id: BASE_APP_ID,
     inputs: [],
     outputs: [RECENT_BLOCK],
     cache_tier: 'volatile',
     async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
-      const state = app_ctx?.state as ActionsState | undefined;
+      const state = app_ctx?.state as BaseState | undefined;
       const recent = state?.recent ?? [];
       if (recent.length === 0) return null;
       return {
@@ -794,52 +1029,63 @@ function renderInputRow(row: Extract<ActionRow, { kind: 'input' }>): string {
 // ============================================================================
 
 /**
- * ActionsApp — the concrete `actions` BlockApp. Holds the durable jsonl ledger and a
+ * BaseApp — the concrete `base` BlockApp. Holds the durable jsonl ledger and a
  * monotonic seq counter (high-water seeded from the jsonl tail). `manifest()` produces
  * the AppManifest the AppRegistry installs. Config is seeded from the App's config.json
  * at construction (off the hot path), clamped, then carried in state.
  *
- * The default storage/config base dir is `.block-agent/apps/actions/`; tests inject a
+ * The default storage/config base dir is `.block-agent/apps/base/`; tests inject a
  * temp dir so they neither read the repo's real config nor write to it.
  */
-export class ActionsApp {
+export class BaseApp {
   readonly store: ActionLogStore;
-  private readonly config: ActionsConfig;
+  private readonly config: BaseConfig;
+  /** The enabled-tool subset (merged from `tools`): config-seeded over BUILTIN_TOOLS. */
+  private readonly enabled: string[];
   /** Shared monotonic seq cursor: seeded from the jsonl tail, advanced by `record`. */
   private readonly nextSeqRef: { value: number };
 
   constructor(baseDir: string = APPS_DIR) {
-    const dir = join(baseDir, ACTIONS_APP_ID);
+    const dir = join(baseDir, BASE_APP_ID);
     mkdirSync(dir, { recursive: true });
     this.store = new ActionLogStore(join(dir, LOG_FILE));
     // Seed config from the file over the compiled defaults (never throws at boot), then
     // clamp before it reaches state. The helper is generic over Record<string,unknown>.
     const defaults: Record<string, unknown> = { ...DEFAULT_CONFIG };
-    const seeded = readAppConfig(ACTIONS_APP_ID, defaults, baseDir);
-    this.config = clampConfig(seeded as unknown as ActionsConfig);
+    const seeded = readAppConfig(BASE_APP_ID, defaults, baseDir);
+    this.config = clampConfig(seeded as unknown as BaseConfig);
+    // The enabled-tools subset (merged from the former `tools` app): read an optional
+    // `enabled_tools` string array from the same config file (over the BUILTIN_TOOLS
+    // default). Config-seeded only — not command-tunable (tools' wasn't either).
+    const rawEnabled = (seeded as Record<string, unknown>)['enabled_tools'];
+    this.enabled =
+      Array.isArray(rawEnabled) && rawEnabled.every((x) => typeof x === 'string')
+        ? [...(rawEnabled as string[])]
+        : [...BUILTIN_TOOLS];
     // High-water seq seed from the jsonl tail (§3.1) — NOT from the bounded window.
     this.nextSeqRef = { value: this.store.nextSeq() };
   }
 
   /**
    * The AppManifest to hand to `AppRegistry.install`. Returned widened to the bare
-   * `AppManifest` (TEAM CONVENTION — the TS2379 fix); the typed `ActionsState`
+   * `AppManifest` (TEAM CONVENTION — the TS2379 fix); the typed `BaseState`
    * discipline is kept inside the command/builder factories.
    *
    * `recent` boots EMPTY: the bounded window is a live projection of incoming records,
-   * not a restart-restore (the full audit is the jsonl; `actions.show` reaches it). The
+   * not a restart-restore (the full audit is the jsonl; `base.show` reaches it). The
    * seq counter still resumes from the jsonl high-water so a restart never reuses a seq.
    */
   manifest(): AppManifest {
     const store = this.store;
     const nextSeqRef = this.nextSeqRef;
-    const initial_state: ActionsState = {
+    const initial_state: BaseState = {
       recent: [],
       config: this.config,
       compacted_seq: -1,
+      enabled: [...this.enabled],
     };
-    const manifest: AppManifest<ActionsState> = {
-      id: ACTIONS_APP_ID,
+    const manifest: AppManifest<BaseState> = {
+      id: BASE_APP_ID,
       version: '1.0.0',
       depends_on: [],
       tree_namespace: TREE_NAMESPACE,
@@ -850,6 +1096,49 @@ export class ActionsApp {
         () => recordCommand(store, nextSeqRef),
         () => showCommand(store),
         () => setConfigCommand(),
+        // Tool commands (merged from the former `tools` app), exposed as `base.<tool>`.
+        // Capability gates UNCHANGED (§9.4): bash → op:dangerous (agent → pending),
+        // http_request → net:http (host-allowlisted), read_file/grep are real reads.
+        () =>
+          toolCommand(
+            'read_file',
+            'Read a UTF-8 text file; the body is returned in the command result.',
+            [],
+            readFileTool,
+            { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+          ),
+        () =>
+          toolCommand(
+            'grep',
+            'Search a file for a literal substring; matches are returned in the command result.',
+            [],
+            grepTool,
+            {
+              type: 'object',
+              required: ['pattern', 'path'],
+              properties: { pattern: { type: 'string' }, path: { type: 'string' } },
+            },
+          ),
+        () =>
+          toolCommand(
+            'bash',
+            'Run a shell command (DANGEROUS → agent invoker requires approval).',
+            [CAP_DANGEROUS],
+            bashTool,
+            { type: 'object', required: ['command'], properties: { command: { type: 'string' } } },
+          ),
+        () =>
+          toolCommand(
+            'http_request',
+            'Make an outbound HTTP request (net:http → host-allowlisted for the agent).',
+            [CAP_NET_HTTP],
+            httpRequestTool,
+            {
+              type: 'object',
+              required: ['url'],
+              properties: { url: { type: 'string' }, method: { type: 'string' } },
+            },
+          ),
       ],
     };
     return manifest as AppManifest;
@@ -857,12 +1146,12 @@ export class ActionsApp {
 }
 
 /**
- * makeActionsApp — convenience factory that constructs an `ActionsApp` (default storage
+ * makeBaseApp — convenience factory that constructs an `BaseApp` (default storage
  * dir) and returns its manifest, for callers that don't need the App handle. Tests that
- * need a temp dir or the durable store construct `new ActionsApp(dir)` directly.
+ * need a temp dir or the durable store construct `new BaseApp(dir)` directly.
  */
-export function makeActionsApp(): AppManifest {
-  return new ActionsApp().manifest();
+export function makeBaseApp(): AppManifest {
+  return new BaseApp().manifest();
 }
 
 // Re-export names + defaults + pure helpers for tests / cross-app references.

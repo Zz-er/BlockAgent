@@ -22,9 +22,8 @@ function mockConfig(storage_dir: string): LauncherConfig {
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: true },
       memory: { enabled: false },
-      actions: { enabled: false },
+      base: { enabled: true },
       memory_letta: { enabled: false },
       task: { enabled: false },
       stats: { enabled: false },
@@ -119,7 +118,7 @@ describe('dispatch', () => {
     const view = cap.last() as Extract<CtxView, { kind: 'status' }>;
     expect(view.kind).toBe('status');
     expect(view.provider_id).toBe('mock');
-    // 3 config-enabled apps (agent_identity, messages, tools) + 2 always-on
+    // 3 config-enabled apps (agent_identity, messages, base) + 2 always-on
     // infrastructure apps installed unconditionally at boot: turn_log (the onTurn
     // ledger) and focus (the working-state distiller). Both are presence/runtime
     // apps not gated by config.apps, so they always count.

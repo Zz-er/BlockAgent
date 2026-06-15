@@ -51,14 +51,14 @@ async function drain(it: AsyncIterable<ProviderChunk>): Promise<ProviderChunk[]>
 
 describe('encodeToolNames', () => {
   it('produces wire-safe names (no dot) and round-trips via decode', () => {
-    const enc = encodeToolNames(['messages.reply', 'tools.read_file', 'agent_identity.set']);
+    const enc = encodeToolNames(['messages.reply', 'base.read_file', 'agent_identity.set']);
     for (const w of enc.wire) {
       expect(w).not.toContain('.');
       expect(w).toMatch(/^[a-zA-Z0-9_-]+$/);
     }
     // decode reverses each wire name to its original command full name.
     expect(enc.decode(enc.wire[0]!)).toBe('messages.reply');
-    expect(enc.decode(enc.wire[1]!)).toBe('tools.read_file');
+    expect(enc.decode(enc.wire[1]!)).toBe('base.read_file');
     expect(enc.decode(enc.wire[2]!)).toBe('agent_identity.set');
   });
 

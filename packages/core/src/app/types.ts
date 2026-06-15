@@ -492,8 +492,8 @@ export interface AppContext<TState = unknown> {
    * The runtime injects the concrete hook at boot (late-injection, like `wake`); until
    * then it is a no-op. An App MUST tolerate `report_input` being absent/inert (guard with
    * `ctx.report_input?.(...)`); installing an App without a running runtime does not throw.
-   * The app does not know `actions` exists — it calls this generic seam; the boot connects
-   * `onInput → actions.record`.
+   * The app does not know `base` exists — it calls this generic seam; the boot connects
+   * `onInput → base.record`.
    */
   report_input?(d: InputDescriptor): void;
 }

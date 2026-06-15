@@ -14,7 +14,7 @@
 
 你写的，就是一个返回模块声明（manifest）的工厂函数，外加几份样板配置——它们一起构成 `apps/` 下的一个独立工作区。
 
-> 所有示例对照仓库里**真实已实现**的代码。最小范本是 `apps/agent_identity/`，更完整的范本是 `apps/messages/` / `apps/tools/` / `apps/memory/` / `apps/task/`。命名、字段、类型都与 `packages/core/src/app/types.ts` 一致。
+> 所有示例对照仓库里**真实已实现**的代码。最小范本是 `apps/agent_identity/`，更完整的范本是 `apps/messages/` / `apps/memory/` / `apps/task/`。命名、字段、类型都与 `packages/core/src/app/types.ts` 一致。
 
 ---
 
@@ -46,7 +46,7 @@ block-agent/
 ├─ apps/            # ★ 所有 BlockApp 的家——你的 app 加在这里
 │  ├─ agent_identity/   # 最小范本
 │  ├─ messages/         # 更完整的范本
-│  ├─ tools/
+│  ├─ base/             # 基础层：工具执行 + 动作账本
 │  ├─ memory/
 │  ├─ task/
 │  └─ …                 # 内置 app 的具体集合会增减，但「apps/ 是 app 的家」不变
@@ -275,7 +275,7 @@ interface BuilderManifest {
 |---|---|---|
 | `stable` | 基本不变，放 cache 前缀头 | 身份块 `agent_identity:identity` |
 | `slow_changing` | 偶尔变 | 对话摘要 `messages:summary`、记忆笔记 `memory:notes` |
-| `volatile` | 每轮可能变 | 最近消息 `messages:recent`、工具结果 `tools:recent` |
+| `volatile` | 每轮可能变 | 最近消息 `messages:recent`、动作时间线 `base:recent` |
 
 > **呈现是可信代码专属**：决定"哪片 state 进 context、定什么 cache_tier"永远是 app 自己的可信 builder 做。不可信后端（如外部记忆 server）只供候选数据，绝不亲手决定渲染字节。
 
@@ -296,8 +296,8 @@ interface CommandManifest<TState> {
 要点：
 
 - **三方共享**：同一个命令 user / agent / app 都能调，没有单独的"agent 专用通道"。差异由统一的鉴权关口按调用者决定，不在这里写 if。
-- **`allowed_invokers` = "谁能调"闸**：缺省不限制。设了就由鉴权关口在最前面拦——不在列表的调用者直接拒。最常见用法是 **`['user']`**：让 agent 改不了某些东西（防 jailbreak / 自我提权）。内置 app 的 `agent_identity.set` / `messages.set_config` / `tools.set_config` / `memory.set_config` 全是 user-only。
-- **`capabilities` = "需要什么权限"**：与 `allowed_invokers` 正交。如 `tools.bash` 声明 `op:dangerous`，agent 调时鉴权关口要求审批；`memory.forget_physical` 声明 `block:delete_physical`，agent 被直接拒。
+- **`allowed_invokers` = "谁能调"闸**：缺省不限制。设了就由鉴权关口在最前面拦——不在列表的调用者直接拒。最常见用法是 **`['user']`**：让 agent 改不了某些东西（防 jailbreak / 自我提权）。内置 app 的 `agent_identity.set` / `messages.set_config` / `base.set_config` / `memory.set_config` 全是 user-only。
+- **`capabilities` = "需要什么权限"**：与 `allowed_invokers` 正交。如 `base.bash` 声明 `op:dangerous`，agent 调时鉴权关口要求审批；`memory.forget_physical` 声明 `block:delete_physical`，agent 被直接拒。
 - **命令不直接改树**：`invoke` 通常调 `ctx.set_state(...)` 改自己的 state（下轮 builder 重渲染），或返回 `ops`（树变更）交给那道唯一的写入关口去落地。返回的 `data` 回给调用方。
 - **id 用内容寻址**：要给记录生成 id，用内容 hash（如 FNV-1a），别用随机/时钟（保可复现）。
 
@@ -405,7 +405,7 @@ registry.install(makeTodoApp());
 - `ctx.read(blockname)` —— 读别的 app 暴露的块（返回**拷贝**，按值）。
 - `ctx.on(event, handler)` / `ctx.emit(event, payload)` —— 事件订阅/发布（fire-and-forget，**不得在 handler 里加阻塞关口**）。
 - `ctx.wake(event)` —— 把 runtime 从 idle 唤醒（如新消息到达后）。fire-and-forget，不过鉴权关口（是调度信号不是命令）。
-- `ctx.report_input(descriptor)` —— **上报一条外部输入**到 `actions` 时间线（fire-and-forget，可选/late-injected，像 `wake` 一样 `?.` 守卫）。**任何接收外部数据的 app**（消息、推送、webhook…）都应在其 ingest handler 里调它,把输入映射成 `{source, sender?, ts, preview, content?}`（你自己定义字段含义),否则该来源的输入**不会出现在 agent 的动作账本里**(agent 可能因看不到"已收到这条"而重复处理)。正文留在你自己的块里(如 `messages:recent`),这里只给紧凑预览,不重复。
+- `ctx.report_input(descriptor)` —— **上报一条外部输入**到 `base` 的动作时间线（fire-and-forget，可选/late-injected，像 `wake` 一样 `?.` 守卫）。**任何接收外部数据的 app**（消息、推送、webhook…）都应在其 ingest handler 里调它,把输入映射成 `{source, sender?, ts, preview, content?}`（你自己定义字段含义),否则该来源的输入**不会出现在 agent 的动作账本里**(agent 可能因看不到"已收到这条"而重复处理)。正文留在你自己的块里(如 `messages:recent`),这里只给紧凑预览,不重复。
 
 > 跨 app 交互**全部 by-value**：阻塞关口（写入闸 / 脱敏）走 `invoke_command`；通知走 `emit`；`read` 返回拷贝；唤醒走 `wake`；外部输入上报走 `report_input`。app 内部访问自己的数据用普通引用。
 
@@ -447,6 +447,6 @@ registry.install(makeTodoApp());
 - [ ] 命令用 `ctx.set_state` 改 state，或返回 `ops`；不直接碰树。
 - [ ] id 用内容寻址，不用随机/时钟。
 - [ ] 工厂内部 typed `AppManifest<TState>`，return 时 `as AppManifest`。
-- [ ] **接收外部输入的 app**（消息/推送/webhook…）在 ingest handler 里调了 `ctx.report_input?.({source, sender?, ts, preview, content?})`，让该来源的输入进入 `actions` 时间线(否则静默缺失)。
+- [ ] **接收外部输入的 app**（消息/推送/webhook…）在 ingest handler 里调了 `ctx.report_input?.({source, sender?, ts, preview, content?})`，让该来源的输入进入 `base` 的动作时间线(否则静默缺失)。
 
 下一步：把 app 装进去、管理它的生命周期 → [blockapp-lifecycle.md](./blockapp-lifecycle.md)。
