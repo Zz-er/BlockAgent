@@ -22,7 +22,7 @@ export function mockConfig(overrides: Partial<LauncherConfig> = {}): LauncherCon
     apps: {
       agent_identity: { enabled: true },
       messages: { enabled: true },
-      tools: { enabled: true },
+      base: { enabled: true },
       memory: { enabled: false },
       memory_letta: { enabled: false },
       task: { enabled: true },

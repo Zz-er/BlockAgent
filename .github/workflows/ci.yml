@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [core, cli, app-memory_letta, app-actions]
+        package: [core, cli, app-memory_letta, app-base]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +39,7 @@ jobs:
 
   apps-typecheck:
     # The trusted built-in apps under apps/ (UH-1 layout) mostly have no own tests
-    # (`test` is `--passWithNoTests`) — EXCEPT app-actions, which has a real suite and is
+    # (`test` is `--passWithNoTests`) — EXCEPT app-base, which has a real suite and is
     # in the typecheck-and-test matrix above. core/cli give the rest transitive typecheck,
     # but this job typechecks every workspace directly so a broken app surfaces on its own.
     # One job over all workspaces (--workspaces --if-present) — cheaper than a job per app.
