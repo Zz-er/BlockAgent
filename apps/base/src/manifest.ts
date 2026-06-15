@@ -27,7 +27,7 @@
  * clock and NOT an FNV-1a content hash. Seeded from the jsonl tail max (not the
  * bounded `state.recent` which rolls), so a post-overflow restart never reuses seqs.
  *
- * THE THREE COMMANDS (§5):
+ * THE CONTROL COMMANDS (§5):
  *   - `record`     — app-only (`allowed_invokers:['app']`), `block:write`. The DUMB
  *     SINK: the two launch subscriptions (onCommand / onInput) call it. The agent
  *     cannot forge the ledger. Appends the FULL record to jsonl + pushes a bounded
@@ -38,6 +38,10 @@
  *     window/threshold/detail/char-limits, clamped. Anti-self-modify gate — the agent
  *     can never change how much of its own trajectory it sees (the `tools.set_config`
  *     / `messages.set_config` gate).
+ *   - `end_turn`   — readonly, agent+user, NO capability. The bare YIELD: end the wake
+ *     WITHOUT a message. Decouples "stop the turn" from "reply to the user" so a group
+ *     agent can stay silent and a scheduled wake can go idle. Hybrid — `messages.reply`
+ *     remains sugar for "reply + end_turn".
  *
  * THE TOOL COMMANDS (merged from the former `tools` app): actions also AGGREGATES the
  * agent's concrete tools — `base.read_file` / `base.grep` / `base.bash` /
@@ -869,6 +873,48 @@ function showCommand(store: ActionLogStore): CommandManifest<BaseState> {
   };
 }
 
+/**
+ * base.end_turn — the bare YIELD primitive (the turn-lifecycle decision the runtime
+ * was missing). Ends the current wake WITHOUT emitting any outward message.
+ *
+ * Why it lives here: ending a turn and speaking to the user are DIFFERENT concepts.
+ * `messages.reply` conflates them (it is sugar for "reply + end_turn"); but a group
+ * agent that decides a message is not for it, or a long-running agent that wakes,
+ * does housekeeping, and goes idle, needs to STOP without speaking. The only prior
+ * no-message exit was "produce zero commands", which models never take — so this
+ * gives them a positive, nameable terminal action.
+ *
+ * Mechanics: returns `end_turn:true` like reply, so the runtime's invokeOne stops the
+ * loop (agent_runtime.ts §8.1). It is `readonly` (no ops, no state mutation) and needs
+ * no capability — it writes nothing, it only signals "I am done". Agent-callable (the
+ * primary user) and user-callable (a manual "stop this wake"). Like reply, the
+ * runtime returns 'end_turn' BEFORE the ledger emit, so a yield is not recorded in
+ * `base:recent` (it has no result to show); the turn telemetry still records the turn
+ * ended. Hybrid by design: reply stays the ergonomic default for the chat case, this
+ * is the explicit exit for the silent / scheduled-wake cases.
+ */
+function endTurnCommand(): CommandManifest<BaseState> {
+  return {
+    name: 'end_turn',
+    description:
+      'End this turn WITHOUT replying — go idle. Use when you have nothing to say: a ' +
+      'message not addressed to you, or you are done and no reply is needed. Tool calls ' +
+      'alone keep the runtime re-prompting you; this is the silent way to stop.',
+    readonly: true,
+    allowed_invokers: ['agent', 'user'],
+    args_schema: { type: 'object', properties: {} },
+    async invoke(
+      _args: unknown,
+      _ctx: AppContext<BaseState>,
+      _invoker: InvokerContext,
+    ): Promise<CommandResult> {
+      // The terminal primitive: ending the turn, decoupled from speaking. No ops, no
+      // message — just the end_turn signal the runtime stops on.
+      return { ok: true, end_turn: true };
+    },
+  };
+}
+
 /** Args for `base.set_config` — every knob optional (retune just what you name). */
 interface SetConfigArgs {
   window_size?: number;
@@ -1096,6 +1142,9 @@ export class BaseApp {
         () => recordCommand(store, nextSeqRef),
         () => showCommand(store),
         () => setConfigCommand(),
+        // The bare YIELD: end the turn without replying (group silence / scheduled-wake
+        // housekeeping). Hybrid — messages.reply stays sugar for "reply + end_turn".
+        () => endTurnCommand(),
         // Tool commands (merged from the former `tools` app), exposed as `base.<tool>`.
         // Capability gates UNCHANGED (§9.4): bash → op:dangerous (agent → pending),
         // http_request → net:http (host-allowlisted), read_file/grep are real reads.

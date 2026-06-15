@@ -460,6 +460,39 @@ describe('base.show', () => {
 });
 
 // ---------------------------------------------------------------------------
+// end_turn — the bare YIELD (end the wake without a message)
+// ---------------------------------------------------------------------------
+
+describe('base.end_turn (the yield primitive)', () => {
+  it('agent ends the turn silently: ok + end_turn, no data payload', async () => {
+    const { ops } = wire();
+    const res = await ops.invoke_command('base.end_turn', {}, AGENT);
+    expect(res.ok).toBe(true);
+    // The signal the runtime's invokeOne stops the wake on (decoupled from reply).
+    expect((res as { end_turn?: boolean }).end_turn).toBe(true);
+    // A pure yield: nothing to show, no result.
+    expect((res as { data?: unknown }).data).toBeUndefined();
+  });
+
+  it('user may also yield (manual stop); the app lane is denied', async () => {
+    const { ops } = wire();
+    const asUser = await ops.invoke_command('base.end_turn', {}, USER);
+    expect(asUser.ok).toBe(true);
+    expect((asUser as { end_turn?: boolean }).end_turn).toBe(true);
+    // allowed_invokers is ['agent','user'] — the ledger ('app') lane cannot forge a yield.
+    const asApp = await ops.invoke_command('base.end_turn', {}, APP);
+    expect(asApp.ok).toBe(false);
+  });
+
+  it('is readonly: it does not push a row into the recent window', async () => {
+    const { reg, ops } = wire();
+    const before = liveState(reg).recent.length;
+    await ops.invoke_command('base.end_turn', {}, AGENT);
+    expect(liveState(reg).recent.length).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // jsonl store mechanics (clone of ToolHistoryStore — 64KB guard, tail-truncate)
 // ---------------------------------------------------------------------------
 
