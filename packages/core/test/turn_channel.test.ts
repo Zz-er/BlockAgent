@@ -24,6 +24,7 @@ import {
   makeEmptyTree,
   makeReplyApp,
   makeEndTurnApp,
+  makeYieldApp,
 } from './fixtures.js';
 
 // A message wake is an app_event with source/reason/ref (the base-ified WakeEvent).
@@ -70,6 +71,24 @@ describe('onTurn — per-turn telemetry channel', () => {
     expect(records[0]?.turn_id).toBe('1.1');
     expect(records[0]?.spawn_depth).toBe(0);
     expect(records[0]?.wake_event).toEqual(WAKE);
+  });
+
+  it('emits ended_by=yield for a silent end_turn (base.end_turn) AND ledgers it on onCommand', async () => {
+    const provider = new MockProvider([
+      { tool_calls: [{ id: 't1', name: 'done.yield', args: {} }] },
+    ]);
+    const { runtime } = wire(provider, makeYieldApp);
+    const records = collectTurns(runtime);
+    // A yield is SILENT (no chat bubble), so unlike a reply it IS recorded on the command
+    // channel that feeds the base:recent ledger.
+    const commands: string[] = [];
+    runtime.onCommand((e) => commands.push(e.name));
+
+    await runtime.on_wake(WAKE);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]?.ended_by).toBe('yield');
+    expect(commands).toEqual(['done.yield']);
   });
 
   it('emits tool_calls then idle across a multi-step (non-end_turn) wake', async () => {

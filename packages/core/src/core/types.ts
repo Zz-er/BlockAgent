@@ -446,7 +446,8 @@ export interface RuntimeErrorEvent {
  * real exit; see AgentRuntime.runTurn / on_wake). Feeds TurnRecord.ended_by.
  */
 export type TurnEndReason =
-  | 'reply' // a command set end_turn (e.g. messages.reply) → the loop stops
+  | 'reply' // a reply command set end_turn (e.g. messages.reply) → the loop stops
+  | 'yield' // a silent end_turn (base.end_turn) → the loop stops, no outward message
   | 'tool_calls' // ≥1 tool_call, no end_turn → the loop continues
   | 'disallowed_text' // commands-only rejection was written (the agent self-corrects)
   | 'idle' // no command and no feedback → the agent is done

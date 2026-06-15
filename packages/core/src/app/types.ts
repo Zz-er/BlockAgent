@@ -182,6 +182,16 @@ export interface CommandResult {
    * to (tool calls) leave it unset so multi-step tool use still loops. Absent ⇒ false.
    */
   end_turn?: boolean;
+  /**
+   * When `end_turn` is set, distinguishes WHY the turn ends — the runtime maps it to
+   * `TurnEndReason` and decides ledgering. `'reply'` (the default when absent): the
+   * command spoke to the user (e.g. `messages.reply`); it surfaces elsewhere (the chat
+   * bubble) so the runtime does NOT re-ledger it. `'yield'` (e.g. `base.end_turn`): a
+   * SILENT end with no outward message; the runtime ends the turn as `'yield'` AND
+   * records it in the command ledger (`base:recent`) so the silent stop leaves a trace.
+   * Ignored unless `end_turn` is true. Absent ⇒ `'reply'`.
+   */
+  end_turn_kind?: 'reply' | 'yield';
 }
 
 /**

@@ -884,14 +884,15 @@ function showCommand(store: ActionLogStore): CommandManifest<BaseState> {
  * no-message exit was "produce zero commands", which models never take — so this
  * gives them a positive, nameable terminal action.
  *
- * Mechanics: returns `end_turn:true` like reply, so the runtime's invokeOne stops the
- * loop (agent_runtime.ts §8.1). It is `readonly` (no ops, no state mutation) and needs
- * no capability — it writes nothing, it only signals "I am done". Agent-callable (the
- * primary user) and user-callable (a manual "stop this wake"). Like reply, the
- * runtime returns 'end_turn' BEFORE the ledger emit, so a yield is not recorded in
- * `base:recent` (it has no result to show); the turn telemetry still records the turn
- * ended. Hybrid by design: reply stays the ergonomic default for the chat case, this
- * is the explicit exit for the silent / scheduled-wake cases.
+ * Mechanics: returns `end_turn:true` + `end_turn_kind:'yield'`, so the runtime stops the
+ * loop (agent_runtime.ts §8.1) and reports the turn as `ended_by:'yield'` (distinct from
+ * a reply). It is `readonly` (no ops, no state mutation) and needs no capability — it
+ * writes nothing, it only signals "I am done". Agent-callable (the primary user) and
+ * user-callable (a manual "stop this wake"). Because a yield is SILENT (no chat bubble),
+ * the runtime DOES record it in the command ledger (`base:recent`) — unlike a reply,
+ * which is skipped there since it already surfaces as the bubble — so a silent stop
+ * still leaves a visible trace. Hybrid by design: reply stays the ergonomic default for
+ * the chat case, this is the explicit exit for the silent / scheduled-wake cases.
  */
 function endTurnCommand(): CommandManifest<BaseState> {
   return {
@@ -909,8 +910,10 @@ function endTurnCommand(): CommandManifest<BaseState> {
       _invoker: InvokerContext,
     ): Promise<CommandResult> {
       // The terminal primitive: ending the turn, decoupled from speaking. No ops, no
-      // message — just the end_turn signal the runtime stops on.
-      return { ok: true, end_turn: true };
+      // message — just the end_turn signal the runtime stops on. `end_turn_kind:'yield'`
+      // tells the runtime this is a SILENT end (report as ended_by:'yield' + record in
+      // base:recent), not a reply (which would surface as a chat bubble instead).
+      return { ok: true, end_turn: true, end_turn_kind: 'yield' };
     },
   };
 }

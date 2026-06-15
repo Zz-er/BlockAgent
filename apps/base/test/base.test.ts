@@ -470,6 +470,8 @@ describe('base.end_turn (the yield primitive)', () => {
     expect(res.ok).toBe(true);
     // The signal the runtime's invokeOne stops the wake on (decoupled from reply).
     expect((res as { end_turn?: boolean }).end_turn).toBe(true);
+    // Marks the silent flavor → runtime reports ended_by:'yield' + ledgers it (vs a reply).
+    expect((res as { end_turn_kind?: string }).end_turn_kind).toBe('yield');
     // A pure yield: nothing to show, no result.
     expect((res as { data?: unknown }).data).toBeUndefined();
   });

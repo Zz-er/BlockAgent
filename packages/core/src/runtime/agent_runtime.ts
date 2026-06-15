@@ -642,21 +642,21 @@ export class AgentRuntime {
     // reported none (preserves exactOptionalPropertyTypes).
     const usage = response.usage ? { usage: response.usage } : {};
 
-    const { parked, end_turn } = await this.handleToolCalls(tool_calls);
+    const { parked, end_turn, yielded } = await this.handleToolCalls(tool_calls);
     if (tool_calls.length > 0) progressed = true;
     if (parked) {
       this.emitTurn({ ...this.turnEnvelope('parked'), ...telemetry, ...usage });
       return true; // parked → caller stops the loop; resumed via on_wake.
     }
-    // The agent finished responding (a command set end_turn, e.g. messages.reply): stop
-    // the loop and return to idle to await the next event, instead of running another
-    // turn and re-replying. Multi-step tool use (no end_turn) keeps looping as before.
-    // A clean reply is NOT a stall — reset the counter + clear any pending nudge (the
-    // wake ends here anyway).
+    // The agent finished responding (a command set end_turn): stop the loop and return to
+    // idle to await the next event, instead of running another turn and re-replying.
+    // Multi-step tool use (no end_turn) keeps looping as before. ended_by distinguishes a
+    // spoken reply ('reply') from a silent yield ('yield', e.g. base.end_turn). Neither is
+    // a stall — reset the counter + clear any pending nudge (the wake ends here anyway).
     if (end_turn) {
       this.stall_turns = 0;
       this.pending_loop_feedback = null;
-      this.emitTurn({ ...this.turnEnvelope('reply'), ...telemetry, ...usage });
+      this.emitTurn({ ...this.turnEnvelope(yielded ? 'yield' : 'reply'), ...telemetry, ...usage });
       return false;
     }
 
@@ -1064,15 +1064,21 @@ export class AgentRuntime {
    */
   private async handleToolCalls(
     tool_calls: ToolCall[],
-  ): Promise<{ parked: boolean; end_turn: boolean }> {
+  ): Promise<{ parked: boolean; end_turn: boolean; yielded: boolean }> {
     const invoker: InvokerContext = { invoker: 'agent' };
     let end_turn = false;
+    let yielded = false;
     for (const call of tool_calls) {
       const result = await this.invokeCommand(call, invoker);
-      if (result === 'parked') return { parked: true, end_turn };
+      if (result === 'parked') return { parked: true, end_turn, yielded };
       if (result === 'end_turn') end_turn = true;
+      // A silent yield (base.end_turn) also ends the turn, but reports as 'yield'.
+      if (result === 'yield') {
+        end_turn = true;
+        yielded = true;
+      }
     }
-    return { parked: false, end_turn };
+    return { parked: false, end_turn, yielded };
   }
 
   /**
@@ -1089,7 +1095,7 @@ export class AgentRuntime {
   private async invokeCommand(
     call: ToolCall,
     invoker: InvokerContext,
-  ): Promise<'done' | 'parked' | 'end_turn'> {
+  ): Promise<'done' | 'parked' | 'end_turn' | 'yield'> {
     try {
       const res = await this.ops.invoke_command(call.name, call.args, invoker);
       // A `pending` policy decision surfaces two ways across impls: the real
@@ -1101,13 +1107,29 @@ export class AgentRuntime {
         this.state = { kind: 'paused_for_approval', gateway_token: token };
         return 'parked'; // deferred until approval — emit when it actually runs on resume.
       }
-      // A successful command may signal it COMPLETED the agent's response (e.g.
-      // messages.reply): the runtime then stops the turn loop instead of looping and
-      // re-replying (CommandResult.end_turn, §8.1). The end_turn command IS the reply —
-      // it surfaces as the `reply` event (the chat bubble), so we do NOT also emit it as a
-      // tool_call (that would double-show it AND, since onReply fires inside the command,
-      // arrive after the reply and strand the UI's live-activity panel).
-      if (res.ok && res.end_turn === true) return 'end_turn';
+      // A successful command may signal it COMPLETED the agent's response (CommandResult
+      // .end_turn, §8.1): the runtime then stops the turn loop instead of looping and
+      // re-replying. Two flavors (end_turn_kind):
+      //   - reply (default): the command IS the reply — it surfaces as the `reply` event
+      //     (the chat bubble), so we do NOT also emit it as a tool_call or re-ledger it
+      //     (double-show; and onReply fires inside the command, stranding the UI panel).
+      //   - yield (base.end_turn): a SILENT end with no outward message. Nothing else
+      //     surfaces it, so we DO record it in the command ledger (base:recent) for a
+      //     visible trace, then end the turn as 'yield'.
+      if (res.ok && res.end_turn === true) {
+        if (res.end_turn_kind === 'yield') {
+          this.emitCommand({
+            name: call.name,
+            args: call.args,
+            ok: true,
+            ...(res.data !== undefined ? { result: res.data, ...refOf(res.data) } : {}),
+            invoker: 'agent',
+            spawn_depth: this.spawn_depth,
+          });
+          return 'yield';
+        }
+        return 'end_turn';
+      }
       // Any OTHER executed command (memory.write, task.add, a denied command…) → surface it
       // to the tool-call channel for a UI to group under the turn (name + ok, never args).
       this.emitToolCall(call.name, res.ok);

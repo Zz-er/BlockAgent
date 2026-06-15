@@ -372,6 +372,24 @@ export function makeEndTurnApp(registry: TestCommandRegistry): void {
 }
 
 /**
+ * makeYieldApp — a fixture command (`done.yield`) that ends the turn SILENTLY via
+ * `end_turn_kind:'yield'`, like `base.end_turn`. Lets a runtime test assert the turn ends
+ * as `ended_by:'yield'` (not 'reply') AND that the silent stop is ledgered on onCommand.
+ */
+export function makeYieldApp(registry: TestCommandRegistry): void {
+  const manifest: CommandManifest = {
+    name: 'yield',
+    description: 'A fixture silent yield (end_turn_kind:yield).',
+    invoke: async () => ({ ok: true }),
+  };
+  registry.register('done.yield', manifest, async () => ({
+    ok: true,
+    end_turn: true,
+    end_turn_kind: 'yield',
+  }));
+}
+
+/**
  * makeDangerousApp — a fixture command (`danger.run`) declaring the `op:dangerous`
  * capability, so the agent invoker resolves to `pending` (approval) per §9.4.
  */
