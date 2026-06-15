@@ -73,7 +73,6 @@ export interface MessagesConfig {
 /** tools app config knobs. */
 export interface ToolsConfig {
   enabled: boolean;
-  tool_history_count?: number;
   /** Subset of builtin tools to enable; absent → all enabled. */
   enabled_tools?: string[];
 }

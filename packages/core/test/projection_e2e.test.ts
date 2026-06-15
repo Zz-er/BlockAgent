@@ -2,15 +2,15 @@
  * test/projection_e2e.test.ts — live-AppContext projection seam (architect/integration).
  *
  * ACCEPTANCE HARD-GATE (lead 2026-05-26): state-driven render-builders
- * (`messages:recent` / `messages:summary` / `tools:recent` / `agent_identity:identity`)
+ * (`messages:recent` / `messages:summary` / `agent_identity:identity`)
  * project from `app_ctx.state`. The unit tests inject an AppContext directly, so they
  * pass even if the REAL loop can't supply one — the "green but the real loop is broken"
  * class we hit twice. This file proves the seam on the REAL Renderer + AppRegistry path:
  * the Renderer resolves each App's LIVE AppContext via `app_context_provider`
  * (→ `AppRegistry.get_app_context`), so a builder sees state AFTER a command mutated it.
  *
- * We drive real mutations (messages.ingest, a tools command via Operations,
- * agent_identity.set via Operations) and then render through a Renderer wired exactly
+ * We drive real mutations (messages.ingest, agent_identity.set via Operations) and
+ * then render through a Renderer wired exactly
  * as `index.ts` wires it — NO injected `app_contexts` Map. If the seam regresses, the
  * blocks render empty/stale and these assertions fail.
  */
@@ -25,7 +25,7 @@ import { Operations } from '../src/core/operations.js';
 import { Renderer } from '../src/core/renderer.js';
 import { AppRegistry } from '../src/app/registry.js';
 import { MessagesApp, RECENT_BLOCK as MSG_RECENT } from '@block-agent/app-messages/manifest.js';
-import { ToolsApp, RECENT_BLOCK as TOOLS_RECENT } from '@block-agent/app-tools/manifest.js';
+import { ToolsApp } from '@block-agent/app-tools/manifest.js';
 import {
   makeAgentIdentityApp,
   BLOCK_IDENTITY,
@@ -75,29 +75,22 @@ describe('live-AppContext projection seam (real Renderer + Registry path)', () =
     expect(text).toContain('deploy the staging build please');
   });
 
-  it('tools:recent renders a tool call after invoking it through real Operations', async () => {
+  it('a tools command executes and returns its body in CommandResult.data (display lives in actions)', async () => {
     const reg = new AppRegistry();
-    // ToolsApp(dir) keeps its history jsonl under the temp dir (no repo pollution);
-    // the recent projection is state-driven, so the test needs the live-context seam.
+    // tools is display-free now: it renders no block. The tool body reaches the agent
+    // via CommandResult.data (which the `actions` app records), not a tools:recent block.
     reg.install(new ToolsApp(join(dir, 'tools')).manifest());
-    const tree = new BlockTree({
-      id: 'root', name: 'root:root', content_blob: null, content_text: null,
-      children: [placeholder(TOOLS_RECENT)],
-    });
-    const ops = Operations.with_default_policy({ tree, registry: reg });
-    const renderer = new Renderer(reg, {
-      app_context_provider: (id) => reg.get_app_context(id),
-    });
+    const ops = Operations.with_default_policy({ tree: new BlockTree(), registry: reg });
 
-    // read THIS test file — a real, deterministic read; mutates tools state.recent.
+    // read THIS test file — a real, deterministic read.
     const path = new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
     const res = await ops.invoke_command('tools.read_file', { path, invocation_id: 't1' }, USER);
     expect(res.ok).toBe(true);
-
-    const text = await renderText(renderer, tree);
-    // The recent projection names the tool + carries (a slice of) its result.
-    expect(text).toContain('read_file');
-    expect(text).toContain('live-AppContext projection seam'); // a line from THIS file
+    const data = res.data as { tool?: string; result?: string };
+    expect(data.tool).toBe('read_file');
+    expect(data.result).toContain('live-AppContext projection seam'); // a line from THIS file
+    // tools owns no projection block.
+    expect(reg.resolve_builder('tools:recent' as BlockName)).toBeNull();
   });
 
   it('agent_identity:identity reflects a new role after agent_identity.set (user)', async () => {
@@ -182,13 +175,14 @@ describe('AppRegistry.seedProjectionBlocks (empty-tree boot is non-empty)', () =
       (name) => ops.has(name),
       (sOps) => ops.apply(sOps, { invoker: 'app', trust: 'trusted' }),
     );
-    // The apps' declared builder outputs are now live nodes in the tree.
+    // The apps' declared builder outputs are now live nodes in the tree. tools is
+    // display-free now (no builder), so it seeds no block.
     expect(seeded).toContain(BLOCK_IDENTITY);
     expect(seeded).toContain(MSG_RECENT);
-    expect(seeded).toContain(TOOLS_RECENT);
+    expect(seeded).not.toContain('tools:recent');
     expect(ops.has(BLOCK_IDENTITY)).toBe(true);
     expect(ops.has(MSG_RECENT)).toBe(true);
-    expect(ops.has(TOOLS_RECENT)).toBe(true);
+    expect(ops.has('tools:recent' as BlockName)).toBe(false);
 
     // The first prompt is now non-empty and carries the agent's identity.
     const text = await renderText(renderer, tree);

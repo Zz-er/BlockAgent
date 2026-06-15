@@ -692,15 +692,9 @@ async function applyAppConfigOverrides(
     }
   }
 
-  if (config.apps.tools.enabled && config.apps.tools.tool_history_count !== undefined) {
-    await operations
-      .invoke_command(
-        'tools.set_config',
-        { tool_history_count: config.apps.tools.tool_history_count },
-        user,
-      )
-      .catch(() => undefined);
-  }
+  // tools no longer has a set_config command: its recent-N display moved to the
+  // `actions` app, so there is no tool_history_count to seed. (`enabled_tools` is a
+  // CLI-only config that is not applied via a runtime command.)
 
   if (config.apps.memory.enabled) {
     const m = config.apps.memory;

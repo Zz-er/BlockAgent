@@ -425,14 +425,9 @@ function resolveTools(
   fileApps: Record<string, unknown>,
 ): LauncherConfig['apps']['tools'] {
   const f = pickObject(fileApps['tools']);
-  const tool_history_count = pick(
-    asNumber(flags['tool-history-count']),
-    asNumber(f['tool_history_count']),
-  );
   const enabled_tools = pick(asStringArray(flags['enabled-tools']), asStringArray(f['enabled_tools']));
   return {
     enabled: appEnabled(flags, f, 'no-tools'),
-    ...(tool_history_count !== undefined ? { tool_history_count } : {}),
     ...(enabled_tools !== undefined ? { enabled_tools } : {}),
   };
 }

@@ -49,20 +49,22 @@ describe('hot-uninstall (real launch + agent.hotUninstall)', () => {
   it('removes the app from registry + drops its projection block, leaving other apps intact', async () => {
     const agent = await launch(mockConfig(dir));
 
-    // Precondition: tools installed + its projection block seeded into the tree.
-    expect(agent.registry.list().some((m) => m.id === 'tools')).toBe(true);
-    expect(agent.operations.has('tools:recent')).toBe(true);
+    // Precondition: messages installed + its projection block seeded into the tree.
+    // (tools is display-free now — it owns no projection block — so we exercise the
+    // projection-block-removal path through messages, which renders messages:recent.)
+    expect(agent.registry.list().some((m) => m.id === 'messages')).toBe(true);
+    expect(agent.operations.has('messages:recent')).toBe(true);
     expect(typeof agent.hotUninstall).toBe('function');
 
-    const res = await agent.hotUninstall!('tools');
+    const res = await agent.hotUninstall!('messages');
 
     // Hot-uninstall succeeded and reported the removed projection block.
     expect(res.ok).toBe(true);
-    expect(res.removed_blocks).toContain('tools:recent');
+    expect(res.removed_blocks).toContain('messages:recent');
 
-    // tools is gone from the registry + its projection block soft-deleted from the tree.
-    expect(agent.registry.list().some((m) => m.id === 'tools')).toBe(false);
-    expect(agent.operations.has('tools:recent')).toBe(false);
+    // messages is gone from the registry + its projection block soft-deleted from the tree.
+    expect(agent.registry.list().some((m) => m.id === 'messages')).toBe(false);
+    expect(agent.operations.has('messages:recent')).toBe(false);
 
     // No collateral: another installed app (memory) + its projection block remain.
     expect(agent.registry.list().some((m) => m.id === 'memory')).toBe(true);
@@ -71,7 +73,7 @@ describe('hot-uninstall (real launch + agent.hotUninstall)', () => {
     // The runtime survived the safe-window mutation and is back to idle (not wedged).
     expect(agent.runtime.state.kind).toBe('idle');
 
-    // The prompt still renders and no longer carries any tools content.
+    // The prompt still renders and no longer carries any messages content.
     const prompt = await agent.renderer.render(agent.operations.snapshot());
     const text = prompt.segments
       .map((s) =>
@@ -81,7 +83,7 @@ describe('hot-uninstall (real launch + agent.hotUninstall)', () => {
       )
       .join('\n');
     expect(prompt.segments.length).toBeGreaterThan(0);
-    expect(text).not.toContain('tools:recent');
+    expect(text).not.toContain('messages:recent');
   });
 
   it('returns a non-ok result for an unknown app id', async () => {
