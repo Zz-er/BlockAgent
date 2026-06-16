@@ -63,7 +63,7 @@ import type {
   CommandResult,
   JsonSchema,
 } from '@block-agent/core/app/types.js';
-import { readAppConfig, APPS_DIR } from '@block-agent/core/apps/_app_config.js';
+import { readAppConfig } from '@block-agent/core/apps/_app_config.js';
 
 // ============================================================================
 // Constants + pluggable seams
@@ -859,11 +859,19 @@ function highestSeq(history: readonly HistoryMessage[]): { user: number; agent: 
 // MessagesApp — the BlockApp (manifest + the §8.2 wake-seam ingest door)
 // ============================================================================
 
-/** Optional pluggable seams + a custom storage dir for the App. */
+/** Optional pluggable seams + a REQUIRED storage dir for the App. */
 export interface MessagesAppOptions {
-  /** Storage dir (defaults to `.block-agent/apps/messages/`, §12.1). */
-  dir?: string;
-  /** Base dir for the config-file seed (defaults to `.block-agent/apps`). */
+  /**
+   * Storage dir (REQUIRED — no implicit cwd fallback). The host (launch.ts) injects an
+   * explicit dir; tests pass a temp dir. Hardened from a silent `.block-agent/apps/messages/`
+   * default so a missed injection fails loudly instead of leaking data into cwd.
+   */
+  dir: string;
+  /**
+   * Base dir for the config-file seed. OPTIONAL: when omitted the App skips reading any
+   * config file and boots from compiled defaults (it never falls back to a cwd-relative
+   * `.block-agent/apps` path). Pass it only to seed config from a known base.
+   */
   configBase?: string;
   /** Token estimator (defaults to char/4); a host injects Provider.estimateTokens later. */
   estimate_tokens?: TokenEstimator;
@@ -895,19 +903,29 @@ export class MessagesApp {
   /** Subscribers on the reply channel (§6 Option B); see `onReply`. */
   private readonly replyListeners = new Set<ReplyListener>();
 
-  constructor(opts: MessagesAppOptions = {}) {
-    const dir = opts.dir ?? join(APPS_DIR, APP_ID);
+  constructor(opts: MessagesAppOptions) {
+    // Data dir is mandatory — no implicit cwd fallback. The compile-time `dir: string`
+    // catches missed injections; this guard covers untyped/JS callers and hot-install.
+    if (opts?.dir === undefined) {
+      throw new Error('MessagesApp requires an explicit data dir; no implicit cwd fallback');
+    }
+    const dir = opts.dir;
     this.store = new MessagesStore(dir);
     this.estimate = opts.estimate_tokens ?? DEFAULT_ESTIMATE_TOKENS;
     this.summarize = opts.summarize ?? DEFAULT_SUMMARIZE;
     // File seed: merge config.json over the compiled defaults (never throws at boot).
     // readAppConfig is keyed on a plain record; round-trip through it then re-narrow
-    // to MessagesConfig (the keys/types match the defaults it merged over).
-    const seeded = readAppConfig(
-      APP_ID,
-      DEFAULT_CONFIG as unknown as Record<string, unknown>,
-      opts.configBase ?? APPS_DIR,
-    );
+    // to MessagesConfig (the keys/types match the defaults it merged over). When no
+    // configBase is supplied we SKIP the file read entirely (never read a cwd-relative
+    // path) and boot from the compiled defaults.
+    const seeded =
+      opts.configBase === undefined
+        ? { ...DEFAULT_CONFIG }
+        : (readAppConfig(
+            APP_ID,
+            DEFAULT_CONFIG as unknown as Record<string, unknown>,
+            opts.configBase,
+          ) as unknown as MessagesConfig);
     this.seedConfig = clampConfig(seeded as unknown as MessagesConfig);
     // Restart restore (D1 §5.2): re-hydrate the bounded projection from the durable
     // history at construction, then advance the id counters past the loaded ids so a

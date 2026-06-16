@@ -87,12 +87,12 @@ function stateCtx(state: MessagesState): AppContext<MessagesState> {
  * Install a MessagesApp into a registry, capturing every WakeEvent the registry's
  * wakeHook receives. Storage dir + config base default to the test's temp dir.
  */
-function installApp(opts: MessagesAppOptions = {}): {
+function installApp(opts: Omit<MessagesAppOptions, 'dir' | 'configBase'> = {}): {
   app: MessagesApp;
   registry: AppRegistry;
   wakes: WakeEvent[];
 } {
-  const app = new MessagesApp({ dir: join(dir, 'store'), configBase: dir, ...opts });
+  const app = new MessagesApp({ ...opts, dir: join(dir, 'store'), configBase: dir });
   const registry = new AppRegistry();
   const wakes: WakeEvent[] = [];
   registry.wakeHook = (e) => wakes.push(e);
@@ -411,8 +411,8 @@ describe('messages config (file seed + user-only set_config)', () => {
   const USER: InvokerContext = { invoker: 'user', identity: 'human' };
 
   /** Wire the App through the REAL Operations + default PolicyEngine (the gate). */
-  function wire(opts: MessagesAppOptions = {}) {
-    const app = new MessagesApp({ dir: join(dir, 'store'), configBase: dir, ...opts });
+  function wire(opts: Omit<MessagesAppOptions, 'dir' | 'configBase'> = {}) {
+    const app = new MessagesApp({ ...opts, dir: join(dir, 'store'), configBase: dir });
     const reg = new AppRegistry();
     reg.install(app.manifest());
     const root: Block = {

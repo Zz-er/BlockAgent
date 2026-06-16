@@ -186,7 +186,11 @@ function setConfigCommand(): CommandManifest<StatsState> {
 
 /** Options for constructing a StatsApp. */
 export interface StatsAppOptions {
-  /** Base dir for the config-file seed (defaults to `.block-agent/apps`). */
+  /**
+   * Base dir for the read-only config-file seed. OPTIONAL: when omitted, StatsApp
+   * skips reading any config file and uses compiled defaults — it never reads a
+   * cwd-relative fallback path. (Stats holds no data dir; config is its only file input.)
+   */
   configBase?: string;
 }
 
@@ -200,11 +204,18 @@ export class StatsApp {
   private readonly seedConfig: StatsConfig;
 
   constructor(opts: StatsAppOptions = {}) {
-    const seeded = readAppConfig(
-      APP_ID,
-      DEFAULT_CONFIG as unknown as Record<string, unknown>,
-      opts.configBase ?? APPS_DIR,
-    );
+    // configBase is the read-only config-seed base. When omitted we skip reading
+    // the config file entirely and fall back to compiled defaults — we never read a
+    // cwd-relative path (no implicit APPS_DIR fallback). Hardening (B 方案): a missing
+    // configBase yields defaults, not a silent cwd read.
+    const seeded =
+      opts.configBase === undefined
+        ? DEFAULT_CONFIG as unknown as Record<string, unknown>
+        : readAppConfig(
+            APP_ID,
+            DEFAULT_CONFIG as unknown as Record<string, unknown>,
+            opts.configBase,
+          );
     this.seedConfig = { show_block: seeded['show_block'] === true };
   }
 

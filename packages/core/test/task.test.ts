@@ -85,12 +85,12 @@ function stateCtx(state: TaskState): AppContext<TaskState> {
 }
 
 /** Install a TaskApp into a registry, capturing every WakeEvent. */
-function installApp(opts: TaskAppOptions = {}): {
+function installApp(opts: Omit<TaskAppOptions, 'dir' | 'configBase'> = {}): {
   app: TaskApp;
   registry: AppRegistry;
   wakes: WakeEvent[];
 } {
-  const app = new TaskApp({ dir: join(dir, 'store'), configBase: dir, ...opts });
+  const app = new TaskApp({ ...opts, dir: join(dir, 'store'), configBase: dir });
   const registry = new AppRegistry();
   const wakes: WakeEvent[] = [];
   registry.wakeHook = (e) => wakes.push(e);
@@ -99,8 +99,8 @@ function installApp(opts: TaskAppOptions = {}): {
 }
 
 /** Wire the App through the REAL Operations + default PolicyEngine (the gate). */
-function wire(opts: TaskAppOptions = {}) {
-  const app = new TaskApp({ dir: join(dir, 'store'), configBase: dir, ...opts });
+function wire(opts: Omit<TaskAppOptions, 'dir' | 'configBase'> = {}) {
+  const app = new TaskApp({ ...opts, dir: join(dir, 'store'), configBase: dir });
   const reg = new AppRegistry();
   reg.install(app.manifest());
   const root: Block = {

@@ -44,25 +44,22 @@ import {
 // the end, which needs a real socket to exercise the 'error' path the fake client can't reach.
 import { ImClient } from '../src/im_client.js';
 
-// D2d test isolation: an ImProxyApp built WITHOUT an explicit `dir` persists its backfill
-// cursor to the shared cwd-relative default `.block-agent/apps/im_proxy/cursors.jsonl`. In a
-// single test process those default-dir constructions would otherwise pollute each other (a
-// cursor persisted by one test seeds a non-zero consumed_seq in the next → a fresh seq:1 push
-// is `<= consumed_seq` → silently dropped → renders `(no messages)`). We give EACH test a
-// clean slate: before every test, wipe the shared default dir so every default-dir
-// construction starts from an empty cursor; after every test, remove the cwd-relative
-// `.block-agent` residue so nothing leaks into the repo. Tests that pass an explicit temp
-// `dir`/`cursors` (the D2d suite below) are already isolated and unaffected. Production never
-// uses the cwd-relative default — launch.ts wires `dir: join(base, 'im_proxy')` under
-// storage_dir (so two co-located fleet instances never share one cursor file).
-const DEFAULT_CURSOR_DIR = join('.block-agent', 'apps', 'im_proxy');
+// D2d test isolation: ImProxyApp now REQUIRES an explicit data `dir` when no `cursors` store is
+// injected (the implicit cwd-relative `join(APPS_DIR, APP_ID)` fallback was removed — it silently
+// leaked the backfill cursor under cwd). Tests that don't otherwise care about the cursor file
+// pass `dir: defaultDir`, a FRESH temp dir minted per test below. A per-test fresh dir also keeps
+// cursor state from leaking between tests (a cursor persisted by one test would otherwise seed a
+// non-zero consumed_seq in the next → a fresh seq:1 push is `<= consumed_seq` → silently dropped
+// → renders `(no messages)`). Tests that mint their OWN temp `dir`/`cursors` (the D2d suite below)
+// are already isolated and pass it explicitly. Production never relied on the old default —
+// launch.ts wires `dir: join(base, 'im_proxy')` under storage_dir.
+let defaultDir: string;
 beforeEach(() => {
-  rmSync(DEFAULT_CURSOR_DIR, { recursive: true, force: true });
+  defaultDir = mkdtempSync(join(tmpdir(), 'im-proxy-default-'));
 });
 afterEach(() => {
-  // Remove ONLY the im_proxy cursor subtree (NOT the whole `.block-agent` root — a real
-  // tree with other apps' data could co-locate there) so no cwd-relative residue leaks.
-  rmSync(DEFAULT_CURSOR_DIR, { recursive: true, force: true });
+  // Remove the per-test temp dir so no residue leaks.
+  rmSync(defaultDir, { recursive: true, force: true });
 });
 
 // ============================================================================
@@ -252,14 +249,14 @@ describe('sanitizeId (injective display-label fence, §7)', () => {
 
 describe('ConversationsBlockBuilder', () => {
   it('renders nothing when there are no conversations', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
     const ctx = makeCtx(app, makeState());
     expect(await builder.build(FAKE_BUILD_CTX, ctx)).toBeNull();
   });
 
   it('renders the conversation list with unread + focus', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
     const ctx = makeCtx(
       app,
@@ -278,7 +275,7 @@ describe('ConversationsBlockBuilder', () => {
   });
 
   it('is byte-identical across two builds with same state (INV #1)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
     const ctx = makeCtx(
       app,
@@ -293,7 +290,7 @@ describe('ConversationsBlockBuilder', () => {
   });
 
   it('resolves a dm peer name from the consumed org_directory object (combine first)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
     const ctx = makeCtx(
       app,
@@ -314,7 +311,7 @@ describe('ConversationsBlockBuilder', () => {
   });
 
   it('has owner system (INV #4) + slow_changing tier', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
     expect(builder.owner).toBe('system');
     expect(builder.cache_tier).toBe('slow_changing');
@@ -323,7 +320,7 @@ describe('ConversationsBlockBuilder', () => {
 
 describe('ChatBlockBuilder', () => {
   it('renders the focused conversation window with [me] and @me highlight', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CHAT_BLOCK);
     const ctx = makeCtx(
       app,
@@ -354,14 +351,14 @@ describe('ChatBlockBuilder', () => {
   });
 
   it('renders nothing when no conversation is focused', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CHAT_BLOCK);
     const ctx = makeCtx(app, makeState({ conversations: [] }));
     expect(await builder.build(FAKE_BUILD_CTX, ctx)).toBeNull();
   });
 
   it('is byte-identical across two builds with same state (INV #1)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CHAT_BLOCK);
     const ctx = makeCtx(
       app,
@@ -378,7 +375,7 @@ describe('ChatBlockBuilder', () => {
   });
 
   it('has volatile tier', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CHAT_BLOCK);
     expect(builder.cache_tier).toBe('volatile');
   });
@@ -390,13 +387,13 @@ describe('ChatBlockBuilder', () => {
 
 describe('im.ingest', () => {
   it('is allowed_invokers: [app] (stricter than messages; agent cannot forge inbound)', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     expect(cmd.allowed_invokers).toEqual(['app']);
   });
 
   it('folds a batch into the matching conversation, bumping unread + consumed_seq', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     const ctx = makeCtx(
       app,
@@ -413,7 +410,7 @@ describe('im.ingest', () => {
   });
 
   it('dedupes by seq — a re-delivered seq is dropped (idempotent)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     const ctx = makeCtx(
       app,
@@ -444,7 +441,7 @@ describe('push → coalesce → ingest → wake', () => {
       { id: 'c1', kind: 'dm', members: [] },
       { id: 'c2', kind: 'dm', members: [] },
     ];
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const ctx = makeCtx(app, makeState());
     // Wire on_install so app.ctx is captured + subscribe is attached.
     await app.manifest().on_install!(ctx);
@@ -489,7 +486,7 @@ describe('inbound message renders verbatim into im_proxy:chat (agent sees it in 
   it('a pushed peer message appears verbatim in the rendered chat block', async () => {
     const client = new FakeImClient();
     client.conversations = [{ id: 'c1', kind: 'dm', members: ['alice'] }];
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const ctx = makeCtx(app, makeState());
     await app.manifest().on_install!(ctx); // bootstrap seeds the conv shell + focus
 
@@ -520,7 +517,7 @@ describe('inbound message renders verbatim into im_proxy:chat (agent sees it in 
 describe('im.send', () => {
   it('forwards to the client (no `from` in the request — server derives it, §7)', async () => {
     const client = new FakeImClient();
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'send');
     const ctx = makeCtx(
       app,
@@ -539,7 +536,7 @@ describe('im.send', () => {
 
   it('optimistically appends the sent message to the focused window as [me]', async () => {
     const client = new FakeImClient();
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'send');
     const ctx = makeCtx(
       app,
@@ -565,7 +562,7 @@ describe('im.send', () => {
 describe('im.reply (send to the focused conversation)', () => {
   it('forwards to the focused conv with no `conv` arg, optimistically appending the reply', async () => {
     const client = new FakeImClient();
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'reply');
     const ctx = makeCtx(
       app,
@@ -587,7 +584,7 @@ describe('im.reply (send to the focused conversation)', () => {
 
   it('errors when no conversation is focused (nothing to reply to)', async () => {
     const client = new FakeImClient();
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'reply');
     const ctx = makeCtx(app, makeState({ conversations: [{ id: 'c1', kind: 'dm', members: [], recent: [], unread: 0, consumed_seq: 0 }] }));
     const res = await cmd.invoke({ body: 'hi' }, ctx, { invoker: 'agent' });
@@ -596,14 +593,14 @@ describe('im.reply (send to the focused conversation)', () => {
   });
 
   it('rejects an empty/missing body', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'reply');
     const ctx = makeCtx(app, makeState({ focus: 'c1', conversations: [{ id: 'c1', kind: 'dm', members: [], recent: [], unread: 0, consumed_seq: 0 }] }));
     expect((await cmd.invoke({}, ctx, { invoker: 'agent' })).ok).toBe(false);
   });
 
   it('is available to the agent (no user-only gate — the agent must be able to reply)', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'reply');
     // allowed_invokers undefined → all invokers (incl. agent), like im.send.
     expect(cmd.allowed_invokers).toBeUndefined();
@@ -629,7 +626,7 @@ describe('per-conversation consumed_seq backfill (no cross-conv loss)', () => {
     client.historyByConv.set('cB', [
       wireMsg({ id: 'b1', conv: 'cB', seq: 3, body: 'B-three' }),
     ]);
-    const app = new ImProxyApp({ client });
+    const app = new ImProxyApp({ client, dir: defaultDir });
     const ctx = makeCtx(app, makeState());
     await app.manifest().on_install!(ctx);
 
@@ -656,7 +653,7 @@ describe('per-conversation consumed_seq backfill (no cross-conv loss)', () => {
 
 describe('identity fence: peer `from` never reaches identity (§7)', () => {
   it('a peer `from` only lands in the sanitized from_label content, not ctx.identity', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     const ctx = makeCtx(
       app,
@@ -680,7 +677,7 @@ describe('identity fence: peer `from` never reaches identity (§7)', () => {
   });
 
   it('mentioned_me is a string-equality self-judgement, not an identity lookup', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     const ctx = makeCtx(
       app,
@@ -697,7 +694,7 @@ describe('identity fence: peer `from` never reaches identity (§7)', () => {
   });
 
   it('a non-matching mention does NOT set mentioned_me', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'ingest');
     const ctx = makeCtx(
       app,
@@ -720,12 +717,12 @@ describe('identity fence: peer `from` never reaches identity (§7)', () => {
 
 describe('user-only gates', () => {
   it('set_config is allowed_invokers: [user]', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     expect(getCommand(app.manifest(), 'set_config').allowed_invokers).toEqual(['user']);
   });
 
   it('group-management commands are all allowed_invokers: [user]', () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const manifest = app.manifest();
     for (const name of ['create_group', 'add_member', 'remove_member', 'set_owner']) {
       expect(getCommand(manifest, name).allowed_invokers).toEqual(['user']);
@@ -741,7 +738,7 @@ describe('user-only gates', () => {
 describe('consume-refresh: state.directory accepts the OrgDirectory object', () => {
   /** Pull the `directory` slice of the manifest's state_schema (what consume-refresh checks). */
   function directorySchema(): JsonSchema {
-    const schema = new ImProxyApp({ client: new FakeImClient() }).manifest().state_schema as {
+    const schema = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir }).manifest().state_schema as {
       properties: { directory: JsonSchema };
     };
     return schema.properties.directory;
@@ -760,7 +757,7 @@ describe('consume-refresh: state.directory accepts the OrgDirectory object', () 
   });
 
   it('after directory folds in, displayName resolves a peer name (end-to-end)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CHAT_BLOCK);
     const ctx = makeCtx(
       app,
@@ -795,7 +792,7 @@ describe('consume-refresh: state.directory accepts the OrgDirectory object', () 
 
 describe('AppManifest invariants', () => {
   it('id + tree_namespace + trust/host', () => {
-    const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+    const m = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir }).manifest();
     expect(m.id).toBe('im_proxy');
     expect(m.tree_namespace).toBe('/im_proxy');
     expect(m.trust).toBe('trusted');
@@ -803,13 +800,13 @@ describe('AppManifest invariants', () => {
   });
 
   it('provides message_count via unread_count; consumes org_directory as directory', () => {
-    const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+    const m = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir }).manifest();
     expect(m.provides).toEqual([{ contract: 'message_count', via: 'unread_count' }]);
     expect(m.consumes).toEqual([{ contract: 'org_directory', as: 'directory' }]);
   });
 
   it('unread_count returns the scalar total unread (contract output_schema)', async () => {
-    const app = new ImProxyApp({ client: new FakeImClient() });
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const cmd = getCommand(app.manifest(), 'unread_count');
     const ctx = makeCtx(
       app,
@@ -840,7 +837,7 @@ describe('IM_SERVICE_SELF seeds the self account', () => {
     try {
       // No explicit `account` opt → the constructor reads the env (real-client path is fine; we
       // inject a fake client so no network, but the env read is independent of the client).
-      const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+      const m = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir }).manifest();
       expect(m.initial_state).toMatchObject({ account: { principal_id: 'agent_a1', display: 'agent_a1' } });
     } finally {
       if (prev === undefined) delete process.env['IM_SERVICE_SELF'];
@@ -852,7 +849,7 @@ describe('IM_SERVICE_SELF seeds the self account', () => {
     const prev = process.env['IM_SERVICE_SELF'];
     process.env['IM_SERVICE_SELF'] = 'from_env';
     try {
-      const m = new ImProxyApp({ client: new FakeImClient(), account: { principal_id: 'explicit', display: 'X' } }).manifest();
+      const m = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir, account: { principal_id: 'explicit', display: 'X' } }).manifest();
       expect(m.initial_state).toMatchObject({ account: { principal_id: 'explicit', display: 'X' } });
     } finally {
       if (prev === undefined) delete process.env['IM_SERVICE_SELF'];
@@ -864,7 +861,7 @@ describe('IM_SERVICE_SELF seeds the self account', () => {
     const prev = process.env['IM_SERVICE_SELF'];
     delete process.env['IM_SERVICE_SELF'];
     try {
-      const m = new ImProxyApp({ client: new FakeImClient() }).manifest();
+      const m = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir }).manifest();
       expect((m.initial_state as ImProxyState).account).toBeUndefined();
     } finally {
       if (prev !== undefined) process.env['IM_SERVICE_SELF'] = prev;
@@ -1227,6 +1224,29 @@ describe('D2d: on_uninstall preserves cursors.jsonl (INV #5)', () => {
     // The durable file is untouched — a later restart still restores the cursor.
     expect(existsSync(path)).toBe(true);
     expect(new CursorStore(dir).readCursors().get('c1')).toBe(4);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// Hardening: no implicit cwd fallback. Constructing without `dir` AND without `cursors` must
+// fail closed (no silent `.block-agent/apps/im_proxy/` write under cwd). Injecting either is fine.
+describe('hardening: explicit data dir required (no cwd fallback)', () => {
+  it('throws a clear error when neither dir nor cursors is provided', () => {
+    expect(() => new ImProxyApp({ client: new FakeImClient() })).toThrow(
+      /requires an explicit data dir/,
+    );
+  });
+
+  it('does NOT throw when an explicit dir is provided', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im_proxy_dir_ok_'));
+    expect(() => new ImProxyApp({ client: new FakeImClient(), dir })).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does NOT throw when an explicit cursors store is provided (dir optional)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im_proxy_cursors_ok_'));
+    const cursors = new CursorStore(dir);
+    expect(() => new ImProxyApp({ client: new FakeImClient(), cursors })).not.toThrow();
     rmSync(dir, { recursive: true, force: true });
   });
 });

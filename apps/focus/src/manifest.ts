@@ -802,16 +802,17 @@ function replayRecord(state: FocusState, rec: FocusRecord): FocusState {
 
 /** Options for constructing a FocusApp. */
 export interface FocusAppOptions {
-  /** Storage dir (defaults to `.block-agent/apps/focus/`). */
-  dir?: string;
+  /**
+   * Storage dir for the focus jsonl — REQUIRED. There is no implicit cwd fallback:
+   * the caller (launch.ts / tests) must give the data an explicit home, or boot fails.
+   * Ignored when an injectable `store` is supplied.
+   */
+  dir: string;
   /** Config override (defaults to the compiled defaults). */
   config?: Partial<FocusConfig>;
   /** Injectable store for testing (overrides the jsonl store). */
   store?: FocusStore;
 }
-
-/** `.block-agent/apps/focus` under cwd — the default storage dir (§12.1). */
-const DEFAULT_DIR = join(process.cwd(), '.block-agent', 'apps', 'focus');
 
 /**
  * FocusApp — the concrete working-state / trajectory BlockApp. `manifest()` produces the
@@ -826,9 +827,17 @@ export class FocusApp {
   private readonly initialState: FocusState;
   private ctx: AppContext<FocusState> | null = null;
 
-  constructor(opts: FocusAppOptions = {}) {
-    const dir = opts.dir ?? DEFAULT_DIR;
-    this.store = opts.store ?? new FocusStore(dir);
+  constructor(opts: FocusAppOptions) {
+    // dir is required for the durable jsonl store — no implicit cwd fallback (B-plan).
+    // An injectable `store` supersedes dir; otherwise a missing dir is a hard error.
+    if (opts.store) {
+      this.store = opts.store;
+    } else {
+      if (opts.dir === undefined) {
+        throw new Error('FocusApp requires an explicit data dir; no implicit cwd fallback');
+      }
+      this.store = new FocusStore(opts.dir);
+    }
     this.config = clampConfig({ ...DEFAULT_CONFIG, ...opts.config });
     // Restart-restore (§6): replay the durable jsonl into a bounded initial state.
     // Guarded so a read/parse failure never blocks boot (start empty instead).

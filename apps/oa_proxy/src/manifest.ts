@@ -333,7 +333,13 @@ function makeSetConfigCommand(): CommandManifest<OaProxyState> {
 
 /** Options for constructing an OaProxyApp. */
 export interface OaProxyAppOptions {
-  /** Base dir for the config-file seed (defaults to `.block-agent/apps`). */
+  /**
+   * Base dir for the read-only config-file seed. OPTIONAL: when omitted the config
+   * file is NOT read at all (compiled defaults are used) — there is no implicit cwd
+   * fallback, so a missing injection can never silently read `.block-agent/apps`
+   * relative to the process cwd. (oa_proxy holds no durable store — it is a pure
+   * projection of the upstream OA service — so there is no `dir` to require.)
+   */
   configBase?: string;
   /**
    * Optional client override for testing (inject a FakeOaClient instead of the real
@@ -351,11 +357,16 @@ export class OaProxyApp {
   private readonly client: OaClient | undefined;
 
   constructor(opts: OaProxyAppOptions = {}) {
-    const seeded = readAppConfig(
-      APP_ID,
-      DEFAULT_CONFIG as unknown as Record<string, unknown>,
-      opts.configBase ?? APPS_DIR,
-    );
+    // configBase omitted → skip the file seed entirely and use compiled defaults (no
+    // implicit cwd-relative `.block-agent/apps` read). configBase present → read+merge.
+    const seeded =
+      opts.configBase === undefined
+        ? ({ ...DEFAULT_CONFIG } as unknown as Record<string, unknown>)
+        : readAppConfig(
+            APP_ID,
+            DEFAULT_CONFIG as unknown as Record<string, unknown>,
+            opts.configBase,
+          );
     // base_url precedence: OA_SERVICE_URL env > file config > compiled default. The platform
     // (BlockAI-team Console) injects the per-instance OA endpoint via OA_SERVICE_URL env (same
     // contract as task_proxy's TASK_SERVICE_URL / im_proxy's IM_SERVICE_URL) — the token already

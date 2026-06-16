@@ -66,7 +66,6 @@ import type {
   CommandResult,
   JsonSchema,
 } from '@block-agent/core/app/types.js';
-import { APPS_DIR } from '@block-agent/core/apps/_app_config.js';
 import type { ConvKind, ImPushFrame, WireMessage } from './wire.js';
 import { ImClient, type ImClientApi } from './im_client.js';
 
@@ -1005,9 +1004,10 @@ export interface ImProxyAppOptions {
   /** Pre-bound account (principal_id + display); usually set on register/boot. */
   account?: { principal_id: string; display: string };
   /**
-   * Storage dir for the durable cursor store (D2d). Defaults to
-   * `.block-agent/apps/im_proxy/` (same `join(APPS_DIR, APP_ID)` resolution as messages/focus).
-   * Tests point this at a temp dir.
+   * Storage dir for the durable cursor store (D2d). REQUIRED unless an explicit `cursors` store
+   * is injected — there is no implicit cwd-relative fallback (a silent `join(APPS_DIR, APP_ID)`
+   * default would leak the cursor file under cwd). launch.ts wires this to
+   * `join(storage_dir, 'im_proxy')`; tests point it at a temp dir (or inject `cursors`).
    */
   dir?: string;
   /**
@@ -1069,9 +1069,19 @@ export class ImProxyApp {
 
     // D2d restart-recovery: the durable cursor store + the cursors restored from it at
     // construction (mirrors messages reading history.jsonl / focus reading focus.jsonl into
-    // initial_state). The read NEVER throws at boot (torn/missing → empty map). The default
-    // dir resolves identically to messages: `join(APPS_DIR, APP_ID)`.
-    this.cursors = opts.cursors ?? new CursorStore(opts.dir ?? join(APPS_DIR, APP_ID));
+    // initial_state). The read NEVER throws at boot (torn/missing → empty map). When `cursors`
+    // is injected (tests) we use it verbatim; otherwise `dir` is REQUIRED — there is no implicit
+    // cwd-relative `join(APPS_DIR, APP_ID)` fallback (that would silently leak data under cwd).
+    if (opts.cursors) {
+      this.cursors = opts.cursors;
+    } else {
+      if (opts.dir === undefined) {
+        throw new Error(
+          'ImProxyApp requires an explicit data dir; no implicit cwd fallback',
+        );
+      }
+      this.cursors = new CursorStore(opts.dir);
+    }
     let restored: Map<string, number>;
     try {
       restored = this.cursors.readCursors();

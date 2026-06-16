@@ -37,6 +37,21 @@ jobs:
       - name: Test
         run: npm run test -w @block-agent/${{ matrix.package }}
 
+      # cwd data-leak guard: every App takes an EXPLICIT data dir (no implicit cwd
+      # fallback — the hardening that removed each app's `?? APPS_DIR` / module-top
+      # `process.cwd()` default). If a test constructs an app without a dir, its jsonl
+      # would land in `<repo>/.block-agent` instead of a temp dir. Fail loudly so a
+      # missed injection is a red build, not a silent leak.
+      - name: Assert no cwd data leak (.block-agent at repo root)
+        shell: bash
+        run: |
+          if [ -e .block-agent ]; then
+            echo "::error::a test leaked a .block-agent dir at the repo root — an app/test was constructed without an explicit data dir (cwd fallback). Pass an explicit (temp) dir."
+            ls -laR .block-agent
+            exit 1
+          fi
+          echo "ok: no .block-agent leaked to the repo root."
+
   apps-typecheck:
     # The trusted built-in apps under apps/ (UH-1 layout) mostly have no own tests
     # (`test` is `--passWithNoTests`) — EXCEPT app-base, which has a real suite and is

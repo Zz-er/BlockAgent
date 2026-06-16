@@ -45,7 +45,6 @@ import { join } from 'node:path';
 
 import type { TurnRecord } from '@block-agent/core/core/types.js';
 import type { AppContext, AppManifest, JsonSchema } from '@block-agent/core/app/types.js';
-import { APPS_DIR } from '@block-agent/core/apps/_app_config.js';
 
 // ============================================================================
 // Identity & file names
@@ -237,7 +236,12 @@ const STATE_SCHEMA: JsonSchema = {
 
 /** Options for constructing a TurnLogApp. */
 export interface TurnLogAppOptions {
-  /** Storage dir (defaults to `.block-agent/apps/turn_log/`). */
+  /**
+   * Storage dir for `runtime_log.jsonl` — REQUIRED. There is no implicit cwd fallback:
+   * the data must always have an explicit home (callers wire it via cli/launch.ts). The
+   * one exception is when an injectable `store` is supplied (tests), in which case `dir`
+   * is unused and may be omitted.
+   */
   dir?: string;
   /** Injectable store for testing (overrides the jsonl store). */
   store?: TurnLogStore;
@@ -255,8 +259,16 @@ export class TurnLogApp {
   private ctx: AppContext<TurnLogState> | null = null;
 
   constructor(opts: TurnLogAppOptions = {}) {
-    const dir = opts.dir ?? join(APPS_DIR, APP_ID);
-    this.store = opts.store ?? new TurnLogStore(dir);
+    if (opts.store) {
+      this.store = opts.store;
+    } else {
+      if (opts.dir === undefined) {
+        throw new Error(
+          'TurnLogApp requires an explicit data dir; no implicit cwd fallback',
+        );
+      }
+      this.store = new TurnLogStore(opts.dir);
+    }
   }
 
   /**

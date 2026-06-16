@@ -806,9 +806,15 @@ function replaceTask(state: TaskState, next: Task): TaskState {
 
 /** Options for constructing a TaskApp. */
 export interface TaskAppOptions {
-  /** Storage dir (defaults to `.block-agent/apps/task/`). */
-  dir?: string;
-  /** Base dir for the config-file seed (defaults to `.block-agent/apps`). */
+  /**
+   * Storage dir for the durable task log. **Required** — there is no implicit
+   * cwd fallback; an omitted dir is a wiring bug, not a silent default.
+   */
+  dir: string;
+  /**
+   * Base dir for the config-file seed. Optional: when omitted, the config-file
+   * seed is **skipped** (compiled defaults are used) — never read from a cwd-relative path.
+   */
   configBase?: string;
   /** Injectable store for testing (overrides the jsonl store). */
   store?: TaskStore;
@@ -829,14 +835,23 @@ export class TaskApp {
   /** Monotonic counter for deterministic task ids within this instance (INV #16). */
   private seq: number;
 
-  constructor(opts: TaskAppOptions = {}) {
-    const dir = opts.dir ?? join(APPS_DIR, APP_ID);
-    this.store = opts.store ?? new TaskStore(dir);
-    const seeded = readAppConfig(
-      APP_ID,
-      DEFAULT_CONFIG as unknown as Record<string, unknown>,
-      opts.configBase ?? APPS_DIR,
-    );
+  constructor(opts: TaskAppOptions) {
+    // dir is the durable data home — it must always have an explicit destination.
+    // No implicit cwd fallback: an omitted dir is a wiring bug, surfaced loudly.
+    if (opts?.dir === undefined) {
+      throw new Error('TaskApp requires an explicit data dir; no implicit cwd fallback');
+    }
+    this.store = opts.store ?? new TaskStore(opts.dir);
+    // configBase is the read-only config-seed path. When omitted, skip the config
+    // file entirely and use compiled defaults — never read a cwd-relative path.
+    const seeded =
+      opts.configBase === undefined
+        ? { ...(DEFAULT_CONFIG as unknown as Record<string, unknown>) }
+        : readAppConfig(
+            APP_ID,
+            DEFAULT_CONFIG as unknown as Record<string, unknown>,
+            opts.configBase,
+          );
     this.seedConfig = clampConfig(seeded as unknown as TaskConfig);
     // Restart restore (D1 §5.2): re-hydrate the bounded task list from the durable log at
     // construction, then advance the id counter past the loaded ids/`ts` so a new task

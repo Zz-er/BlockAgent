@@ -102,7 +102,7 @@ import type {
   CommandResult,
   JsonSchema,
 } from '@block-agent/core/app/types.js';
-import { APPS_DIR, readAppConfig } from '@block-agent/core/apps/_app_config.js';
+import { readAppConfig } from '@block-agent/core/apps/_app_config.js';
 
 // ============================================================================
 // Identity & block names
@@ -1083,8 +1083,9 @@ function renderInputRow(row: Extract<ActionRow, { kind: 'input' }>): string {
  * the AppManifest the AppRegistry installs. Config is seeded from the App's config.json
  * at construction (off the hot path), clamped, then carried in state.
  *
- * The default storage/config base dir is `.block-agent/apps/base/`; tests inject a
- * temp dir so they neither read the repo's real config nor write to it.
+ * The storage/config base dir is REQUIRED — there is no implicit cwd fallback. Tests
+ * inject a temp dir so they neither read the repo's real config nor write to it; the
+ * production wiring (launch.ts) passes the resolved per-app dir explicitly.
  */
 export class BaseApp {
   readonly store: ActionLogStore;
@@ -1094,7 +1095,12 @@ export class BaseApp {
   /** Shared monotonic seq cursor: seeded from the jsonl tail, advanced by `record`. */
   private readonly nextSeqRef: { value: number };
 
-  constructor(baseDir: string = APPS_DIR) {
+  constructor(baseDir: string) {
+    // Data must always have an explicit home — no silent cwd-relative fallback (B-plan
+    // hardening). A missing dir means a caller forgot to inject it; fail loud.
+    if (baseDir === undefined) {
+      throw new Error('BaseApp requires an explicit data dir; no implicit cwd fallback');
+    }
     const dir = join(baseDir, BASE_APP_ID);
     mkdirSync(dir, { recursive: true });
     this.store = new ActionLogStore(join(dir, LOG_FILE));
@@ -1198,12 +1204,13 @@ export class BaseApp {
 }
 
 /**
- * makeBaseApp — convenience factory that constructs an `BaseApp` (default storage
- * dir) and returns its manifest, for callers that don't need the App handle. Tests that
- * need a temp dir or the durable store construct `new BaseApp(dir)` directly.
+ * makeBaseApp — convenience factory that constructs an `BaseApp` at the given storage
+ * base dir and returns its manifest, for callers that don't need the App handle. The
+ * dir is REQUIRED (no implicit cwd fallback). Tests that need the durable store
+ * construct `new BaseApp(dir)` directly.
  */
-export function makeBaseApp(): AppManifest {
-  return new BaseApp().manifest();
+export function makeBaseApp(baseDir: string): AppManifest {
+  return new BaseApp(baseDir).manifest();
 }
 
 // Re-export names + defaults + pure helpers for tests / cross-app references.

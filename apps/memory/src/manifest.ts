@@ -965,9 +965,16 @@ function restoreMemory(
 
 /** Options for constructing a MemoryApp. */
 export interface MemoryAppOptions {
-  /** Storage dir (defaults to `.block-agent/apps/memory/`). */
-  dir?: string;
-  /** Base dir for config-file seed (defaults to `.block-agent/apps`). */
+  /**
+   * Storage dir for the durable JSONL — **required** (no implicit cwd fallback).
+   * The caller (launch.ts in production, a temp dir in tests) must always give the
+   * data an explicit home. Omitted only when an injected `store` supplies its own.
+   */
+  dir: string;
+  /**
+   * Base dir for the config-file seed (optional). When omitted, the config file is
+   * NOT read (compiled defaults are used) — there is no cwd-relative fallback read.
+   */
   configBase?: string;
   /** Injectable store for testing (overrides the JSONL store). */
   store?: MemoryStore;
@@ -984,14 +991,23 @@ export class MemoryApp {
   /** Bounded notes/user projection re-hydrated from the durable JSONL at construction. */
   private readonly seedProjection: { notes: MemoryEntry[]; user: MemoryEntry[] };
 
-  constructor(opts: MemoryAppOptions = {}) {
-    const dir = opts.dir ?? join(APPS_DIR, APP_ID);
+  constructor(opts: MemoryAppOptions) {
+    // dir is the data's explicit home — no implicit cwd fallback. The TS type already
+    // marks it required (so every caller is forced to pass it); this is the runtime
+    // fence for un-typed / hot-install callers.
+    if (opts.dir === undefined) {
+      throw new Error('MemoryApp requires an explicit data dir; no implicit cwd fallback');
+    }
+    const dir = opts.dir;
+    // Seed config from file ONLY when configBase is given. Omitted → compiled defaults,
+    // never a cwd-relative read.
+    const seeded: Record<string, unknown> = opts.configBase === undefined
+      ? { ...DEFAULT_CONFIG }
+      : readAppConfig(APP_ID, { ...DEFAULT_CONFIG }, opts.configBase);
     if (opts.store) {
       this.store = opts.store;
     } else {
       // Build the JSONL store with char limits seeded from config.
-      const defaults: Record<string, unknown> = { ...DEFAULT_CONFIG };
-      const seeded = readAppConfig(APP_ID, defaults, opts.configBase ?? APPS_DIR);
       const notesCharLimit = typeof seeded['notes_char_limit'] === 'number'
         ? Math.max(1, Math.floor(seeded['notes_char_limit'] as number))
         : DEFAULT_CONFIG.notes_char_limit;
@@ -1000,9 +1016,6 @@ export class MemoryApp {
         : DEFAULT_CONFIG.user_char_limit;
       this.store = new JsonlMemoryStore(dir, { notesCharLimit, userCharLimit });
     }
-    // Seed config from file over compiled defaults.
-    const defaults: Record<string, unknown> = { ...DEFAULT_CONFIG };
-    const seeded = readAppConfig(APP_ID, defaults, opts.configBase ?? APPS_DIR);
     this.seedConfig = clampConfig(seeded as unknown as MemoryConfig);
     // Restart restore (D1 §5.2): re-hydrate the bounded notes/user projection from the
     // durable JSONL at construction (pinned/recalled have no durable backing → empty).
