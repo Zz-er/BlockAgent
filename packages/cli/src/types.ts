@@ -204,7 +204,11 @@ export interface LauncherConfig {
    * defensively (a malformed entry drops out); nothing in the default path reads it.
    */
   contract_bindings?: Record<string, string>;
-  /** Base dir for `.block-agent` storage (apps get an explicit dir); default cwd. */
+  /**
+   * Base dir for `.block-agent` storage — the per-process `root_dir` (default cwd); apps get
+   * an explicit dir derived from it. Resolved by `bootstrap` + `loadConfig` (root-dir-
+   * architecture.md §3): always set to the root now, so launch/purge `?? cwd` never fires.
+   */
   storage_dir?: string;
   /** Forwarded to AgentRuntime. */
   max_turns_per_wake?: number;
