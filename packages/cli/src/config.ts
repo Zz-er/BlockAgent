@@ -15,6 +15,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import type {
   LauncherConfig,
@@ -236,6 +237,37 @@ function pick<T>(...candidates: Array<T | undefined>): T | undefined {
 }
 
 // ============================================================================
+// resolveRootDir — the per-process root, resolved BEFORE loadDotenv/loadConfig
+// ============================================================================
+
+/**
+ * resolveRootDir — pick the per-process `root_dir` from ONLY two sources: the
+ * `--root-dir <path>` flag and the `BLOCK_AGENT_ROOT_DIR` *ambient* env var
+ * (root-dir-architecture.md §1). It returns `undefined` when neither is set; the
+ * caller (`bootstrap`) then falls back to `process.cwd()` for byte-identical legacy
+ * behavior.
+ *
+ * THE BOOTSTRAP PARADOX (§1): the `.env` file and `block-agent.config.json` BOTH live
+ * INSIDE the root, so the root must be known BEFORE either is read. That is why this
+ * resolver may NOT consult `.env` or the config file — referencing them would be a
+ * cycle. It runs before `loadDotenv`, so `BLOCK_AGENT_ROOT_DIR` must be a REAL ambient
+ * env var (set by the shell / container); placing it in a `.env` has NO effect (the
+ * `.env` is not loaded yet). This inverts the usual "file > env" intuition and is a
+ * documented high-frequency footgun (README / --help / this doc-comment, all three).
+ *
+ * It does NOT `path.resolve` — absolutization is the caller's single chokepoint
+ * (`bootstrap`) so a relative `--root-dir ./foo` is made absolute exactly once.
+ */
+export function resolveRootDir(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const flags = parseFlags(argv);
+  // Two sources only — NO .env, NO config file (both live inside the root).
+  return asString(flags['root-dir']) ?? asString(env['BLOCK_AGENT_ROOT_DIR']);
+}
+
+// ============================================================================
 // loadConfig — the merge
 // ============================================================================
 
@@ -256,12 +288,26 @@ function pick<T>(...candidates: Array<T | undefined>): T | undefined {
 export function loadConfig(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
+  opts?: { rootDir?: string; rootExplicit?: boolean },
 ): LauncherConfig {
   const flags = parseFlags(argv);
 
-  // Config file: `--config <path>` overrides the default file name; either way a
+  // Per-process root (root-dir-architecture.md §1/§3). Defaults to cwd so the legacy
+  // signature `loadConfig(argv, env)` stays byte-compatible: the default config-file
+  // path and storage_dir below derive from cwd exactly as before. `bootstrap()` passes
+  // the resolved, absolutized root; a `--config` flag still overrides the file path.
+  const rootDir = opts?.rootDir ?? process.cwd();
+  // Was the root EXPLICITLY chosen (--root-dir / BLOCK_AGENT_ROOT_DIR), vs defaulted to
+  // cwd? An explicit root WINS over the deprecated storage_dir aliases (§6); a defaulted
+  // root yields to them so the legacy `--storage-dir` escape hatch still redirects data.
+  const rootExplicit = opts?.rootExplicit ?? false;
+
+  // Config file: `--config <path>` overrides the default file path; otherwise the file
+  // lives in the root (`<root>/block-agent.config.json`). A `--config` path is honored
+  // verbatim (operator's explicit finger — not re-homed under root): absolute is used
+  // as-is, relative resolves against cwd by Node, NOT against root. Either way a
   // bad/missing file degrades to `{}` so defaults win (never throws at startup).
-  const configPath = asString(flags['config']) ?? DEFAULT_CONFIG_FILE;
+  const configPath = asString(flags['config']) ?? join(rootDir, DEFAULT_CONFIG_FILE);
   const file = readConfigFile(configPath);
   const fileProvider = pickObject(file['provider']);
   const fileApps = pickObject(file['apps']);
@@ -312,12 +358,21 @@ export function loadConfig(
     ...(thinking_format !== undefined ? { thinking_format } : {}),
   };
 
-  // Storage dir: flag > file > env > (undefined → launch defaults to cwd).
-  const storage_dir = pick(
+  // Storage dir (root-dir-architecture.md §3/§6): for outside callers it is `root_dir`;
+  // internally we keep the `storage_dir` name and derive `storage_dir = root`, so every
+  // existing data callsite (appsBaseDir, /app purge) keeps working unchanged. The legacy
+  // `--storage-dir` / file `storage_dir` / `BLOCK_AGENT_STORAGE_DIR` survive as DEPRECATED
+  // aliases — a redirect escape hatch — but an EXPLICIT root wins over them (§6). So:
+  //   - explicit root → storage_dir = root (aliases ignored);
+  //   - defaulted root (=cwd) → aliases still redirect, falling back to root(=cwd).
+  // Always defined now (= root at minimum), so the `?? cwd` dead-fallbacks in launch.ts /
+  // commands.ts never fire.
+  const storageAliases = pick(
     asString(flags['storage-dir']),
     asString(file['storage_dir']),
     asString(env['BLOCK_AGENT_STORAGE_DIR']),
   );
+  const storage_dir = rootExplicit ? rootDir : (storageAliases ?? rootDir);
 
   const max_turns_per_wake = pick(
     asNumber(flags['max-turns-per-wake']),
@@ -349,7 +404,9 @@ export function loadConfig(
       oa_proxy: resolveServiceProxy('oa_proxy', flags, fileApps),
       task_proxy: resolveServiceProxy('task_proxy', flags, fileApps),
     },
-    ...(storage_dir !== undefined ? { storage_dir } : {}),
+    // storage_dir is now ALWAYS set (= root at minimum), so this is unconditional —
+    // launch.ts/commands.ts `?? cwd` fallbacks become dead code (kept, harmless).
+    storage_dir,
     ...(max_turns_per_wake !== undefined ? { max_turns_per_wake } : {}),
     ...(allow_purge ? { allow_purge } : {}),
     ...(contract_bindings !== undefined ? { contract_bindings } : {}),

@@ -118,6 +118,27 @@ A few notes:
 - Use the root script `npm run serve`, **not** `npm run serve -w @block-agent/server` — the latter runs in the package directory and won't find the repo-root `.env` / config file.
 - Loopback only: the backend stamps input as the `user` invoker unconditionally, which is only safe on `localhost`. Don't bind `0.0.0.0` until an auth layer is in place.
 
+## Working directory (root_dir, optional)
+
+By default `.env`, `block-agent.config.json`, and all BlockApp data (`.block-agent/apps/<id>/`) live in the directory you launch from (the current working directory, cwd). **With no new flags the behavior is byte-for-byte identical to before** — existing users need to change nothing.
+
+If you want to pin a process's entire state to an explicit root directory (a container volume, several agents on one machine, or just decoupling data from cwd), use `--root-dir`:
+
+```bash
+npm start -- --root-dir /srv/agent-a
+# equivalent: BLOCK_AGENT_ROOT_DIR=/srv/agent-a npm start
+```
+
+From then on that process's `.env`, config file, and app data all live under `/srv/agent-a`. Two processes pointed at different `--root-dir`s are fully isolated; a second process pointed at the **same** root is refused at startup (and prints the holder's pid) so two processes can't interleave writes and corrupt the data.
+
+A few notes:
+
+- **`BLOCK_AGENT_ROOT_DIR` must be a real shell/container environment variable** (ambient env) — it **cannot live in `.env`**, because the root has to be decided *before* `.env` is loaded (the `.env` itself lives inside the root). Putting it in `.env` has no effect. This inverts the usual "file overrides env" intuition and is the most common footgun.
+- **The root must already exist**: `--root-dir` pointing at a non-existent directory **fails fast and exits** (so a typo'd path can't silently create empty state = the agent's amnesia). To create it on purpose, add `--create-root` (e.g. a container's first boot with an empty root volume). The `.block-agent/apps` subtree below it is still created lazily.
+- **Old data is not migrated when you point at a brand-new root.** If you used to run in cwd and now explicitly switch to a new root, the old `.block-agent` / `.env` / config are not moved automatically — `mv` them yourself when needed (e.g. `mv ./.block-agent ./.env ./block-agent.config.json /srv/agent-a/`).
+- The old `--storage-dir` / `BLOCK_AGENT_STORAGE_DIR` remain as **deprecated** aliases: when no `--root-dir` is given they can still redirect app data within the root; once `--root-dir` is given explicitly, the root wins.
+- `--config <path>` is not re-homed by the root: an absolute path is used as-is, a relative path still resolves against cwd (it's the file you explicitly pointed at).
+
 ## Tutorial & docs
 
 To build a block of your own, start with the [BlockApp development guide](./doc/blockapp-development.md) — it begins from the project's directory layout (where `apps/` lives, which files make up a block), then walks you file by file through writing your first working block. Full usage & development docs are in [`doc/`](./doc/README.md).

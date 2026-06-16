@@ -118,6 +118,27 @@ npm run web
 - 用根脚本 `npm run serve`，**不要**用 `npm run serve -w @block-agent/server`——后者会把工作目录切到包目录，找不到仓库根的 `.env` 与配置文件。
 - 仅限本机 loopback：后端无条件把输入按"使用者"身份盖章，只在 `localhost` 上是安全的；未加鉴权前不要绑 `0.0.0.0`。
 
+## 工作目录（root_dir，可选）
+
+默认情况下，`.env`、`block-agent.config.json`、以及所有 BlockApp 的数据（`.block-agent/apps/<id>/`）都落在你启动时所在的目录（当前工作目录 cwd）。**不传任何新参数时行为与以前逐字节一致**——老用户无需改动。
+
+如果你想把一个 agent 进程的全部状态钉在一个明确的根目录（容器挂卷、一机多 agent、把数据从 cwd 解耦），用 `--root-dir`：
+
+```bash
+npm start -- --root-dir /srv/agent-a
+# 等价：BLOCK_AGENT_ROOT_DIR=/srv/agent-a npm start
+```
+
+此后该进程的 `.env`、配置文件、app 数据全部在 `/srv/agent-a` 下。两个指向不同 `--root-dir` 的进程互不干扰；指向**同一** root 的第二个进程会被拒绝启动（并打印持锁进程的 pid），以防两进程交错写坏数据。
+
+几条要点：
+
+- **`BLOCK_AGENT_ROOT_DIR` 必须是真实的 shell/容器环境变量**（ambient env），**不能写进 `.env`**——因为 root 要在加载 `.env` *之前*就定下来（`.env` 本身住在 root 里面）。把它塞进 `.env` 不会生效，这与平常"文件覆盖 env"的直觉相反，是最常见的踩坑点。
+- **root 必须已存在**：`--root-dir` 指向一个不存在的目录会**直接报错退出**（防止打错路径时静默新建空目录 = agent 失忆）。确实要新建就加 `--create-root`（例如容器首次启动、root 卷为空但合法）。其下的 `.block-agent/apps` 会按需自动创建。
+- **指向全新 root 时不会自动搬运旧数据**。如果你之前在 cwd 下跑、现在显式换到一个新 root，旧的 `.block-agent` / `.env` / 配置不会自动迁移——需要时请手动 `mv` 过去（例：`mv ./.block-agent ./.env ./block-agent.config.json /srv/agent-a/`）。
+- 旧的 `--storage-dir` / `BLOCK_AGENT_STORAGE_DIR` 仍作为**已弃用**的别名保留：未显式给 `--root-dir` 时它仍能在 root 内重定向 app 数据；一旦显式给了 `--root-dir`，以 root 为准。
+- `--config <path>` 不受 root 重定向影响：绝对路径按原样用，相对路径仍相对 cwd 解析（这是你手指的文件）。
+
 ## 教程与文档
 
 想自己拼一个 Block，从 [BlockApp 开发指南](./doc/blockapp-development.md) 开始——它从整个项目的目录结构讲起，告诉你 `apps/` 在哪、一个 Block 由哪几个文件组成，再逐个文件带你写出第一个可用的 Block。完整的使用与开发文档见 [`doc/`](./doc/README.md)。

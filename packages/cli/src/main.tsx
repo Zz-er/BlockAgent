@@ -21,7 +21,8 @@
  */
 
 import { render } from './ink.js';
-import { loadConfig, loadDotenv } from './config.js';
+import { loadConfig } from './config.js';
+import { bootstrap, BootstrapError } from './bootstrap.js';
 import { launch } from './launch.js';
 import { App } from './ui/App.js';
 import { isMissingProviderKeyError, type MissingProviderKeyError } from './types.js';
@@ -74,12 +75,27 @@ function printNoTtyHelp(): void {
 }
 
 async function main(): Promise<void> {
-  // Load a repo-root .env (overriding ambient vars) BEFORE reading config/env, so the
-  // project's .env (provider keys, LETTA_*, BLOCK_AGENT_*) actually takes effect for
-  // `npm start` and wins over a stray shell env var (file > env). Shared with the
-  // headless serve bin so the CLI and the web/server path behave identically.
-  loadDotenv();
-  const config = loadConfig(process.argv.slice(2), process.env);
+  const argv = process.argv.slice(2);
+
+  // Per-process root bootstrap (root-dir-architecture.md §1): resolve --root-dir /
+  // BLOCK_AGENT_ROOT_DIR (ambient-only) → absolutize → fail-fast if an explicit root is
+  // missing (unless --create-root) → mkdir .block-agent/apps → take the single-root lock →
+  // load <root>/.env (file > env; byte-identical when root === cwd). Shared with the headless
+  // serve bin so the CLI and web/server paths behave identically. The key stays env-only.
+  let boot;
+  try {
+    boot = bootstrap(argv, process.env);
+  } catch (err) {
+    // A missing explicit root or a held root lock → clean message + non-zero exit, no UI.
+    console.error(err instanceof BootstrapError ? err.message : err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+    return;
+  }
+
+  const config = loadConfig(argv, process.env, {
+    rootDir: boot.root,
+    rootExplicit: boot.rootExplicit,
+  });
   let agent;
   try {
     agent = await launch(config);

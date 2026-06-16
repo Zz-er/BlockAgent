@@ -12,7 +12,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { DEFAULTS, loadConfig, loadDotenv, parseFlags } from '../src/config.js';
+import {
+  DEFAULT_CONFIG_FILE,
+  DEFAULTS,
+  loadConfig,
+  loadDotenv,
+  parseFlags,
+  resolveRootDir,
+} from '../src/config.js';
 
 /** An empty env so a stray real env var never leaks into a test's expectations. */
 const EMPTY_ENV: NodeJS.ProcessEnv = {};
@@ -188,5 +195,90 @@ describe('loadDotenv', () => {
     process.env[K1] = 'untouched';
     expect(() => loadDotenv(join(dir, 'does-not-exist'))).not.toThrow();
     expect(process.env[K1]).toBe('untouched');
+  });
+});
+
+// ============================================================================
+// resolveRootDir — the per-process root (root-dir-architecture.md §1)
+// ============================================================================
+
+describe('resolveRootDir', () => {
+  it('reads the --root-dir flag', () => {
+    expect(resolveRootDir(['--root-dir', '/srv/agent'], EMPTY_ENV)).toBe('/srv/agent');
+    expect(resolveRootDir(['--root-dir=/srv/agent'], EMPTY_ENV)).toBe('/srv/agent');
+  });
+
+  it('reads BLOCK_AGENT_ROOT_DIR from ambient env when no flag', () => {
+    expect(resolveRootDir([], { BLOCK_AGENT_ROOT_DIR: '/env/root' })).toBe('/env/root');
+  });
+
+  it('flag beats env', () => {
+    expect(resolveRootDir(['--root-dir', '/flag'], { BLOCK_AGENT_ROOT_DIR: '/env' })).toBe('/flag');
+  });
+
+  it('returns undefined when neither source is set (caller falls back to cwd)', () => {
+    expect(resolveRootDir([], EMPTY_ENV)).toBeUndefined();
+  });
+
+  it('does NOT consult .env or the config file (only flag + ambient env)', () => {
+    // No file/.env source exists in the resolver — passing storage_dir/config flags has
+    // no effect on the root. (The bootstrap paradox: root is known before either is read.)
+    expect(resolveRootDir(['--config', '/some/config.json'], EMPTY_ENV)).toBeUndefined();
+  });
+
+  it('does NOT absolutize (that is the bootstrap caller\'s single chokepoint)', () => {
+    // A relative path is returned verbatim; bootstrap path.resolve()s it exactly once.
+    expect(resolveRootDir(['--root-dir', './rel'], EMPTY_ENV)).toBe('./rel');
+  });
+});
+
+// ============================================================================
+// loadConfig — root_dir threading (configPath + storage_dir derivation)
+// ============================================================================
+
+describe('loadConfig root_dir threading', () => {
+  it('default config path derives from rootDir (not cwd) when given', () => {
+    const cfg = loadConfig([], EMPTY_ENV, { rootDir: '/my/root' });
+    expect(cfg.config_path).toBe(join('/my/root', DEFAULT_CONFIG_FILE));
+  });
+
+  it('--config is honored verbatim, NOT re-homed under root', () => {
+    const cfg = loadConfig(['--config', '/explicit/cfg.json'], EMPTY_ENV, { rootDir: '/my/root' });
+    expect(cfg.config_path).toBe('/explicit/cfg.json');
+  });
+
+  it('storage_dir is always set (= root) so launch/purge ?? cwd never fires', () => {
+    const cfg = loadConfig([], EMPTY_ENV, { rootDir: '/my/root' });
+    expect(cfg.storage_dir).toBe('/my/root');
+  });
+
+  it('an EXPLICIT root wins over the deprecated --storage-dir alias', () => {
+    const cfg = loadConfig(['--storage-dir', '/old/data'], EMPTY_ENV, {
+      rootDir: '/my/root',
+      rootExplicit: true,
+    });
+    expect(cfg.storage_dir).toBe('/my/root');
+  });
+
+  it('a DEFAULTED root yields to the deprecated --storage-dir alias (escape hatch)', () => {
+    const cfg = loadConfig(['--storage-dir', '/old/data'], EMPTY_ENV, {
+      rootDir: '/my/root',
+      rootExplicit: false,
+    });
+    expect(cfg.storage_dir).toBe('/old/data');
+  });
+
+  it('the deprecated BLOCK_AGENT_STORAGE_DIR env still redirects under a defaulted root', () => {
+    const cfg = loadConfig([], { BLOCK_AGENT_STORAGE_DIR: '/env/data' }, {
+      rootDir: '/my/root',
+      rootExplicit: false,
+    });
+    expect(cfg.storage_dir).toBe('/env/data');
+  });
+
+  it('legacy two-arg loadConfig(argv, env) defaults rootDir to cwd (byte-compatible)', () => {
+    const cfg = loadConfig([], EMPTY_ENV);
+    expect(cfg.storage_dir).toBe(process.cwd());
+    expect(cfg.config_path).toBe(join(process.cwd(), DEFAULT_CONFIG_FILE));
   });
 });

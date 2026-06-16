@@ -33,7 +33,8 @@ import { join } from 'node:path';
 import { argv } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
-import { loadConfig, loadDotenv, parseFlags } from '@block-agent/cli/config.js';
+import { loadConfig, parseFlags } from '@block-agent/cli/config.js';
+import { bootstrap, BootstrapError } from '@block-agent/cli/bootstrap.js';
 import type { LauncherConfig } from '@block-agent/cli/types.js';
 
 import { serve, type RunningServer } from './serve.js';
@@ -54,6 +55,7 @@ const DEFAULT_PORT = 7345;
 export function resolveServeConfig(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
+  opts?: { rootDir?: string; rootExplicit?: boolean },
 ): { config: LauncherConfig; name: string; port: number; host: string } {
   const flags = parseFlags(argv);
   const name = typeof flags['name'] === 'string' ? flags['name'] : '';
@@ -64,14 +66,17 @@ export function resolveServeConfig(
   }
 
   // The full runtime config from the SAME precedence chain the CLI uses (flags > file > env >
-  // defaults). `--config <path>` is honored inside loadConfig (it reads that key itself).
-  const base = loadConfig(argv, env);
+  // defaults). `--config <path>` is honored inside loadConfig (it reads that key itself). The
+  // root_dir (resolved by bootstrap, default cwd) homes the config file + storage base.
+  const base = loadConfig(argv, env, opts);
 
-  // §3.1 instance keying: each instance gets its OWN data dir so two co-located instances never
-  // collide on `.block-agent` state (the §8 `<instance>` segment). We nest the resolved
-  // storage_dir under the instance name; loadConfig's storage_dir (flag/file/env/cwd) is the base.
-  const storageBase = base.storage_dir ?? process.cwd();
-  const config: LauncherConfig = { ...base, storage_dir: join(storageBase, name) };
+  // root + --name are orthogonal two layers (root-dir-architecture.md §4): root = the
+  // process-level isolation boundary, --name = the instance sub-division INSIDE it. The
+  // per-instance data dir is `<root>/<name>` so two co-located instances never collide on
+  // `.block-agent` state. `base.storage_dir` is now ALWAYS the root (loadConfig sets it),
+  // so the old `?? cwd` is gone — a missing InstanceConfig root can no longer leak to cwd.
+  const root = base.storage_dir ?? process.cwd();
+  const config: LauncherConfig = { ...base, storage_dir: join(root, name) };
 
   const portFlag = flags['port'];
   const port =
@@ -91,11 +96,26 @@ export async function main(
   argv: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
-  // Load a repo-root .env (overriding ambient vars) BEFORE resolving config, so the project's
-  // .env (provider keys, BLOCK_AGENT_*, *_SERVICE_*) takes effect for the web/serve path exactly
-  // as it does for `npm start`. Same loader the CLI uses; the key still flows env-only.
-  loadDotenv();
-  const { config, name, port, host } = resolveServeConfig(argv, env);
+  // Per-process root bootstrap (root-dir-architecture.md §1/§4), the SAME shared prologue the
+  // interactive CLI runs: resolve --root-dir / BLOCK_AGENT_ROOT_DIR (ambient-only) → absolutize
+  // → fail-fast on a missing explicit root (unless --create-root) → mkdir .block-agent/apps →
+  // take the single-root lock → load <root>/.env (file > env). The key still flows env-only.
+  let boot;
+  try {
+    boot = bootstrap(argv, env);
+  } catch (err) {
+    // A missing explicit root or a held root lock → clean stderr message + non-zero exit.
+    process.stderr.write(
+      `${err instanceof BootstrapError ? err.message : err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const { config, name, port, host } = resolveServeConfig(argv, env, {
+    rootDir: boot.root,
+    rootExplicit: boot.rootExplicit,
+  });
 
   let server: RunningServer;
   try {
