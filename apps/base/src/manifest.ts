@@ -104,6 +104,8 @@ import type {
 } from '@block-agent/core/app/types.js';
 import { readAppConfig } from '@block-agent/core/apps/_app_config.js';
 
+import { RootFence } from './fence.js';
+
 // ============================================================================
 // Identity & block names
 // ============================================================================
@@ -496,30 +498,43 @@ function toolFail(
   return { id, tool, request, ok: false, result: '', error: `${tool}: ${error}` };
 }
 
-/** `read_file` — read a UTF-8 text file. Real, side-effect-free read. */
-async function readFileTool(id: string, args: unknown): Promise<ToolCallRecord> {
+/**
+ * `read_file` — read a UTF-8 text file. Real, side-effect-free read, GATED by the
+ * root_dir realpath fence (P0.3): the target path is realpath-resolved and must land
+ * inside an allowed root, else the read is REFUSED (fail-closed) before `fs` is touched.
+ */
+async function readFileTool(fence: RootFence, id: string, args: unknown): Promise<ToolCallRecord> {
   const request = asRecord(args);
   const path = stringArg(args, 'path');
   if (path === null) return toolFail('read_file', id, request, 'missing string arg `path`');
+  // FENCE FIRST: resolve the real on-disk location and refuse anything out of the agent's
+  // allowed roots (defeats `../` traversal + absolute escape + symlink-out). No read on null.
+  const safe = fence.check(path);
+  if (safe === null)
+    return toolFail('read_file', id, request, `path '${path}' is outside the allowed root`);
   try {
     const { readFile: fsReadFile } = await import('node:fs/promises');
-    const text = await fsReadFile(path, 'utf8');
+    const text = await fsReadFile(safe, 'utf8');
     return toolOk('read_file', id, request, text);
   } catch (err) {
     return toolFail('read_file', id, request, err instanceof Error ? err.message : String(err));
   }
 }
 
-/** `grep` — search a file's lines for a literal substring (deterministic). */
-async function grepTool(id: string, args: unknown): Promise<ToolCallRecord> {
+/** `grep` — search a file's lines for a literal substring (deterministic). Fence-gated (P0.3). */
+async function grepTool(fence: RootFence, id: string, args: unknown): Promise<ToolCallRecord> {
   const request = asRecord(args);
   const pattern = stringArg(args, 'pattern');
   const path = stringArg(args, 'path');
   if (pattern === null) return toolFail('grep', id, request, 'missing string arg `pattern`');
   if (path === null) return toolFail('grep', id, request, 'missing string arg `path`');
+  // FENCE FIRST: same realpath containment gate as read_file — no read on a null verdict.
+  const safe = fence.check(path);
+  if (safe === null)
+    return toolFail('grep', id, request, `path '${path}' is outside the allowed root`);
   try {
     const { readFile: fsReadFile } = await import('node:fs/promises');
-    const text = await fsReadFile(path, 'utf8');
+    const text = await fsReadFile(safe, 'utf8');
     const lines = text.split('\n');
     const matches: string[] = [];
     for (let i = 0; i < lines.length; i++) {
@@ -536,11 +551,22 @@ async function grepTool(id: string, args: unknown): Promise<ToolCallRecord> {
  * `bash` — run a shell command. DANGEROUS: declares `op:dangerous`, so the agent invoker
  * is gated to `pending` BEFORE this runs (§9.4). v3.0 SAFE STUB: records the requested
  * command, does NOT spawn a shell.
+ *
+ * WRITE-SIDE FENCE FRAMEWORK (P0.3): bash is the future write/exec lane, so the realpath
+ * fence is wired here NOW (ready to reuse when bash becomes a real shell). When the caller
+ * names a working dir (`cwd`), it MUST be inside an allowed root — a shell run outside the
+ * agent's root is refused before anything executes (fail-closed). The command string itself
+ * is opaque to the fence (a real shell will need per-write fencing at spawn time); this gate
+ * is the directory boundary the real implementation reuses verbatim.
  */
-async function bashTool(id: string, args: unknown): Promise<ToolCallRecord> {
+async function bashTool(fence: RootFence, id: string, args: unknown): Promise<ToolCallRecord> {
   const request = asRecord(args);
   const command = stringArg(args, 'command');
   if (command === null) return toolFail('bash', id, request, 'missing string arg `command`');
+  // Write-side fence: if a working dir is named, it must resolve inside an allowed root.
+  const cwd = stringArg(args, 'cwd');
+  if (cwd !== null && fence.check(cwd) === null)
+    return toolFail('bash', id, request, `cwd '${cwd}' is outside the allowed root`);
   return toolOk('bash', id, request, `[bash stub] would run: ${command}`);
 }
 
@@ -549,7 +575,7 @@ async function bashTool(id: string, args: unknown): Promise<ToolCallRecord> {
  * granted the token but the host must be allowlisted host-side. v3.0 SAFE STUB: records the
  * requested (method, url), does NOT open a socket.
  */
-async function httpRequestTool(id: string, args: unknown): Promise<ToolCallRecord> {
+async function httpRequestTool(_fence: RootFence, id: string, args: unknown): Promise<ToolCallRecord> {
   const request = asRecord(args);
   const url = stringArg(args, 'url');
   if (url === null) return toolFail('http_request', id, request, 'missing string arg `url`');
@@ -567,10 +593,14 @@ async function httpRequestTool(id: string, args: unknown): Promise<ToolCallRecor
 // agent — the actions ledger captures it via `onCommand` at `command_detail=3`. The tool
 // command writes NO block and keeps NO state.
 
-/** The runner signature each tool exposes. */
-type ToolRunner = (id: string, args: unknown) => Promise<ToolCallRecord>;
+/**
+ * The runner signature each tool exposes. The `fence` is the root_dir realpath fence
+ * (P0.3): file/exec tools consult it before touching the disk; pure tools ignore it.
+ */
+type ToolRunner = (fence: RootFence, id: string, args: unknown) => Promise<ToolCallRecord>;
 
 function toolCommand(
+  fence: RootFence,
   tool: BuiltinTool,
   description: string,
   capabilities: Capability[],
@@ -594,7 +624,7 @@ function toolCommand(
       }
 
       const id = invocationIdFor(tool, args);
-      const record = await run(id, args);
+      const record = await run(fence, id, args);
 
       // Return the record as data — the actions ledger captures `{ tool, id, result }` via
       // onCommand (command_detail=3). No block op, no state mutation: the command executes
@@ -1087,6 +1117,18 @@ function renderInputRow(row: Extract<ActionRow, { kind: 'input' }>): string {
  * inject a temp dir so they neither read the repo's real config nor write to it; the
  * production wiring (launch.ts) passes the resolved per-app dir explicitly.
  */
+export interface BaseAppOptions {
+  /**
+   * The root_dir realpath-fence roots (P0.3): every `base.read_file` / `grep` / `bash`
+   * (write side) target MUST resolve inside one of these. This is the agent's own
+   * root_dir → storage_dir (the agent reads/writes its own tree, never the wider host).
+   * Omitted → defaults to `[process.cwd()]` (the agent's root_dir; in the default config
+   * storage_dir IS cwd). The production wiring (launch.ts) MAY pass the resolved
+   * storage_dir explicitly so the fence is independent of the process cwd.
+   */
+  allowedRoots?: string[];
+}
+
 export class BaseApp {
   readonly store: ActionLogStore;
   private readonly config: BaseConfig;
@@ -1094,13 +1136,23 @@ export class BaseApp {
   private readonly enabled: string[];
   /** Shared monotonic seq cursor: seeded from the jsonl tail, advanced by `record`. */
   private readonly nextSeqRef: { value: number };
+  /** The root_dir realpath fence guarding every file tool (P0.3). */
+  private readonly fence: RootFence;
 
-  constructor(baseDir: string) {
+  constructor(baseDir: string, opts?: BaseAppOptions) {
     // Data must always have an explicit home — no silent cwd-relative fallback (B-plan
     // hardening). A missing dir means a caller forgot to inject it; fail loud.
     if (baseDir === undefined) {
       throw new Error('BaseApp requires an explicit data dir; no implicit cwd fallback');
     }
+    // Build the file-tool fence (P0.3). Default root = the agent's own root_dir (= cwd in
+    // the default config); the production wiring may pass the resolved storage_dir. A path
+    // resolving OUTSIDE these roots is refused before any read/write/exec (fail-closed).
+    const allowedRoots =
+      opts?.allowedRoots !== undefined && opts.allowedRoots.length > 0
+        ? opts.allowedRoots
+        : [process.cwd()];
+    this.fence = new RootFence(allowedRoots);
     const dir = join(baseDir, BASE_APP_ID);
     mkdirSync(dir, { recursive: true });
     this.store = new ActionLogStore(join(dir, LOG_FILE));
@@ -1133,6 +1185,7 @@ export class BaseApp {
   manifest(): AppManifest {
     const store = this.store;
     const nextSeqRef = this.nextSeqRef;
+    const fence = this.fence;
     const initial_state: BaseState = {
       recent: [],
       config: this.config,
@@ -1159,6 +1212,7 @@ export class BaseApp {
         // http_request → net:http (host-allowlisted), read_file/grep are real reads.
         () =>
           toolCommand(
+            fence,
             'read_file',
             'Read a UTF-8 text file; the body is returned in the command result.',
             [],
@@ -1167,6 +1221,7 @@ export class BaseApp {
           ),
         () =>
           toolCommand(
+            fence,
             'grep',
             'Search a file for a literal substring; matches are returned in the command result.',
             [],
@@ -1179,6 +1234,7 @@ export class BaseApp {
           ),
         () =>
           toolCommand(
+            fence,
             'bash',
             'Run a shell command (DANGEROUS → agent invoker requires approval).',
             [CAP_DANGEROUS],
@@ -1187,6 +1243,7 @@ export class BaseApp {
           ),
         () =>
           toolCommand(
+            fence,
             'http_request',
             'Make an outbound HTTP request (net:http → host-allowlisted for the agent).',
             [CAP_NET_HTTP],
@@ -1209,8 +1266,8 @@ export class BaseApp {
  * dir is REQUIRED (no implicit cwd fallback). Tests that need the durable store
  * construct `new BaseApp(dir)` directly.
  */
-export function makeBaseApp(baseDir: string): AppManifest {
-  return new BaseApp(baseDir).manifest();
+export function makeBaseApp(baseDir: string, opts?: BaseAppOptions): AppManifest {
+  return new BaseApp(baseDir, opts).manifest();
 }
 
 // Re-export names + defaults + pure helpers for tests / cross-app references.
@@ -1223,4 +1280,5 @@ export {
   buildInputRow,
   pushBounded,
   renderRecent,
+  RootFence,
 };
