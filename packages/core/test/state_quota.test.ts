@@ -88,6 +88,17 @@ describe('assertStateWithinQuota — trust-scoped, fail-closed', () => {
   it('respects a caller-supplied lower limit', () => {
     expect(() => assertStateWithinQuota('evil', 'sandboxed', 'abcdef', 4)).toThrow(AppStateQuotaError);
   });
+
+  it('P0.4 force: meters a TRUSTED app when force=true (declares-projection lane)', () => {
+    // A trusted app is normally unmetered, but the registry passes force=true when it
+    // DECLARES projection — its state reaches the prompt via the generic builder, so it
+    // must respect the quota even though it is trusted (GUARD2).
+    expect(() => assertStateWithinQuota('proj', 'trusted', big, undefined, true)).toThrow(
+      AppStateQuotaError,
+    );
+    // ...and force=false (the default) keeps a trusted app unmetered (zero regression).
+    expect(() => assertStateWithinQuota('proj', 'trusted', big, undefined, false)).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -159,5 +170,43 @@ describe('child-process write-back quota (AppRegistry.write_app_cell)', () => {
     const reg = new AppRegistry();
     installApp(reg, quotaApp('trusted'));
     expect(() => reg.write_app_cell('q', { data: OVERSIZED })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0.4 GUARD2 — a TRUSTED app that DECLARES projection is metered (set_state)
+// ---------------------------------------------------------------------------
+
+describe('declares-projection widens metering to a trusted app', () => {
+  /** A TRUSTED app that declares projection (no own builder for the block — GUARD1). */
+  function projectingTrustedApp(): AppManifest {
+    return {
+      id: 'q',
+      version: '0.0.0',
+      depends_on: [],
+      tree_namespace: '/q',
+      initial_state: { data: 'seed' },
+      state_schema: { type: 'object' },
+      trust: 'trusted',
+      builders: [],
+      projection: [{ block: 'q:view', from: 'data' }],
+      commands: [],
+    };
+  }
+
+  it('REJECTS an over-quota set_state on a trusted declares-projection app', () => {
+    const reg = new AppRegistry();
+    reg.install(projectingTrustedApp()); // trusted: no child factory needed
+    const ctx = reg.get_app_context('q')!;
+    expect(() => ctx.set_state(() => ({ data: OVERSIZED }))).toThrow(AppStateQuotaError);
+    expect((ctx.state as { data: string }).data).toBe('seed'); // cell untouched
+  });
+
+  it('ALLOWS a within-quota set_state on the same app', () => {
+    const reg = new AppRegistry();
+    reg.install(projectingTrustedApp());
+    const ctx = reg.get_app_context('q')!;
+    ctx.set_state(() => ({ data: 'small' }));
+    expect((ctx.state as { data: string }).data).toBe('small');
   });
 });

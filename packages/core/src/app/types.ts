@@ -358,6 +358,23 @@ export interface AppManifest<TState = unknown> {
    */
   host?: AppHostKind;
 
+  /**
+   * Context-budget reservation (§9.2 ①): the MAX bytes (UTF-8) this App's rendered
+   * blocks may occupy in the prompt. Optional + additive. Two roles, both static (a
+   * `set_config` may NEVER raise it — that would bypass the install-time Σ check, §9.4 #7):
+   *   - DECLARATION side: `install()` rejects when Σ(render_ceiling_bytes) over all
+   *     installed dashboard Apps would exceed the injected reserve `R` (the dashboard
+   *     budget), throwing `AppRenderReserveError` BEFORE the App is recorded (zero
+   *     residue). An App that omits this declares no reservation (and, per the wiring,
+   *     is held to a global default ceiling so the budget proof still closes — §9.4 #1).
+   *   - RUN side: the Renderer clips each of this App's blocks to this ceiling (§9.2 ②),
+   *     so the declared bound is structurally enforced, not a gentleman's agreement.
+   * The elastic `base` ledger does NOT declare this — it is clipped to the injected
+   * `E_hard = B − R` instead (the render reserve left after the dashboards), so the
+   * per-turn total is `Σdashboards + base ≤ R + E_hard = B` by construction (§9.3).
+   */
+  render_ceiling_bytes?: number;
+
   /** Subtree root this App owns, e.g. `/memory` (block names use the bare id prefix). */
   tree_namespace: string;
   initial_state: TState;

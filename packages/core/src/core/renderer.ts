@@ -40,6 +40,7 @@ import type {
   BuilderManifest,
   BuilderRegistry,
 } from '../app/types.js';
+import { clipBytes } from '../apps/_projection.js';
 
 /** Fixed render order of the three cache tiers (§10.2 stable-first, volatile-last). */
 const TIER_ORDER: readonly CacheTier[] = ['stable', 'slow_changing', 'volatile'] as const;
@@ -81,6 +82,25 @@ export interface RendererOptions {
    * fallback.
    */
   readonly configs?: ReadonlyMap<string, Readonly<Record<string, string>>>;
+  /**
+   * Per-block render ceiling resolver (context-budget §9.2 ②): given a block's owning
+   * `app_id`, return the MAX UTF-8 bytes that App's blocks may occupy, or `undefined`
+   * for "no clip" (unbudgeted — the legacy behavior). The Renderer clips each block's
+   * rendered text to this ceiling with the SAME pure `clipBytes` the projection path
+   * uses, AFTER the builder runs — a deterministic function of (frozen snapshot, static
+   * ceiling), so byte-identical rendering (INV #1) holds and `estimateTokens` never
+   * touches the build path. The elastic `base` ledger resolves to `E_hard` here (the
+   * launcher's closure returns `B − R` for it); dashboards resolve to their declared
+   * `render_ceiling_bytes`. Unset (undefined) ⇒ NO clipping at all (every block renders
+   * full — current behavior preserved, the budget model is opt-in via wiring).
+   *
+   * RECALLED-FENCE EXCEPTION (§9.4 #3): a block whose rendered output carries a
+   * structured fence token (`memory:recalled`) is SELF-BOUNDED in its own builder to
+   * ≤ ceiling, so this uniform clip hits `clipBytes`'s fast-path (a no-op) and never
+   * severs a fence token. The Renderer adds NO fence semantics — it clips uniformly; the
+   * fenced builder's self-bound is what keeps the fast-path guaranteed.
+   */
+  readonly ceiling_resolver?: (app_id: string) => number | undefined;
 }
 
 /** One block paired with the tier it renders into and its owner builder (if any). */
@@ -171,7 +191,7 @@ export class Renderer implements RendererContract {
     const out: RenderedBlock[] = [];
     for (const item of classified) {
       if (item === null) continue;
-      out.push({ name: item.name, tier: item.tier, text: this.blockText(item.block) });
+      out.push({ name: item.name, tier: item.tier, text: this.blockText(item) });
     }
     return out;
   }
@@ -235,11 +255,11 @@ export class Renderer implements RendererContract {
   private renderTier(items: Classified[]): string | ContentPart[] {
     const hasBlob = items.some((it) => it.block.content_blob !== null);
     if (!hasBlob) {
-      return items.map((it) => this.blockText(it.block)).join('\n');
+      return items.map((it) => this.blockText(it)).join('\n');
     }
     const parts: ContentPart[] = [];
     for (const it of items) {
-      const text = this.blockText(it.block);
+      const text = this.blockText(it);
       if (text.length > 0) parts.push({ type: 'text', value: text });
       const blob = it.block.content_blob;
       if (blob !== null) {
@@ -252,9 +272,36 @@ export class Renderer implements RendererContract {
     return parts;
   }
 
-  /** Deterministic text projection of one block: just its content (no metadata). */
-  private blockText(block: Readonly<Block>): string {
-    return block.content_text ?? '';
+  /**
+   * Deterministic text projection of one classified block: its content, clipped to the owning
+   * App's render ceiling (§9.2 ②). The clip is a PURE function of (block content, static
+   * ceiling) — `clipBytes` trims on a codepoint boundary and appends a fixed marker — so
+   * rendering stays byte-identical for a given (snapshot, ceiling) pair (INV #1); it runs AFTER
+   * the builder, never inside it, and never consults `estimateTokens`. A fenced block
+   * (`memory:recalled`) is already self-bounded ≤ its ceiling, so this hits `clipBytes`'s
+   * fast-path (no-op) and never cuts a fence token. No resolver, or `undefined` ceiling for
+   * this app ⇒ render full (unclipped).
+   *
+   * SECURITY (RedTeam P0.2): the ceiling is keyed off the AUTHORITATIVE owning app_id —
+   * `it.builder.app_id` (set at INSTALL, builder-immutable) for a managed block, falling back
+   * to the tree-POSITION name (`it.name`, the registry/collect key) for an unmanaged block.
+   * It is NEVER keyed off `it.block.name` — a builder's `build()` may return a Block whose
+   * `name` differs from its registered tree position, so trusting the returned name would let
+   * a (buggy or tampered) builder emit `{name:'runtime:huge'}` from a budgeted slot and clip
+   * would resolve `runtime`→undefined→escape the budget. Keying off install-time identity
+   * closes that: the budget is structurally enforced, not builder-self-reported.
+   */
+  private blockText(it: Classified): string {
+    const text = it.block.content_text ?? '';
+    const resolver = this.options.ceiling_resolver;
+    if (resolver === undefined) return text;
+    // Install-time owner: the builder's app_id (a managed block) or the tree-position
+    // name's prefix (an unmanaged block has no builder). Both are immune to a forged
+    // `it.block.name` — `it.name` is the snapshot/collect key, not the builder's output.
+    const appId = it.builder?.app_id ?? appIdOf(it.name);
+    const ceiling = resolver(appId);
+    if (ceiling === undefined) return text;
+    return clipBytes(text, ceiling);
   }
 
   // --------------------------------------------------------------------------
@@ -320,6 +367,17 @@ export class Renderer implements RendererContract {
 // ============================================================================
 
 const EMPTY_CONFIG: Readonly<Record<string, string>> = Object.freeze({});
+
+/**
+ * The owning app_id of a block name: the prefix before the first `:` (`<app_id>:<name>`,
+ * §3.1). A bare name with no colon (e.g. the synthetic `core:root` always has one, but a
+ * malformed/legacy name might not) yields the whole string — the ceiling_resolver simply
+ * returns undefined for an unknown id, so an unprefixed block renders unclipped (safe).
+ */
+function appIdOf(name: BlockName): string {
+  const i = name.indexOf(':');
+  return i < 0 ? name : name.slice(0, i);
+}
 
 /**
  * A block contributes to the prompt only if it carries content. A node with

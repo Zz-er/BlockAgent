@@ -58,9 +58,28 @@ import type { ModelProvider } from '@block-agent/core/provider/types.js';
 import type { IdentityState } from '@block-agent/app-agent_identity/manifest.js';
 import type { LauncherConfig, LaunchedAgent, ProviderKind, HotUninstallResult } from './types.js';
 import { MISSING_PROVIDER_KEY_CODE } from './types.js';
+import { computeContextBudget } from './config.js';
 
 /** The empty-tree root name (core/block.ts:128 `core:root`); apps fill the tree on use. */
 const ROOT_NAME: BlockName = 'core:root';
+
+/**
+ * App ids whose render budget is the ELASTIC `E_hard`, NOT a fixed dashboard reservation
+ * (skill-memory-wiki §9.1): the agent's episodic working stream. `base` (the action/
+ * observation ledger) is the one elastic stream today. These are exempt from the install
+ * Σ ≤ R gate and resolve to `E_hard` in the Renderer's ceiling_resolver.
+ */
+const ELASTIC_APP_IDS: ReadonlySet<string> = new Set<string>(['base']);
+
+/**
+ * Default PER-BLOCK `render_ceiling_bytes` charged to (and clipped on) a dashboard App that
+ * declares none (§9.4 #1, fail-closed: undeclared still counts toward Σ ≤ R). 4 KiB — a
+ * conservative cap that comfortably holds one bounded dashboard panel; an App needing more
+ * declares its own `render_ceiling_bytes`. Per-block (缺陷1): the Σ charge is (block count)×
+ * this default, matching the Renderer's per-block clip, so the budget proof (Σ ≤ R) holds
+ * regardless of how many blocks each default-charged App renders.
+ */
+const DEFAULT_DASHBOARD_CEILING = 4 * 1024;
 
 /**
  * Turn-barrier registry, keyed by AgentRuntime. The §8.2 wake seam (`ctx.wake` →
@@ -144,6 +163,20 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //   block:delete_physical / block:modify_pinned), matching the PolicyEngine
   //   `sandboxed` row's denied set (policy.ts) so install-time and run-time agree.
   registry.ceiling_resolver = capabilityCeilingFor;
+
+  // 2-budget) Inject the context-budget reserve (skill-memory-wiki §9.2 ①). `R` caps the
+  //   SUM of every installed dashboard App's render_ceiling_bytes; install() throws
+  //   AppRenderReserveError if admitting an App would exceed it (fail-closed, BEFORE the
+  //   App is recorded). An App that declares no ceiling is charged DEFAULT_DASHBOARD_CEILING
+  //   (so an undeclared App still counts toward Σ, never escapes the budget). The elastic
+  //   `base` ledger is EXEMPT — its budget is `E_hard`, enforced by the Renderer's per-block
+  //   clip (§9.2 ②), not an install-time reservation. Set BEFORE installEnabledApps so the
+  //   boot's own installs are metered too. Wiring-injected (not config-overridable) so the
+  //   partition is stable across restarts (§9.4 #1/#7).
+  const budget = computeContextBudget();
+  registry.render_reserve_bytes = budget.R;
+  registry.default_render_ceiling_bytes = DEFAULT_DASHBOARD_CEILING;
+  registry.elastic_app_ids = ELASTIC_APP_IDS;
 
   // 2a) Register the built-in scalar-count contracts (R-6) BEFORE installing any app,
   //     so the assemble-time provides/consumes check can resolve each contract NAME to
@@ -257,8 +290,21 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
 
   // 4) Renderer over the live App-context provider so state-driven projection builders
   //    (messages:recent / base:recent) read post-mutation state each render.
+  //    ceiling_resolver (skill-memory-wiki §9.2 ②): the run-side half of the budget — the
+  //    Renderer clips each block to its owning App's render ceiling. `base` (the elastic
+  //    stream) → `E_hard`; every other App → its declared render_ceiling_bytes, or the
+  //    DEFAULT (so an undeclared dashboard is still clipped, matching its install-side
+  //    charge). An app_id with no installed manifest → undefined (render unclipped, safe —
+  //    e.g. `core:root` / a system bookkeeping block has no App reservation). The closure
+  //    reads the registry live, so a hot-installed App's blocks are clipped from turn 1.
   const renderer = new Renderer(registry, {
     app_context_provider: (app_id) => registry.get_app_context(app_id),
+    ceiling_resolver: (app_id) => {
+      if (ELASTIC_APP_IDS.has(app_id)) return budget.E_hard;
+      const manifest = registry.get(app_id);
+      if (manifest === null) return undefined; // not an App block (core:root, bookkeeping)
+      return manifest.render_ceiling_bytes ?? DEFAULT_DASHBOARD_CEILING;
+    },
   });
 
   // 5) Runtime. root_name = the empty-tree root so its bookkeeping blocks attach.
@@ -517,8 +563,17 @@ function installEnabledApps(
   // AND owns the agent's tools. The two telemetry feeds (onCommand / onInput) are subscribed
   // near the runtime construction (above); runtime uninstall is guarded (F1, commands.ts).
   // `base` (the variable) is the APPS_DIR root (the BaseApp ctor appends `base/`).
+  //
+  // P0.3 fence wiring (integration glue): the BaseApp file-tool fence (read_file/grep/bash)
+  // must allow the agent's resolved root_dir (= storage_dir), NOT the process cwd. BaseApp
+  // defaults `allowedRoots` to `[process.cwd()]` — correct ONLY when storage_dir == cwd (the
+  // default config). With an explicit `--root-dir <other>`, cwd ≠ storage_dir, so we MUST
+  // pass the resolved root here, or the fence would wrongly admit cwd files and wrongly
+  // refuse files inside root_dir. storage_dir is always set post-loadConfig (= root at
+  // minimum); the `?? cwd` is dead-fallback (kept for the legacy no-root path).
   if (config.apps.base.enabled) {
-    registry.install(new BaseApp(base).manifest());
+    const fenceRoot = config.storage_dir ?? process.cwd();
+    registry.install(new BaseApp(base, { allowedRoots: [fenceRoot] }).manifest());
   }
   // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
   // @block-agent/app-memory_letta — core never imports it (DR-M4). base_url comes from

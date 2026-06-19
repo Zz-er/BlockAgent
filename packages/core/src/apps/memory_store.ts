@@ -336,6 +336,71 @@ export function fenceRecalledContent(body: string): string {
   return [MEMORY_CONTEXT_OPEN, MEMORY_CONTEXT_NOTE, '', safe, MEMORY_CONTEXT_CLOSE].join('\n');
 }
 
+/**
+ * The FIXED UTF-8 byte overhead the fence wrapper adds around a body: the open/close
+ * tokens, the system note, and the four `'\n'` join separators (between OPEN·NOTE·''·body·CLOSE).
+ * A pure constant — `fenceRecalledContent` is `[OPEN, NOTE, '', safe, CLOSE].join('\n')`, so
+ * the non-body bytes are `OPEN + '\n' + NOTE + '\n' + '' + '\n' + '\n' + CLOSE` (the empty
+ * line contributes its two surrounding newlines). Computed once at module load.
+ */
+export const FENCE_OVERHEAD_BYTES =
+  Buffer.byteLength(
+    [MEMORY_CONTEXT_OPEN, MEMORY_CONTEXT_NOTE, '', '', MEMORY_CONTEXT_CLOSE].join('\n'),
+    'utf8',
+  );
+
+/**
+ * fenceRecalledContentBounded — fence-aware clip (context-budget §9.4 #3): wrap `body` in
+ * the isolation fence such that the WHOLE rendered block is ≤ `ceiling` UTF-8 bytes BY
+ * CONSTRUCTION. The recalled builder calls this so the Renderer's uniform per-block clip
+ * (`clipBytes`) hits its fast-path (a no-op) on `memory:recalled` and can NEVER sever the
+ * structured fence token (which would pierce the primary INV #21 defense, §5.1).
+ *
+ * Order (matters): neutralize fence tokens FIRST (an injection can't hide behind the
+ * wrapper, and neutralizing may EXPAND the body — `<…>` → `&lt;…&gt;` — so it must precede
+ * the size clip), THEN `clipBytes` the neutralized body to the budget left after the fixed
+ * wrapper overhead, THEN wrap. Clipping the already-neutralized body can only trim inert
+ * text (entities / plain chars) on a codepoint boundary — never a real fence token, since
+ * those are only the wrapper we add here. Pure + deterministic (INV #1 / #16).
+ *
+ * FAIL-CLOSED on a degenerate ceiling (RedTeam P0.2 informational): if `ceiling` is smaller
+ * than `FENCE_OVERHEAD_BYTES` itself, NO valid fence can fit — the wrapper alone exceeds the
+ * ceiling, so the Renderer's uniform `clipBytes(text, ceiling)` would then SEVER the structured
+ * CLOSE token and pierce INV #21. So we return '' (render NOTHING) rather than emit an
+ * over-ceiling fenced block: an empty recalled panel is strictly safer than a fence-broken one.
+ * In production the ceiling (≥4 KiB) dwarfs the overhead so this never fires; it guards against
+ * a misconfiguration silently re-arming the very escape this self-bound closes. Also returns ''
+ * for an empty body (render nothing).
+ */
+export function fenceRecalledContentBounded(body: string, ceiling: number): string {
+  if (body.trim().length === 0) return '';
+  // Fail-closed: a ceiling that can't hold the wrapper would let the Renderer cut the fence.
+  if (ceiling < FENCE_OVERHEAD_BYTES) return '';
+  const safe = neutralizeFenceTokens(body);
+  const bodyBudget = ceiling - FENCE_OVERHEAD_BYTES; // ≥ 0 by the guard above
+  const clipped = clipBytesCodepoint(safe, bodyBudget);
+  return [MEMORY_CONTEXT_OPEN, MEMORY_CONTEXT_NOTE, '', clipped, MEMORY_CONTEXT_CLOSE].join('\n');
+}
+
+/**
+ * clipBytesCodepoint — cap `text` at `max` UTF-8 bytes on a codepoint boundary (no marker,
+ * no split surrogate). A private twin of `_projection.clipBytes` WITHOUT the `…[truncated]`
+ * marker: the recalled body is clipped INSIDE the fence, where the visible truncation marker
+ * would be needless noise and (worse) eat into the body budget unpredictably. Pure.
+ */
+function clipBytesCodepoint(text: string, max: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= max) return text;
+  let out = '';
+  let used = 0;
+  for (const ch of text) {
+    const w = Buffer.byteLength(ch, 'utf8');
+    if (used + w > max) break;
+    out += ch;
+    used += w;
+  }
+  return out;
+}
+
 // ============================================================================
 // Implementer split (architect-owned spec; mirrors ARCHITECTURE.md style)
 // ============================================================================

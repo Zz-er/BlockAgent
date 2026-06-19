@@ -17,7 +17,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AppRegistry } from '../src/app/registry.js';
+import { AppRegistry, AppRenderReserveError } from '../src/app/registry.js';
 import { Operations } from '../src/core/operations.js';
 import { Renderer } from '../src/core/renderer.js';
 import { BlockTree } from '../src/core/block.js';
@@ -30,6 +30,7 @@ import {
   NOTES_BLOCK,
   USER_BLOCK,
   RECALLED_BLOCK,
+  MEMORY_RENDER_CEILING_BYTES,
   type MemoryEntry,
   type MemoryState,
 } from '@block-agent/app-memory/manifest.js';
@@ -373,6 +374,104 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
     }
   });
 
+  it('§9.4 #3: a HUGE recalled body self-bounds ≤ ceiling AND keeps the fence token intact', async () => {
+    const reg = new AppRegistry();
+    const dir = tempDir();
+    try {
+      const app = new MemoryApp({ dir });
+      reg.install(app.manifest());
+      const builder = reg.resolve_builder(RECALLED_BLOCK);
+      // A recall body far larger than the App's render ceiling.
+      const flood = '召回内容'.repeat(20_000); // multibyte, ≫ MEMORY_RENDER_CEILING_BYTES
+      const hugeState: MemoryState = {
+        ...baseState,
+        recalled: [
+          { id: 'big', target: 'notes', content: flood, provenance: { origin: 'agent', verified: false } },
+        ],
+      };
+      const block = await builder!.build(stubBuildContext(), stubAppContext(hugeState));
+      expect(block).not.toBeNull();
+      const text = block!.content_text!;
+      // (a) the whole fenced block is ≤ the App ceiling BY CONSTRUCTION (self-bound).
+      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(MEMORY_RENDER_CEILING_BYTES);
+      // (b) BOTH fence tokens survive the clip — the close tag is never severed (INV #21).
+      expect(text).toContain(MEMORY_CONTEXT_OPEN);
+      expect(text.endsWith(MEMORY_CONTEXT_CLOSE)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('§9.4 #3: the Renderer per-block clip is a NO-OP on the self-bounded recalled block', async () => {
+    // The Renderer clips memory:recalled to the SAME ceiling the builder self-bound to, so
+    // clipBytes hits its fast-path (no marker, no cut) — proving the uniform Renderer clip
+    // never severs the fence token on this fenced block. We first build the self-bound block
+    // via the real RECALLED builder, then render it through a passthrough owner so the
+    // Renderer re-emits THAT block (rather than re-running the live, empty memory cell).
+    const reg = new AppRegistry();
+    const dir = tempDir();
+    try {
+      const app = new MemoryApp({ dir });
+      reg.install(app.manifest());
+      const flood = 'x'.repeat(60_000);
+      const hugeState: MemoryState = {
+        ...baseState,
+        recalled: [
+          { id: 'big', target: 'notes', content: flood, provenance: { origin: 'agent', verified: false } },
+        ],
+      };
+      const recalledBuilder = reg.resolve_builder(RECALLED_BLOCK)!;
+      const block = (await recalledBuilder.build(stubBuildContext(), stubAppContext(hugeState)))!;
+
+      // A throwaway registry whose memory:recalled owner just re-emits the snapshot block,
+      // so the Renderer's clip is the only transform under test.
+      const reg2 = new AppRegistry();
+      reg2.install({
+        id: 'memory',
+        version: '1.0.0',
+        depends_on: [],
+        tree_namespace: '/memory',
+        initial_state: {},
+        state_schema: {},
+        builders: [
+          () => ({
+            name: 'passthrough.recalled',
+            version: '1.0.0',
+            owner: 'system',
+            app_id: 'memory',
+            inputs: [],
+            outputs: [RECALLED_BLOCK],
+            cache_tier: 'volatile',
+            async build(ctx: BuildContext): Promise<Block | null> {
+              const src = ctx.read(RECALLED_BLOCK);
+              return src ? { ...src, children: [] } : null;
+            },
+          }),
+        ],
+        commands: [],
+      });
+      const tree = new BlockTree({
+        id: 'root',
+        name: 'root:root' as BlockName,
+        children: [block],
+        content_text: null,
+        content_blob: null,
+      });
+      const renderer = new Renderer(reg2, {
+        ceiling_resolver: (id) => (id === 'memory' ? MEMORY_RENDER_CEILING_BYTES : undefined),
+      });
+      const r = await renderer.render(tree.snapshot());
+      const rendered = r.segments[0]!.rendered as string;
+      // Fast-path no-op: the rendered text equals the builder's self-bound output verbatim
+      // (no extra `…[truncated]` marker from the Renderer), and the fence close is intact.
+      expect(rendered).toBe(block.content_text);
+      expect(rendered).not.toContain('…[truncated]');
+      expect(rendered.endsWith(MEMORY_CONTEXT_CLOSE)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('RecalledBlockBuilder returns null for empty recalled state', async () => {
     const reg = new AppRegistry();
     const dir = tempDir();
@@ -383,6 +482,39 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
       const emptyState: MemoryState = { ...baseState, recalled: [] };
       const block = await builder!.build(stubBuildContext(), stubAppContext(emptyState));
       expect(block).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('缺陷1: the real memory app charges the reserve PER-BLOCK (4 blocks × ceiling), not 1×', () => {
+    // Concrete coverage of the per-block charge against the REAL memory manifest (not a
+    // synthetic N-block stub): memory renders 4 blocks (pinned/notes/user/recalled), so its
+    // reserve charge is 4 × MEMORY_RENDER_CEILING_BYTES. A reserve sized for only 1× rejects
+    // it; a reserve sized for 4× admits it. (If a future `memory:index` block is added, the
+    // charge tracks the real builder count automatically — no constant to bump.)
+    const dir = tempDir();
+    try {
+      const fourBlockCharge = 4 * MEMORY_RENDER_CEILING_BYTES;
+
+      // R one byte short of the 4-block charge → install REJECTED (proves it charges 4×, not 1×).
+      const tight = new AppRegistry();
+      tight.render_reserve_bytes = fourBlockCharge - 1;
+      expect(() => tight.install(new MemoryApp({ dir }).manifest())).toThrow(AppRenderReserveError);
+
+      // R exactly the 4-block charge → admitted.
+      const ok = new AppRegistry();
+      ok.render_reserve_bytes = fourBlockCharge;
+      expect(() => ok.install(new MemoryApp({ dir }).manifest())).not.toThrow();
+      expect(ok.get('memory')).not.toBeNull();
+
+      // Sanity: a 1×-ceiling reserve (what the OLD per-app charge would have allowed) is NOT
+      // enough — the regression the per-block fix closes.
+      const oldWrong = new AppRegistry();
+      oldWrong.render_reserve_bytes = MEMORY_RENDER_CEILING_BYTES; // 1× — the buggy sizing
+      expect(() => oldWrong.install(new MemoryApp({ dir }).manifest())).toThrow(
+        AppRenderReserveError,
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

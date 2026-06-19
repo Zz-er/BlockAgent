@@ -56,7 +56,7 @@ import {
   type MemoryRecord,
   type MemoryQuery,
   type MemoryStore,
-  fenceRecalledContent,
+  fenceRecalledContentBounded,
   scanMemoryContent,
 } from '@block-agent/core/apps/memory_store.js';
 
@@ -73,6 +73,18 @@ export const PINNED_BLOCK: BlockName = 'memory:pinned';
 export const NOTES_BLOCK: BlockName = 'memory:notes';
 export const USER_BLOCK: BlockName = 'memory:user';
 export const RECALLED_BLOCK: BlockName = 'memory:recalled';
+
+/**
+ * Per-block render ceiling (context-budget §9.2): the MAX UTF-8 bytes EACH of this App's
+ * blocks may occupy in the prompt. Declared on the manifest (`render_ceiling_bytes`) so
+ * install() counts it toward the dashboard reserve Σ ≤ R — PER BLOCK (缺陷1): memory renders
+ * four blocks (pinned/notes/user/recalled), so its charge is 4 × this ceiling. The recalled
+ * builder also SELF-BOUNDs its fenced output to ≤ this ceiling (§9.4 #3) so the Renderer's
+ * uniform per-block clip fast-paths it and never severs the fence token. The notes/user
+ * windows are already char-bounded (2200/1375 chars) well under this. 4 KiB per block:
+ * comfortably fits each bounded window + the fenced recall hits.
+ */
+export const MEMORY_RENDER_CEILING_BYTES = 4 * 1024;
 
 /** §12.2: each JSONL line MUST be ≤ 64KB. */
 const MAX_LINE_BYTES = 64 * 1024;
@@ -540,7 +552,12 @@ const RecalledBlockBuilder: BuilderManifest = {
     const state = memoryStateOf(app_ctx);
     if (state === null || state.recalled.length === 0) return null;
     const body = renderEntries(state.recalled);
-    const fenced = fenceRecalledContent(body);
+    // §9.4 #3: fence-aware SELF-BOUND to the App's render ceiling, so the whole fenced
+    // block is ≤ ceiling by construction. The Renderer's uniform per-block clip then
+    // fast-paths this block (no-op) and can never cut the structured fence token (which
+    // would pierce the INV #21 isolation). Renderer adds no fence semantics — the bound
+    // lives here, in the trusted builder, where the fence structure is known.
+    const fenced = fenceRecalledContentBounded(body, MEMORY_RENDER_CEILING_BYTES);
     if (fenced.length === 0) return null;
     return {
       id: RECALLED_BLOCK,
@@ -1033,6 +1050,10 @@ export class MemoryApp {
       id: APP_ID,
       version: '1.0.0',
       depends_on: [],
+      // Context-budget reservation (§9.2 ①): install() counts this toward the dashboard
+      // reserve Σ ≤ R, and the Renderer clips each memory block to it (§9.2 ②). The
+      // recalled builder self-bounds its fenced output to the SAME value (§9.4 #3).
+      render_ceiling_bytes: MEMORY_RENDER_CEILING_BYTES,
       tree_namespace: TREE_NAMESPACE,
       // initial_state carries the file-seeded config AND the bounded notes/user projection
       // re-hydrated from the durable JSONL at construction (D1 §5.2 restart restore): a

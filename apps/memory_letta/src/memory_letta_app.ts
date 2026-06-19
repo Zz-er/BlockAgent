@@ -42,7 +42,7 @@ import type {
 } from '@block-agent/core/app/types.js';
 import {
   scanMemoryContent,
-  fenceRecalledContent,
+  fenceRecalledContentBounded,
   type MemoryRecord,
 } from '@block-agent/core/apps/memory_store.js';
 import { LettaMemoryStore, type LettaCoreBlock } from './letta_store.js';
@@ -60,6 +60,16 @@ const TREE_NAMESPACE = '/memory_letta' as const;
 /** The two blocks this App renders. */
 const CORE_BLOCK: BlockName = 'memory_letta:core';
 const RECALLED_BLOCK: BlockName = 'memory_letta:recalled';
+
+/**
+ * Per-block render ceiling (context-budget §9.2), mirroring the built-in `memory` app. The
+ * recalled builder SELF-BOUNDs its fenced output to ≤ this ceiling (§9.4 #3 通则: any block
+ * whose render output carries a structured token must self-bound in its builder) so the
+ * Renderer's uniform per-block clip fast-paths it and never severs the `</memory-context>`
+ * fence token. Declared on the manifest so install() charges (block count)×this toward Σ ≤ R.
+ * 4 KiB per block, same as `memory`.
+ */
+export const MEMORY_LETTA_RENDER_CEILING_BYTES = 4 * 1024;
 
 // ============================================================================
 // State (INV #14 — all JSON + bounded)
@@ -176,7 +186,7 @@ function makeCoreBlocksBuilder(initialState: LettaMemoryState): BuilderManifest 
 /**
  * RecalledBlockBuilder — projects the most-recent archival search hits into
  * `memory_letta:recalled`. Wraps content in the shared provenance fence
- * (`fenceRecalledContent`) with [unverified] markers for unverified entries.
+ * (`fenceRecalledContentBounded`, self-bound ≤ ceiling) with [unverified] markers for unverified entries.
  * cache_tier `volatile`: changes on every recall command.
  * INV #16: reads `app_ctx.state.recalled` only — no Letta call, no clock.
  */
@@ -202,7 +212,10 @@ function makeRecalledBlockBuilder(initialState: LettaMemoryState): BuilderManife
         })
         .join('\n');
 
-      const fenced = fenceRecalledContent(body);
+      // §9.4 #3: fence-aware SELF-BOUND to the App's render ceiling so the whole fenced block
+      // is ≤ ceiling by construction; the Renderer's uniform per-block clip then fast-paths it
+      // and can never cut the structured fence token (INV #21).
+      const fenced = fenceRecalledContentBounded(body, MEMORY_LETTA_RENDER_CEILING_BYTES);
       if (fenced.length === 0) return null;
 
       return {
@@ -546,6 +559,10 @@ export class MemoryLettaApp {
       id: APP_ID,
       version: '1.0.0',
       depends_on: [],
+      // Context-budget reservation (§9.2 ①): install() charges (block count)×this toward
+      // Σ ≤ R, and the Renderer clips each memory_letta block to it (§9.2 ②). The recalled
+      // builder self-bounds its fenced output to the SAME value (§9.4 #3).
+      render_ceiling_bytes: MEMORY_LETTA_RENDER_CEILING_BYTES,
       tree_namespace: TREE_NAMESPACE,
       initial_state: initialState,
       state_schema: STATE_SCHEMA,

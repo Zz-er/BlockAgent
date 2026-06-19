@@ -400,6 +400,68 @@ describe('AppRegistry', () => {
     );
   });
 
+  it('P0.4 ④: STAMPS a builder whose app_id ≠ its install id to the install id (clip-key integrity)', () => {
+    const reg = new AppRegistry();
+    // A builder declaring a FOREIGN app_id ('rich') while installed under 'a'. The Renderer keys
+    // its render ceiling off `builder.app_id`, and the Σ charges blocks under the install id, so
+    // the two only agree if app_id === install id. The registry STAMPS it (not reject) so the
+    // clip key is GUARANTEED to equal the install id — the author cannot mis-declare it.
+    const foreign: BuilderManifest = {
+      ...passthroughBuilder('a:x', 'stable'),
+      app_id: 'rich', // mismatched: installed under 'a'
+    };
+    reg.install(manifest({ id: 'a', builders: [foreign] }));
+    expect(reg.get('a')).not.toBeNull(); // installed, NOT rejected
+    expect(reg.resolve_builder('a:x')?.app_id).toBe('a'); // stamped to the install id
+    // The ORIGINAL module-level singleton is NOT mutated (per-instance copy) — its declared
+    // app_id still reads 'rich', so a second install sharing it is not corrupted.
+    expect(foreign.app_id).toBe('rich');
+  });
+
+  it('P0.4 ④: a builder already matching its install id is registered UNCHANGED (zero alloc)', () => {
+    const reg = new AppRegistry();
+    const ok = passthroughBuilder('a:x', 'stable'); // app_id derived = 'a' = install id
+    reg.install(manifest({ id: 'a', builders: [ok] }));
+    expect(reg.resolve_builder('a:x')).toBe(ok); // same reference (no needless copy)
+  });
+
+  it('P0.4 ④: an undefined app_id is STAMPED to the install id (no skip)', () => {
+    const reg = new AppRegistry();
+    // Omit app_id entirely (exactOptionalPropertyTypes: not `app_id: undefined`).
+    const { app_id: _drop, ...noAppId } = passthroughBuilder('a:x', 'stable');
+    reg.install(manifest({ id: 'a', builders: [noAppId as BuilderManifest] }));
+    expect(reg.resolve_builder('a:x')?.app_id).toBe('a'); // stamped, not left undefined
+  });
+
+  it('P0.4 ④: auto-rename stamps each install to its OWN id, no cross-install pollution', () => {
+    // Install the SAME builder-declaring manifest twice. The 2nd collides on id → renames to
+    // `r_2` (§5.3 #4). The builders output DIFFERENT block names so indexBuilders does not trip
+    // INV #3; each builder must be stamped to ITS OWN installed id, and the first must not be
+    // corrupted by the second (the per-instance copy on a would-be shared singleton).
+    const reg = new AppRegistry();
+    const mk = (out: BlockName): AppManifest =>
+      manifest({ id: 'r', builders: [{ ...passthroughBuilder(out, 'stable'), app_id: 'r' }] });
+    const r1 = reg.install(mk('r:one' as BlockName));
+    const r2 = reg.install(mk('r:two' as BlockName)); // collides → 'r_2'
+    expect(r1.installed_id).toBe('r');
+    expect(r2.installed_id).toBe('r_2');
+    expect(reg.resolve_builder('r:one')?.app_id).toBe('r'); // stamped to own id
+    expect(reg.resolve_builder('r:two')?.app_id).toBe('r_2'); // stamped to renamed id
+  });
+
+  it('P0.4 ④: a builder-bearing app asking for a RESERVED id (core→core_2) installs and is stamped', () => {
+    // The canonical auto-rename case: an app declaring the RESERVED id `core` (its builders
+    // therefore declare app_id 'core') is renamed to `core_2` at install (§5.3 #4 / reserved).
+    // A throw on `builder.app_id('core') !== installed_id('core_2')` would WRONGLY reject this
+    // documented-legal install; stamping installs it and re-homes the builder to 'core_2'.
+    const reg = new AppRegistry();
+    const m = manifest({ id: 'core', builders: [{ ...passthroughBuilder('core:x', 'stable'), app_id: 'core' }] });
+    const res = reg.install(m);
+    expect(res.installed_id).toBe('core_2'); // reserved → auto-renamed
+    expect(reg.get('core_2')).not.toBeNull(); // installed, NOT rejected
+    expect(reg.resolve_builder('core:x')?.app_id).toBe('core_2'); // stamped to the renamed id
+  });
+
   it('uninstall removes the App and its builder ownership', () => {
     const reg = new AppRegistry();
     reg.install(manifest({ id: 'a', builders: [passthroughBuilder('a:s', 'stable')] }));

@@ -5,9 +5,10 @@
  * Two surfaces:
  *   1. the builder itself — pure pipeline scan→fence→clip, the `from` subpath extraction,
  *      the volatile tier pin, null on injection / absent slice.
- *   2. the registry wiring — a SANDBOXED app declaring `projection` gets a system-owned
- *      generic builder per entry; a TRUSTED app declaring the same does NOT (it renders
- *      via its own builders — the auto-build is sandboxed-only).
+ *   2. the registry wiring — an app declaring `projection` gets a system-owned generic
+ *      builder per entry. P0.4 opened this to TRUSTED apps too (was sandboxed-only), with
+ *      GUARD1: a projected block that is ALSO owned by a hand-written builder REJECTS the
+ *      install (the own builder would bypass the generic scan+fence).
  *
  * Raven SS4 ① (injection content forced through scan+fence, can't bypass) + ② size cap
  * (clip) + INV#4 (owner=system) + INV#1 (deterministic build) are gated here.
@@ -23,9 +24,11 @@ import {
 import {
   MEMORY_CONTEXT_OPEN,
   MEMORY_CONTEXT_CLOSE,
+  fenceRecalledContentBounded,
+  FENCE_OVERHEAD_BYTES,
 } from '../src/apps/memory_store.js';
 import { AppRegistry } from '../src/app/registry.js';
-import type { AppManifest, AppContext, BuildContext } from '../src/app/types.js';
+import type { AppManifest, AppContext, BuildContext, BuilderManifest } from '../src/app/types.js';
 import type { BlockName, BlockSnapshot } from '../src/core/types.js';
 import { inProcessChildFactory } from './_support/in_process_child_factory.js';
 
@@ -215,10 +218,92 @@ describe('registry auto-registers a system builder from a SANDBOXED app projecti
     expect(builder!.cache_tier_pinned).toBe(true);
   });
 
-  it('does NOT auto-build for a TRUSTED app declaring projection (renders via own builders)', () => {
+  it('P0.4: ALSO auto-builds for a TRUSTED app declaring projection (opens the metered render path)', () => {
     const reg = new AppRegistry();
     reg.install(projectionApp('trusted'));
-    // No generic builder is registered for the trusted app's projection block.
-    expect(reg.resolve_builder('proj:view')).toBeNull();
+    // P0.4 GUARD1 opened the gate: a trusted app declaring projection now ALSO gets the
+    // synthesized system-owned generic builder (so it can opt into the declarative,
+    // scan+fence+clip render path), not just sandboxed apps.
+    const builder = reg.resolve_builder('proj:view');
+    expect(builder).not.toBeNull();
+    expect(builder!.owner).toBe('system');
+    expect(builder!.cache_tier).toBe('volatile');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0.4 GUARD1 — projection + same-name own builder REJECTS at install
+// ---------------------------------------------------------------------------
+
+describe('P0.4 GUARD1: projection collides with a hand-written builder', () => {
+  /** A trusted app that BOTH declares projection for proj:view AND ships a builder owning it. */
+  function collidingApp(): AppManifest {
+    const ownBuilder: BuilderManifest = {
+      name: 'OwnViewBuilder',
+      version: '1.0.0',
+      owner: 'system',
+      app_id: 'proj',
+      inputs: [],
+      outputs: ['proj:view'],
+      cache_tier: 'volatile',
+      async build() {
+        return {
+          id: 'proj:view',
+          name: 'proj:view',
+          children: [],
+          content_text: 'own',
+          content_blob: null,
+        };
+      },
+    };
+    return {
+      id: 'proj',
+      version: '0.0.0',
+      depends_on: [],
+      tree_namespace: '/proj',
+      initial_state: { display: 'hi' },
+      state_schema: { type: 'object' },
+      trust: 'trusted',
+      builders: [() => ownBuilder],
+      projection: [{ block: 'proj:view', from: 'display' }],
+      commands: [],
+    };
+  }
+
+  it('REJECTS the install (a projected block must not also be owned by an own builder)', () => {
+    const reg = new AppRegistry();
+    // GUARD1: an own builder on a projected block would bypass the generic scan+fence →
+    // install throws (fail-closed), NOT silently ignores either path.
+    expect(() => reg.install(collidingApp())).toThrow(/GUARD1|projection/i);
+    // Zero residue: the rejected app is not recorded.
+    expect(reg.get('proj')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fenceRecalledContentBounded — degenerate-ceiling fail-closed (RedTeam P0.2 info)
+// ---------------------------------------------------------------------------
+
+describe('fenceRecalledContentBounded — self-bound + degenerate-ceiling guard', () => {
+  it('produces a fenced block ≤ ceiling with both tokens intact (normal ceiling)', () => {
+    const out = fenceRecalledContentBounded('x'.repeat(100_000), 4096);
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(4096);
+    expect(out).toContain(MEMORY_CONTEXT_OPEN);
+    expect(out.endsWith(MEMORY_CONTEXT_CLOSE)).toBe(true);
+  });
+
+  it('FAIL-CLOSED: a ceiling smaller than the fence wrapper renders NOTHING (no fence-sever)', () => {
+    // A ceiling below the irreducible wrapper overhead cannot hold a valid fence — emitting
+    // one would let the Renderer's clipBytes cut the CLOSE token (INV #21 breach). So it
+    // returns '' (render nothing), never an over-ceiling fenced block.
+    expect(fenceRecalledContentBounded('some recalled body', FENCE_OVERHEAD_BYTES - 1)).toBe('');
+    // Exactly at the overhead, an empty-body fence fits (body budget 0).
+    const atEdge = fenceRecalledContentBounded('body', FENCE_OVERHEAD_BYTES);
+    expect(Buffer.byteLength(atEdge, 'utf8')).toBeLessThanOrEqual(FENCE_OVERHEAD_BYTES);
+    expect(atEdge.endsWith(MEMORY_CONTEXT_CLOSE)).toBe(true);
+  });
+
+  it('returns "" for an empty body (render nothing)', () => {
+    expect(fenceRecalledContentBounded('   ', 4096)).toBe('');
   });
 });

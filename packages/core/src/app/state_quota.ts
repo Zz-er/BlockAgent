@@ -73,19 +73,29 @@ export function stateByteLength(value: unknown): number {
 }
 
 /**
- * Enforce the byte quota for a sandboxed App's next state. No-op for a trusted App
- * (returns immediately — the gate is sandboxed-only, zero regression). For a sandboxed
- * App, throws `AppStateQuotaError` when `next` serializes to more than `limit` bytes
- * so the caller leaves the cell untouched. `trust` is the App's authored
- * `manifest.trust`; absent ⇒ trusted (the codebase-wide default).
+ * Enforce the byte quota for a METERED App's next state. The gate fires when EITHER the
+ * App is sandboxed (its state is the projection source the GenericProjectionBuilder
+ * renders) OR `force` is true. `force` is the P0.4 widening (seat §10.2 GUARD2): a
+ * TRUSTED App that opts into the declarative projection render path (`manifest.projection`)
+ * is "metered-trusted" — its projected state reaches the prompt through the same generic
+ * builder, so it must respect the same byte quota even though it is trusted. The caller
+ * (registry) passes `force = manifest.projection != null` so a trusted dashboard that
+ * does NOT project stays unmetered (zero regression), but one that does is capped.
+ *
+ * Throws `AppStateQuotaError` when `next` serializes to more than `limit` bytes so the
+ * caller leaves the cell untouched. `trust` is the App's authored `manifest.trust`;
+ * absent ⇒ trusted (the codebase-wide default).
  */
 export function assertStateWithinQuota(
   app_id: string,
   trust: AppTrust | undefined,
   next: unknown,
   limit: number = DEFAULT_MAX_STATE_BYTES,
+  force = false,
 ): void {
-  if (effectiveTrust(trust) !== 'sandboxed') return; // trusted apps are unmetered
+  // Metered iff sandboxed (state is the projection source) OR the caller forces it
+  // (trusted-but-declares-projection). A plain trusted App is unmetered → zero regression.
+  if (!force && effectiveTrust(trust) !== 'sandboxed') return;
   const bytes = stateByteLength(next);
   if (bytes > limit) throw new AppStateQuotaError(app_id, bytes, limit);
 }

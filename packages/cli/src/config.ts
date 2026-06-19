@@ -62,6 +62,73 @@ export const DEFAULTS: LauncherConfig = {
 /** The config file consulted when `--config` is absent (design §3 / §11.4). */
 export const DEFAULT_CONFIG_FILE = 'block-agent.config.json';
 
+// ============================================================================
+// Context budget (skill-memory-wiki-architecture.md §9) — compiled, NOT overridable
+// ============================================================================
+
+/**
+ * The resolved context budget partition (§9.2). All BYTES (UTF-8 — the unit the Renderer
+ * clips on), so token→byte conversion happens HERE, once, at boot:
+ *   - `B`      — the global render budget: the prompt-byte ceiling everything-rendered
+ *                must fit under.
+ *   - `R`      — the dashboard reserve: the ceiling on Σ(render_ceiling_bytes) over the
+ *                bounded dashboard Apps (the install-side gate, §9.2 ①).
+ *   - `E_hard` — `B − R`: the elastic stream's (`base`) hard byte ceiling, enforced by the
+ *                Renderer's per-block clip (§9.2 ②). The leftover render budget after the
+ *                dashboards' reserve.
+ * Invariant: `R + E_hard = B` by construction, so `Σdashboards + base ≤ R + E_hard = B`
+ * holds for every turn's transient (§9.3).
+ */
+export interface ContextBudget {
+  readonly B: number;
+  readonly R: number;
+  readonly E_hard: number;
+}
+
+/**
+ * Pessimistic UTF-8 bytes per token, for the one-time token→byte conversion (§9.2). A
+ * deliberately HIGH constant: the budget proof must hold for the worst case (multibyte
+ * CJK/emoji text costs more bytes per token than ASCII), so over-estimating bytes keeps the
+ * rendered prompt comfortably within the model's true token window. NOT `estimateTokens`
+ * (per-provider, never on the render path) — a fixed compile-time factor, applied once.
+ */
+const PESSIMISTIC_BYTES_PER_TOKEN = 4;
+
+/**
+ * The token budget reserved for ALL block-tree rendering (dashboards + base ledger),
+ * compile-time constant. Deliberately conservative and model-AGNOSTIC: it must be ≤ the
+ * smallest model context we target, and stable across restarts (so `E_hard` — which the
+ * agent's working window is clipped to — never shifts under it, §9.4 #7). The model's full
+ * window also holds the system prompt, tool catalog, and the provider's own framing, so this
+ * is only the slice the BlockTree may occupy, well under any modern (≥128K-token) window.
+ */
+const RENDER_TOKEN_BUDGET = 48 * 1024; // 48K tokens of block-tree render budget
+
+/**
+ * Fraction of the global budget `B` reserved for the bounded DASHBOARDS (`R = ⌊B·ratio⌋`);
+ * the remainder is the elastic `base` stream's `E_hard`. 45%/55% split: the dashboards
+ * get a reserve that comfortably holds the PER-BLOCK charge of the default set (缺陷1: the
+ * Σ now counts every dashboard BLOCK × its ceiling, ≈12 blocks × 4 KiB ≈ 48 KiB for the
+ * default boot) with headroom for a few hot-installed apps, and the majority stays with the
+ * agent's episodic working context. A compile-time constant — the operator does not tune the
+ * partition (§9.4 #7: a config knob on this would let a restart silently move `E_hard`).
+ */
+const DASHBOARD_RESERVE_RATIO = 0.45;
+
+/**
+ * computeContextBudget — derive the `{ B, R, E_hard }` partition (§9.2) from the compiled
+ * token budget. PURE + deterministic + source-INDEPENDENT: it reads NO flags, NO config file,
+ * NO env — the partition must be stable across restarts (§9.4 #1/#7), so it is wiring-injected
+ * (launch.ts hands `R`/`E_hard` to the registry + Renderer), never a `block-agent.config.json`
+ * field. Exposed for the launcher + unit tests.
+ */
+export function computeContextBudget(): ContextBudget {
+  const B = RENDER_TOKEN_BUDGET * PESSIMISTIC_BYTES_PER_TOKEN;
+  const R = Math.floor(B * DASHBOARD_RESERVE_RATIO);
+  const E_hard = B - R;
+  return { B, R, E_hard };
+}
+
 /** The provider kinds we accept on flags / env / file. */
 const PROVIDER_KINDS: ReadonlySet<string> = new Set<ProviderKind>([
   'anthropic',

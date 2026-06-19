@@ -127,6 +127,33 @@ export class AppCapabilityCeilingError extends Error {
   }
 }
 
+/**
+ * Thrown by install() when admitting this App would push the sum of declared
+ * `render_ceiling_bytes` over the dashboard render reserve `R` (§9.2 ① / §9.4 #2).
+ * The check runs alongside the capability-ceiling check and throws BEFORE the App is
+ * recorded (`apps.set`), so a rejected install leaves ZERO registry/index residue —
+ * the budget can never be transiently overcommitted. Carries the offending App's own
+ * ceiling, the already-committed sum, and the reserve, for tests + operator telemetry.
+ */
+export class AppRenderReserveError extends Error {
+  constructor(
+    readonly app_id: string,
+    /** This App's declared render_ceiling_bytes. */
+    readonly app_ceiling: number,
+    /** Σ render_ceiling_bytes over the apps ALREADY installed (before this one). */
+    readonly committed: number,
+    /** The dashboard render reserve R (the injected ceiling on the sum). */
+    readonly reserve: number,
+  ) {
+    super(
+      `AppRenderReserveError[${app_id}]: render_ceiling_bytes ${app_ceiling} would push ` +
+        `the dashboard reserve to ${committed + app_ceiling} bytes, over the ${reserve}-byte ` +
+        `budget (R) — install rejected (fail-closed, §9.2)`,
+    );
+    this.name = 'AppRenderReserveError';
+  }
+}
+
 /** Thrown on a dependency cycle in `depends_on` at bootstrap (§7.3 #3). */
 export class AppDependencyCycleError extends Error {
   constructor(readonly cycle: string[]) {
@@ -394,6 +421,38 @@ export class AppRegistry
    */
   ceiling_resolver?: (trust: AppTrustLevel) => ReadonlySet<string>;
 
+  /**
+   * Dashboard render reserve `R` (bytes, §9.2 ①): the ceiling on the SUM of every
+   * installed App's `render_ceiling_bytes`. `install()` rejects (throws
+   * `AppRenderReserveError`) when admitting an App would push that sum over `R`, BEFORE
+   * the App is recorded (zero residue). Injected at boot (cli/config derives `R` from the
+   * global budget `B`, §9.4 #1) like the other registry seams; left `undefined` ⇒ NO
+   * reserve check at all (current behavior preserved → existing tests unaffected, the
+   * budget model is opt-in via wiring). The matching run-side clip is the Renderer's
+   * (§9.2 ②); this is the install-side declaration gate only.
+   */
+  render_reserve_bytes?: number;
+
+  /**
+   * Default `render_ceiling_bytes` charged to a dashboard App that DECLARES none
+   * (§9.4 #1, fail-closed: an undeclared App still counts toward Σ rather than escaping
+   * the budget). Only consulted when `render_reserve_bytes` is set (the budget model is
+   * on). The `base` ledger is exempt from this default — it is the elastic stream clipped
+   * to `E_hard` by the Renderer, not a fixed-ceiling dashboard — so the launcher passes
+   * its id via `elastic_app_ids` so install() never charges it a dashboard reservation.
+   * Injected at boot alongside `render_reserve_bytes`.
+   */
+  default_render_ceiling_bytes?: number;
+
+  /**
+   * App ids EXEMPT from the dashboard reserve Σ (§9.2 / §9.3): the elastic stream(s)
+   * (`base`) whose render budget is the leftover `E_hard = B − R`, enforced by the
+   * Renderer's per-block clip, not by a fixed install-time reservation. An exempt App
+   * neither contributes its `render_ceiling_bytes` to Σ nor is charged the default.
+   * Empty by default. Injected at boot.
+   */
+  elastic_app_ids?: ReadonlySet<string>;
+
   /** Optional config supplied at construction, keyed by manifest.id. */
   constructor(opts?: { configs?: Record<string, Record<string, string>> }) {
     if (opts?.configs) {
@@ -476,6 +535,27 @@ export class AppRegistry
       }
     }
 
+    // Dashboard render reserve Σ check (§9.2 ① / §9.4 #2). Only when a reserve `R` is
+    // injected (the budget model is on; undefined ⇒ skip, zero regression). The elastic
+    // stream(s) (`base`) are exempt (their budget is `E_hard`, Renderer-clipped).
+    //
+    // PER-BLOCK charge (架构师缺陷1修): the Renderer clips EACH of an App's blocks to its
+    // ceiling independently, so an App with N render blocks can occupy up to N×ceiling — the
+    // §9.3 bound holds ONLY if Σ counts that worst case. So an App charges
+    //   (its render-block count) × (declared render_ceiling_bytes, or the injected default),
+    // NOT one flat ceiling. The block count is known here (the builders are already
+    // instantiated; we count distinct output block names). An App with zero render blocks
+    // (e.g. a presence-only app) charges 0. Admitting this App must keep Σ ≤ R; else THROW
+    // BEFORE apps.set below (zero residue, mirrors the capability-ceiling throw).
+    if (this.render_reserve_bytes !== undefined && !this.elastic_app_ids?.has(installed_id)) {
+      const reserve = this.render_reserve_bytes;
+      const appCharge = this.renderReserveCharge(manifest, instance.builders);
+      const committed = this.committedRenderReserve();
+      if (committed + appCharge > reserve) {
+        throw new AppRenderReserveError(installed_id, appCharge, committed, reserve);
+      }
+    }
+
     // Contract PROVIDES checks (R-1 / R-3 / DR-F — all per-manifest, additive). An
     // App that declares no `provides` adds no warnings here, so contract-less
     // installs are byte-for-byte unchanged. We run this AFTER instance.commands is
@@ -493,6 +573,44 @@ export class AppRegistry
   /** An id is unavailable if an App holds it OR it is reserved for the core. */
   private isTaken(app_id: string): boolean {
     return this.apps.has(app_id) || RESERVED_APP_IDS.has(app_id);
+  }
+
+  /**
+   * The render-reserve charge for one App (架构师缺陷1修, §9.2 ①): the worst-case render
+   * footprint = (number of distinct render-output blocks) × (declared `render_ceiling_bytes`,
+   * or the injected default for an undeclared App). This MUST mirror the Renderer's per-block
+   * clip (each block independently capped at the same ceiling), or Σ undercounts an App that
+   * renders multiple blocks and the §9.3 bound breaks. An App with zero render blocks charges
+   * 0 (it contributes no prompt bytes). The block count comes from the instantiated builders'
+   * outputs (distinct, deduped — INV #3 means one owner per name anyway). Per-byte ceiling is
+   * the App's own declaration or the default; absent default ⇒ 0 (no budget model wired for it).
+   */
+  private renderReserveCharge(
+    manifest: AppManifest,
+    builders: readonly BuilderManifest[],
+  ): number {
+    const perBlock = manifest.render_ceiling_bytes ?? this.default_render_ceiling_bytes ?? 0;
+    if (perBlock === 0) return 0;
+    const blocks = new Set<string>();
+    for (const b of builders) for (const out of b.outputs) blocks.add(out);
+    return blocks.size * perBlock;
+  }
+
+  /**
+   * Σ render-reserve charge over the apps ALREADY installed (§9.2 ①), using the SAME
+   * per-block rule install() applies to the candidate (缺陷1): each dashboard App charges
+   * (its block count)×(ceiling or default); an elastic (`base`) App charges nothing (its
+   * budget is `E_hard`, Renderer-clipped). Recomputed per install (apps install once at boot,
+   * so the O(n) walk is negligible) — no running counter to drift out of sync on uninstall.
+   * Only meaningful when `render_reserve_bytes` is set.
+   */
+  private committedRenderReserve(): number {
+    let sum = 0;
+    for (const [id, instance] of this.apps) {
+      if (this.elastic_app_ids?.has(id)) continue;
+      sum += this.renderReserveCharge(instance.manifest, instance.builders);
+    }
+    return sum;
   }
 
   /**
@@ -625,7 +743,15 @@ export class AppRegistry
     if (!instance) return; // unknown / uninstalled — no-op (idempotent)
     assertJsonSerializable(next, app_id, '', new WeakSet());
     assertMatchesSchema(next, instance.manifest.state_schema, app_id);
-    assertStateWithinQuota(app_id, instance.manifest.trust, next);
+    // Metered iff sandboxed OR declares projection (P0.4 GUARD2): a declared-projection
+    // app's state reaches the prompt via the generic builder, so cap it even if trusted.
+    assertStateWithinQuota(
+      app_id,
+      instance.manifest.trust,
+      next,
+      undefined,
+      instance.manifest.projection != null,
+    );
     instance.cell.state = next; // authoritative live write (what get_app_context reads)
   }
 
@@ -1168,18 +1294,53 @@ export class AppRegistry
     for (const factory of manifest.builders) {
       const builder = factory(cell.state);
       this.assertLegalBuilder(installed_id, builder);
-      builders.push(builder);
+      // P0.4 ④ (clip-key integrity): the Renderer keys each block's render ceiling off
+      // `builder.app_id` (renderer.ts blockText), and the install Σ charges blocks per-app by
+      // iterating this.apps under `installed_id` — so the ledger (charge) and the enforcement
+      // (clip) only agree if a builder's app_id EQUALS its install id. We STAMP it to
+      // `installed_id` (the registry holds the truth) rather than throw, for two reasons:
+      //   1. auto-rename: a built-in builder declares its manifest id (e.g. 'messages'), but an
+      //      id collision renames the install to 'messages_2' (§5.3 #4). A throw would wrongly
+      //      REJECT that legal rename; stamping transparently re-homes the builder to the new id.
+      //   2. pure structural enforcement — the author CANNOT mis-declare app_id (honest
+      //      copy-paste OR malicious foreign id), because the registry overwrites it. No
+      //      gentleman's agreement, no "check-then-reject" variant that could be bypassed.
+      // PER-INSTANCE COPY (never mutate in place): built-in builders are module-level const
+      // SINGLETONS (the factory returns the SAME reference each install), so mutating
+      // `builder.app_id` would corrupt every other install sharing that reference. Stamp a
+      // SHALLOW COPY iff it differs; a builder already matching (the common case) is pushed
+      // unchanged (zero allocation, byte-identical behavior).
+      const stamped =
+        builder.app_id === installed_id ? builder : { ...builder, app_id: installed_id };
+      builders.push(stamped);
     }
 
-    // UH-2/SS4b (§3.4 方案 A): a SANDBOXED app ships NO builder code — it DECLARES
-    // `projection: [{block, from}]`, and the core side synthesizes one trusted,
-    // system-owned GenericProjectionBuilder per entry (owner=system, reads state[from],
-    // forces scan+fence+clip, pins the block volatile). This is the ONLY way an
-    // untrusted app's state reaches the render path (it never runs build() itself). A
-    // TRUSTED app declaring `projection` is ignored here (it renders via its own
-    // builders) — the auto-build is sandboxed-only, so the generic builder is never
-    // layered on top of a trusted app's hand-written builders.
-    if (manifest.projection && effectiveTrust(manifest.trust) === 'sandboxed') {
+    // §3.4 方案 A + P0.4 GUARD1: an App that DECLARES `projection: [{block, from}]` gets
+    // ONE trusted, system-owned GenericProjectionBuilder synthesized per entry (owner=system,
+    // reads state[from], forces scan+fence+clip, pins the block volatile). This is the
+    // declarative render path — the App never ships render code for a projected block, so the
+    // untrusted/peer-controlled state always passes the generic fence.
+    //
+    // GUARD1 (was: sandboxed-only; now opened to TRUSTED too so a trusted App can opt into the
+    // metered declarative render path — seat §10.2): synthesis fires for ANY trust. But a
+    // projected block MUST NOT also be claimed by a hand-written builder of the same App —
+    // that own-builder would bypass the generic scan+fence (the very fence the declaration
+    // buys). So if any installed builder's `outputs` already include a declared projection
+    // block, REJECT the install (throw) rather than silently ignoring the declaration or
+    // letting the own-builder win. Fail-closed: the App must pick ONE render path per block.
+    if (manifest.projection) {
+      const handWritten = new Set<BlockName>();
+      for (const b of builders) for (const out of b.outputs) handWritten.add(out);
+      for (const { block } of manifest.projection) {
+        if (handWritten.has(block)) {
+          throw new AppManifestError(
+            `app declares projection for block '${block}' but also ships a builder that owns ` +
+              `it — a projected block may not be rendered by an own builder (it would bypass the ` +
+              `generic scan+fence). Remove one (GUARD1, §3.4).`,
+            installed_id,
+          );
+        }
+      }
       for (const { block, from } of manifest.projection) {
         builders.push(
           makeGenericProjectionBuilder({ app_id: installed_id, block_name: block, from }),
@@ -1335,8 +1496,10 @@ export class AppRegistry
         // SS4a / 前置3: a SANDBOXED app's state is the projection source — gate its
         // BYTE size (the schema check is shape, not size). REJECT over-quota so the
         // cell stays at its previous value (a sandboxed app can't bloat the prompt /
-        // poison the cache prefix). No-op for a trusted app (unmetered, zero regression).
-        assertStateWithinQuota(app_id, manifest.trust, next);
+        // poison the cache prefix). P0.4 GUARD2: a TRUSTED app that DECLARES projection is
+        // also metered (its state reaches the prompt via the generic builder); a plain
+        // trusted app stays unmetered (zero regression).
+        assertStateWithinQuota(app_id, manifest.trust, next, undefined, manifest.projection != null);
         cell.state = next;
       },
 

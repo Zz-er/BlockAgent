@@ -98,6 +98,55 @@ describe('launch tool catalog', () => {
 });
 
 // ============================================================================
+// context-budget boot (skill-memory-wiki §9.3 缺陷1): the FULL default-on app set
+// — incl. base (elastic) + the always-on turn_log/focus — must install within the
+// dashboard reserve R under PER-BLOCK charging (the real default boot, the load-
+// bearing case the per-app charge silently passed but per-block could overflow).
+// ============================================================================
+
+describe('launch context budget', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'block-agent-budget-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The full default-on set (agent_identity/messages/memory/base/task) + mock provider. */
+  function fullDefaultConfig(d: string): LauncherConfig {
+    return {
+      provider: { kind: 'mock', model: 'mock' },
+      apps: {
+        agent_identity: { enabled: true },
+        messages: { enabled: true },
+        memory: { enabled: true },
+        base: { enabled: true }, // elastic stream — exempt from Σ, but installs at boot
+        memory_letta: { enabled: false },
+        task: { enabled: true },
+        stats: { enabled: false },
+        im_proxy: { enabled: false },
+        oa_proxy: { enabled: false },
+        task_proxy: { enabled: false },
+      },
+      storage_dir: d,
+    };
+  }
+
+  it('admits the FULL default boot under per-block Σ ≤ R (no AppRenderReserveError)', async () => {
+    // If the per-block charge of the default dashboards (agent_identity 1 + messages 2 +
+    // memory 4 + task 1 + focus 4 blocks, each ≤ 4 KiB ≈ 48 KiB) exceeded R, launch() would
+    // throw here. base + turn_log are exempt/zero-block. This is the regression guard for
+    // the budget constants (config.ts) staying in step with the default block count.
+    const agent = await launch(fullDefaultConfig(dir));
+    // The reserve IS wired (budget model on) and every default app installed.
+    for (const id of ['agent_identity', 'messages', 'memory', 'base', 'task', 'focus', 'turn_log']) {
+      expect(agent.registry.get(id)).not.toBeNull();
+    }
+  });
+});
+
+// ============================================================================
 // base ledger wiring smoke (base-app §2.2 / §9): the onInput + onCommand
 // subscriptions + inputHook turn one real turn into durable ledger records.
 // ============================================================================
