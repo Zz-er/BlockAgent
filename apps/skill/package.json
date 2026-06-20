@@ -1,0 +1,34 @@
+{
+  "name": "@block-agent/app-skill",
+  "version": "1.0.0",
+  "description": "skill BlockApp: progressive-disclosure skill mechanism (index stable, body metered on invoke).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "$exports_note": "exports point at .ts SOURCE (no build). Importers use '@block-agent/app-skill/manifest.js'.",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "blockAgent": {
+    "id": "skill",
+    "trust": "trusted",
+    "host": "in-process",
+    "default_enabled": true,
+    "summary": "渐进披露技能机制：索引常驻，正文按需载入（metered 8KB/N=3/LRU）。",
+    "provides": [],
+    "requires": null
+  },
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@block-agent/core": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

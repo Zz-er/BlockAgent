@@ -154,6 +154,21 @@ export interface MemoryLettaConfig {
 }
 
 /**
+ * `skill` app config knobs (§2). ENABLED by default (zero dependency, trusted in-process).
+ * `--no-skill` / file `apps.skill.enabled:false` disables it. active_byte_ceiling and
+ * active_count_cap are non-file overrides (flag > file) — the app's own config seed +
+ * compiled defaults remain the fallback. The agent can never retune these at runtime
+ * (`skill.set_config` is user-only), so the operator pins them here.
+ */
+export interface SkillConfig {
+  enabled: boolean;
+  /** Hard byte cap on the skill:active rendered block (default 8192). */
+  active_byte_ceiling?: number;
+  /** Max simultaneously open skills (default 3). */
+  active_count_cap?: number;
+}
+
+/**
  * Platform-service proxy app config — shared by `im_proxy` / `oa_proxy` / `task_proxy`
  * (Phase C). ALL DISABLED by default: each projects a BlockAI-team service (IM/OA/Task)
  * and must not try to connect on a default boot. This config carries ONLY the enable gate;
@@ -194,6 +209,8 @@ export interface LauncherConfig {
     im_proxy: ServiceProxyConfig;
     oa_proxy: ServiceProxyConfig;
     task_proxy: ServiceProxyConfig;
+    /** §2 skill progressive-disclosure mechanism; enabled by default (trusted in-process). */
+    skill: SkillConfig;
   };
   /**
    * OPTIONAL operator-supplied contract rebindings (C-API-7). The contract model

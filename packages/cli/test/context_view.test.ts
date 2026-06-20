@@ -31,6 +31,7 @@ function mockConfig(storage_dir: string): LauncherConfig {
       im_proxy: { enabled: false },
       oa_proxy: { enabled: false },
       task_proxy: { enabled: false },
+      skill: { enabled: false },
     },
     storage_dir,
   };

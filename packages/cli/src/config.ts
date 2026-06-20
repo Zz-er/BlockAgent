@@ -55,6 +55,9 @@ export const DEFAULTS: LauncherConfig = {
     im_proxy: { enabled: false },
     oa_proxy: { enabled: false },
     task_proxy: { enabled: false },
+    // skill: progressive-disclosure skill mechanism; trusted in-process, zero dependency →
+    // on by default like memory/task.
+    skill: { enabled: true },
   },
   welcome: { cube: true },
 };
@@ -470,6 +473,7 @@ export function loadConfig(
       im_proxy: resolveServiceProxy('im_proxy', flags, fileApps),
       oa_proxy: resolveServiceProxy('oa_proxy', flags, fileApps),
       task_proxy: resolveServiceProxy('task_proxy', flags, fileApps),
+      skill: resolveSkill(flags, fileApps),
     },
     // storage_dir is now ALWAYS set (= root at minimum), so this is unconditional —
     // launch.ts/commands.ts `?? cwd` fallbacks become dead code (kept, harmless).
@@ -784,4 +788,31 @@ function resolveServiceProxy(
   const flagOn = flags[flagId] === true || flags[flagId] === 'true';
   const flagOff = flags[`no-${flagId}`] === true || flags[`no-${flagId}`] === 'true';
   return { enabled: flagOff ? false : flagOn || fileEnabled };
+}
+
+/**
+ * resolveSkill — the `skill` app config (§2). ENABLED by default (zero dependency,
+ * trusted in-process). `--no-skill` / file `apps.skill.enabled:false` disables it.
+ * active_byte_ceiling / active_count_cap are non-file overrides (flag > file); the
+ * app's own config seed + compiled defaults remain the fallback. The agent can never
+ * retune these at runtime (`skill.set_config` is user-only), so the operator pins them.
+ */
+function resolveSkill(
+  flags: ParsedFlags,
+  fileApps: Record<string, unknown>,
+): LauncherConfig['apps']['skill'] {
+  const f = pickObject(fileApps['skill']);
+  const active_byte_ceiling = pick(
+    asNumber(flags['skill-active-byte-ceiling']),
+    asNumber(f['active_byte_ceiling']),
+  );
+  const active_count_cap = pick(
+    asNumber(flags['skill-active-count-cap']),
+    asNumber(f['active_count_cap']),
+  );
+  return {
+    enabled: appEnabled(flags, f, 'no-skill'),
+    ...(active_byte_ceiling !== undefined ? { active_byte_ceiling } : {}),
+    ...(active_count_cap !== undefined ? { active_count_cap } : {}),
+  };
 }

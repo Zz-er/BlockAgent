@@ -9,11 +9,12 @@
  * Authoritative design: ai_com/block-agent-memory-design.md §3.1 / §4 / §5.1 / §7.1
  * and the Implementer split in apps/memory_store.ts lines 285–376.
  *
- * Four projection blocks:
+ * Five projection blocks:
  *   - `memory:pinned`  — pinned notes,      cache_tier `stable`
  *   - `memory:notes`   — agent notes,        cache_tier `slow_changing`
  *   - `memory:user`    — user profile,       cache_tier `slow_changing`
  *   - `memory:recalled`— last recall hits,   cache_tier `volatile` (provenance-fenced)
+ *   - `memory:pressure`— context-pressure distillation nudge (P1#1), cache_tier `volatile`
  *
  * INVARIANTS held here:
  *   #1 / #16  build PURE + byte-identical; provenance no wall-clock; id content-addressed.
@@ -59,6 +60,7 @@ import {
   fenceRecalledContentBounded,
   scanMemoryContent,
 } from '@block-agent/core/apps/memory_store.js';
+import { MemdirStore } from './memdir_store.js';
 
 // ============================================================================
 // Identity & block names
@@ -73,16 +75,37 @@ export const PINNED_BLOCK: BlockName = 'memory:pinned';
 export const NOTES_BLOCK: BlockName = 'memory:notes';
 export const USER_BLOCK: BlockName = 'memory:user';
 export const RECALLED_BLOCK: BlockName = 'memory:recalled';
+/** The always-on MEMORY.md index (P1.2 Delta 2) — one line per memory, cache_tier stable. */
+export const INDEX_BLOCK: BlockName = 'memory:index';
+/** The context-pressure distillation nudge (P1#1) — renders only under pressure. */
+export const PRESSURE_BLOCK: BlockName = 'memory:pressure';
+
+/**
+ * The pressure ratio at/above which `PressureNudgeBuilder` renders the distillation nudge
+ * (P1#1, §E): 0.7 = `base`'s SOFT water, so the nudge is visible across the whole grace
+ * band [0.7·E, 0.95·E) — the ≥1-turn window the agent has to distil before the oldest
+ * action rows scroll out. Below it the block disappears (no pressure ⇒ no nudge).
+ */
+const PRESSURE_NUDGE_THRESHOLD = 0.7;
+
+/**
+ * Max rows the MEMORY.md index renders before a "还有 X 条" tail (P1.2 Delta 2). A display
+ * cap on top of the fence's byte self-bound: keeps the stable index block short so it does
+ * not churn the prompt-cache head. The byte ceiling (`renderFenced`) is the hard guarantee;
+ * this is the readable top-N cap.
+ */
+const INDEX_DISPLAY_COUNT = 30;
 
 /**
  * Per-block render ceiling (context-budget §9.2): the MAX UTF-8 bytes EACH of this App's
  * blocks may occupy in the prompt. Declared on the manifest (`render_ceiling_bytes`) so
  * install() counts it toward the dashboard reserve Σ ≤ R — PER BLOCK (缺陷1): memory renders
- * four blocks (pinned/notes/user/recalled), so its charge is 4 × this ceiling. The recalled
- * builder also SELF-BOUNDs its fenced output to ≤ this ceiling (§9.4 #3) so the Renderer's
- * uniform per-block clip fast-paths it and never severs the fence token. The notes/user
- * windows are already char-bounded (2200/1375 chars) well under this. 4 KiB per block:
- * comfortably fits each bounded window + the fenced recall hits.
+ * SIX blocks (pinned/notes/user/recalled/index + the P1#1 pressure nudge), so its charge is
+ * 6 × this ceiling. ALL FIVE content blocks (pinned/notes/user/recalled/index) SELF-BOUND
+ * their fenced output to ≤ this ceiling (§9.4 #3 / P1.2 Delta 3) so the Renderer's uniform
+ * per-block clip fast-paths them and never severs the fence token; only the platform-authored
+ * pressure nudge is unfenced. The notes/user windows are also char-bounded (2200/1375 chars)
+ * well under this. 4 KiB per block: comfortably fits each bounded window + the fenced hits.
  */
 export const MEMORY_RENDER_CEILING_BYTES = 4 * 1024;
 
@@ -133,15 +156,31 @@ function clampConfig(cfg: MemoryConfig): MemoryConfig {
 // State (bounded projection — INV #14)
 // ============================================================================
 
+/** The four memory types (skill-memory-wiki §3 frontmatter `type`). */
+export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
+
 /**
  * MemoryEntry — one entry in the bounded projection window.
- * provenance is deterministic content only (no wall-clock, INV #21).
+ * provenance is deterministic content only (no wall-clock, INV #21). P1.2 adds `type`
+ * (skill-memory-wiki §3 four-class) so the index/notes routing carries the class.
  */
 export interface MemoryEntry {
   id: string;
   target: 'notes' | 'user';
+  type: MemoryType;
   content: string;
   provenance: { origin: 'agent' | 'user' | 'imported'; verified: boolean };
+}
+
+/**
+ * IndexEntry — one row in the always-on MEMORY.md index (P1.2 Delta 2). Mirrors the
+ * skill-memory-wiki frontmatter index fields: a short name, its type, and a one-line
+ * description. Bounded (top-N) and rendered by IndexBlockBuilder in the STABLE segment.
+ */
+export interface IndexEntry {
+  name: string;
+  type: MemoryType;
+  description: string;
 }
 
 /**
@@ -153,18 +192,35 @@ export interface MemoryState {
   user: MemoryEntry[];
   pinned: MemoryEntry[];
   recalled: MemoryEntry[];
+  /**
+   * The always-on MEMORY.md index (P1.2 Delta 2): one bounded row per live memory.
+   * Maintained in sync with notes/user on remember (push) and forget (filter); NEVER
+   * read from disk on the render path (pure builder, INV #16). Bounded top-N.
+   */
+  index: IndexEntry[];
   config: MemoryConfig;
+  /**
+   * The elastic working-window pressure ratio (P1#1), folded in each render by §3.5
+   * consume-refresh from the `context_pressure` contract (`base` provides it). Seeded 0 so
+   * a provider-less boot renders no nudge. Drives `PressureNudgeBuilder`: as it approaches 1
+   * the agent is nudged to distil durable facts via `memory.remember` before the oldest
+   * action rows scroll out of `base`'s byte-bounded window. NATIVE derived state — never
+   * written by a memory command (only consume-refresh sets it).
+   */
+  context_pressure: number;
 }
 
 /** INV #14: declare every state key so set_state is schema-checked. */
 const STATE_SCHEMA: JsonSchema = {
   type: 'object',
-  required: ['notes', 'user', 'pinned', 'recalled', 'config'],
+  required: ['notes', 'user', 'pinned', 'recalled', 'index', 'config', 'context_pressure'],
   properties: {
     notes: { type: 'array' },
     user: { type: 'array' },
     pinned: { type: 'array' },
     recalled: { type: 'array' },
+    index: { type: 'array' },
+    context_pressure: { type: 'number' },
     config: {
       type: 'object',
       required: ['notes_char_limit', 'user_char_limit', 'recall_limit', 'archivist_enabled'],
@@ -439,6 +495,7 @@ function memoryStateOf(app_ctx: AppContext | undefined): MemoryState | null {
     !Array.isArray(cand.user) ||
     !Array.isArray(cand.pinned) ||
     !Array.isArray(cand.recalled) ||
+    !Array.isArray(cand.index) ||
     cand.config == null
   ) {
     return null;
@@ -446,15 +503,50 @@ function memoryStateOf(app_ctx: AppContext | undefined): MemoryState | null {
   return s as MemoryState;
 }
 
-/** Render a list of MemoryEntry values as a bullet list. */
+/**
+ * Render a list of MemoryEntry values as a bullet list. P1.2 (skill-memory-wiki §5.1
+ * addendum): the per-entry `[unverified]` / origin text marker is GONE — the trust bit
+ * no longer reaches the render path. Every block is wrapped UNCONDITIONALLY in the
+ * provenance fence (`renderFenced`), so a poisoned memory is isolated as data regardless
+ * of any self-claimed origin. Renders content only; pure + deterministic (INV #1 / #16).
+ */
 function renderEntries(entries: MemoryEntry[]): string {
   if (entries.length === 0) return '(none)';
-  return entries
-    .map((e) => {
-      const tag = e.provenance.verified ? '' : ' [unverified]';
-      return `- (${e.provenance.origin}${tag}) ${e.content}`;
-    })
-    .join('\n');
+  return entries.map((e) => `- ${e.content}`).join('\n');
+}
+
+/**
+ * renderFenced — wrap a heading + rendered body in the shared provenance isolation fence,
+ * SELF-BOUND to the App's render ceiling (skill-memory-wiki §9.4 #3 / P1.2 Delta 3). All
+ * FIVE memory blocks (pinned/notes/user/recalled/index) go through this so the whole block
+ * is ≤ ceiling BY CONSTRUCTION — the Renderer's uniform per-block clip then fast-paths
+ * (no-op) and can NEVER sever the structured fence token (which would pierce INV #21). The
+ * `memory:pressure` block is the ONLY render block that does NOT fence (platform-authored
+ * nudge, no agent text). Returns '' when the fenced body is empty so the builder renders
+ * nothing.
+ */
+function renderFenced(heading: string, body: string): string {
+  return fenceRecalledContentBounded(`${heading}\n${body}`, MEMORY_RENDER_CEILING_BYTES);
+}
+
+/**
+ * Render the bounded MEMORY.md index (P1.2 Delta 2): top-N `- [name] (type): description`
+ * rows + a "还有 X 条" tail when more exist. Each name/description is passed through
+ * `scanMemoryContent` (INV #21) and dropped (rendered as a neutral placeholder) if it
+ * carries an injection/exfil payload — the index fields are agent-authored and reach the
+ * prompt. Pure + deterministic (INV #1 / #16).
+ */
+function renderIndex(index: IndexEntry[]): string {
+  if (index.length === 0) return '(none)';
+  const shown = index.slice(0, INDEX_DISPLAY_COUNT);
+  const lines = shown.map((e) => {
+    const name = scanMemoryContent(e.name).ok ? e.name : '[blocked]';
+    const desc = scanMemoryContent(e.description).ok ? e.description : '[blocked]';
+    return `- [${name}] (${e.type}): ${desc}`;
+  });
+  const remaining = index.length - shown.length;
+  if (remaining > 0) lines.push(`还有 ${remaining} 条`);
+  return lines.join('\n');
 }
 
 /**
@@ -473,11 +565,13 @@ const PinnedBlockBuilder: BuilderManifest = {
   async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
     const state = memoryStateOf(app_ctx);
     if (state === null || state.pinned.length === 0) return null;
+    const fenced = renderFenced('# Pinned memory', renderEntries(state.pinned));
+    if (fenced.length === 0) return null;
     return {
       id: PINNED_BLOCK,
       name: PINNED_BLOCK,
       children: [],
-      content_text: `# Pinned memory\n${renderEntries(state.pinned)}`,
+      content_text: fenced,
       content_blob: null,
     };
   },
@@ -499,11 +593,13 @@ const NotesBlockBuilder: BuilderManifest = {
   async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
     const state = memoryStateOf(app_ctx);
     if (state === null) return null;
+    const fenced = renderFenced('# Agent notes', renderEntries(state.notes));
+    if (fenced.length === 0) return null;
     return {
       id: NOTES_BLOCK,
       name: NOTES_BLOCK,
       children: [],
-      content_text: `# Agent notes\n${renderEntries(state.notes)}`,
+      content_text: fenced,
       content_blob: null,
     };
   },
@@ -524,11 +620,13 @@ const UserBlockBuilder: BuilderManifest = {
   async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
     const state = memoryStateOf(app_ctx);
     if (state === null) return null;
+    const fenced = renderFenced('# User profile', renderEntries(state.user));
+    if (fenced.length === 0) return null;
     return {
       id: USER_BLOCK,
       name: USER_BLOCK,
       children: [],
-      content_text: `# User profile\n${renderEntries(state.user)}`,
+      content_text: fenced,
       content_blob: null,
     };
   },
@@ -551,19 +649,84 @@ const RecalledBlockBuilder: BuilderManifest = {
   async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
     const state = memoryStateOf(app_ctx);
     if (state === null || state.recalled.length === 0) return null;
-    const body = renderEntries(state.recalled);
-    // §9.4 #3: fence-aware SELF-BOUND to the App's render ceiling, so the whole fenced
-    // block is ≤ ceiling by construction. The Renderer's uniform per-block clip then
-    // fast-paths this block (no-op) and can never cut the structured fence token (which
-    // would pierce the INV #21 isolation). Renderer adds no fence semantics — the bound
-    // lives here, in the trusted builder, where the fence structure is known.
-    const fenced = fenceRecalledContentBounded(body, MEMORY_RENDER_CEILING_BYTES);
+    // §9.4 #3 / P1.2 Delta 3: fence-aware SELF-BOUND to the App's render ceiling, so the
+    // whole fenced block is ≤ ceiling by construction. The Renderer's uniform per-block
+    // clip then fast-paths this block (no-op) and can never cut the structured fence token
+    // (which would pierce the INV #21 isolation). Renderer adds no fence semantics — the
+    // bound lives here, in the trusted builder, where the fence structure is known.
+    const fenced = renderFenced('# Recalled memory', renderEntries(state.recalled));
     if (fenced.length === 0) return null;
     return {
       id: RECALLED_BLOCK,
       name: RECALLED_BLOCK,
       children: [],
       content_text: fenced,
+      content_blob: null,
+    };
+  },
+};
+
+/**
+ * IndexBlockBuilder — owner of `memory:index` (P1.2 Delta 2). Renders the always-on
+ * MEMORY.md index: a `# Memory index` heading + one `- [name] (type): description` row per
+ * live memory, capped at INDEX_DISPLAY_COUNT with a "还有 X 条" tail. cache_tier `stable`
+ * (the index changes only on remember/forget). PURE: reads state.index only (INV #16) —
+ * NEVER reads disk. SELF-BOUND in the fence to the App render ceiling so the stable block is
+ * ≤ ceiling by construction (no prompt-cache-head blow-out). Returns null when empty.
+ */
+const IndexBlockBuilder: BuilderManifest = {
+  name: 'IndexBlockBuilder',
+  version: '1.0.0',
+  owner: 'system', // INV #4: 'agent' illegal.
+  app_id: APP_ID,
+  inputs: [],
+  outputs: [INDEX_BLOCK],
+  cache_tier: 'stable',
+  async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
+    const state = memoryStateOf(app_ctx);
+    if (state === null || state.index.length === 0) return null;
+    const fenced = renderFenced('# Memory index', renderIndex(state.index));
+    if (fenced.length === 0) return null;
+    return {
+      id: INDEX_BLOCK,
+      name: INDEX_BLOCK,
+      children: [],
+      content_text: fenced,
+      content_blob: null,
+    };
+  },
+};
+
+/**
+ * PressureNudgeBuilder — owner of `memory:pressure` (P1#1). Renders a distillation nudge
+ * when the consumed `context_pressure` ratio crosses `base`'s soft water (≥ 0.7): it tells
+ * the agent the elastic action window is filling and to distil durable facts via
+ * `memory.remember` before the oldest rows scroll out. cache_tier `volatile` (the ratio
+ * changes most turns). PURE: reads `state.context_pressure` only (INV #16) — `Math.round`
+ * over a stored ratio is deterministic (no clock/random). Returns null below the threshold
+ * (the block disappears) so it costs nothing when there is no pressure.
+ */
+const PressureNudgeBuilder: BuilderManifest = {
+  name: 'PressureNudgeBuilder',
+  version: '1.0.0',
+  owner: 'system', // INV #4: 'agent' illegal.
+  app_id: APP_ID,
+  inputs: [],
+  outputs: [PRESSURE_BLOCK],
+  cache_tier: 'volatile',
+  async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
+    const state = memoryStateOf(app_ctx);
+    if (state === null) return null;
+    const pressure = typeof state.context_pressure === 'number' ? state.context_pressure : 0;
+    if (pressure < PRESSURE_NUDGE_THRESHOLD) return null;
+    const pct = Math.round(pressure * 100);
+    return {
+      id: PRESSURE_BLOCK,
+      name: PRESSURE_BLOCK,
+      children: [],
+      content_text:
+        `# 上下文压力\n上下文压力 ${pct}%，动作窗口接近预算上限。请用 \`memory.remember\` ` +
+        `把需要长期保留的耐久事实蒸馏进记忆，避免随窗口滚动丢失。`,
       content_blob: null,
     };
   },
@@ -637,7 +800,8 @@ function rememberCommand(app: MemoryApp): CommandManifest<MemoryState> {
       };
       await app.store.store(rec);
 
-      const entry: MemoryEntry = { id, target, content, provenance: { origin, verified } };
+      const type: MemoryType = target === 'user' ? 'user' : 'feedback';
+      const entry: MemoryEntry = { id, target, type, content, provenance: { origin, verified } };
       const cfg = (ctx.state as MemoryState).config;
       const charLimit = target === 'user' ? cfg.user_char_limit : cfg.notes_char_limit;
 
@@ -686,12 +850,17 @@ function recallCommand(app: MemoryApp): CommandManifest<MemoryState> {
       const queryArgs: MemoryQuery = { query: a.query, limit };
       if (tags !== undefined) queryArgs.tags = tags;
       const hits = await app.store.query(queryArgs);
-      const entries: MemoryEntry[] = hits.map((r) => ({
-        id: r.id,
-        target: r.tags.includes('user') ? 'user' : 'notes',
-        content: r.content,
-        provenance: { origin: r.provenance.origin, verified: r.provenance.verified },
-      }));
+      const entries: MemoryEntry[] = hits.map((r) => {
+        const target: 'notes' | 'user' = r.tags.includes('user') ? 'user' : 'notes';
+        const type: MemoryType = target === 'user' ? 'user' : 'feedback';
+        return {
+          id: r.id,
+          target,
+          type,
+          content: r.content,
+          provenance: { origin: r.provenance.origin, verified: r.provenance.verified },
+        };
+      });
 
       ctx.set_state((s) => ({ ...(s as MemoryState), recalled: entries }));
       return { ok: true, data: { count: entries.length } };
@@ -721,9 +890,12 @@ function pinCommand(app: MemoryApp): CommandManifest<MemoryState> {
       if (rec === null) {
         return { ok: false, error: `memory id '${id}' not found` };
       }
+      const target: 'notes' | 'user' = rec.tags.includes('user') ? 'user' : 'notes';
+      const type: MemoryType = target === 'user' ? 'user' : 'feedback';
       const entry: MemoryEntry = {
         id: rec.id,
-        target: rec.tags.includes('user') ? 'user' : 'notes',
+        target,
+        type,
         content: rec.content,
         provenance: { ...rec.provenance },
       };
@@ -939,9 +1111,11 @@ function pushBoundedChars(arr: MemoryEntry[], charLimit: number): MemoryEntry[] 
 /** Project a durable MemoryRecord into the bounded-projection MemoryEntry shape. */
 function entryFromRecord(rec: MemoryRecord): MemoryEntry {
   const target: 'notes' | 'user' = rec.tags.includes('user') ? 'user' : 'notes';
+  const type: MemoryType = target === 'user' ? 'user' : 'feedback';
   return {
     id: rec.id,
     target,
+    type,
     content: rec.content,
     provenance: { origin: rec.provenance.origin, verified: rec.provenance.verified },
   };
@@ -963,7 +1137,7 @@ function restoreMemory(
   store: MemoryStore,
   config: MemoryConfig,
 ): { notes: MemoryEntry[]; user: MemoryEntry[] } {
-  if (!(store instanceof JsonlMemoryStore)) return { notes: [], user: [] };
+  if (!(store instanceof MemdirStore)) return { notes: [], user: [] };
   let live: { notes: MemoryRecord[]; user: MemoryRecord[] };
   try {
     live = store.readAllByTarget();
@@ -1031,7 +1205,7 @@ export class MemoryApp {
       const userCharLimit = typeof seeded['user_char_limit'] === 'number'
         ? Math.max(1, Math.floor(seeded['user_char_limit'] as number))
         : DEFAULT_CONFIG.user_char_limit;
-      this.store = new JsonlMemoryStore(dir, { notesCharLimit, userCharLimit });
+      this.store = new MemdirStore(dir, { notesCharLimit, userCharLimit });
     }
     this.seedConfig = clampConfig(seeded as unknown as MemoryConfig);
     // Restart restore (D1 §5.2): re-hydrate the bounded notes/user projection from the
@@ -1050,6 +1224,12 @@ export class MemoryApp {
       id: APP_ID,
       version: '1.0.0',
       depends_on: [],
+      // P1#1: memory CONSUMES the `context_pressure` contract (base provides it) into
+      // `state.context_pressure`; consume-refresh folds the scalar each render, and
+      // PressureNudgeBuilder renders the distillation nudge as it approaches 1. Identity-
+      // free (§3.2): memory never names base. cardinality:'one'/combine:'first' → the one
+      // provider's ratio is taken verbatim; a provider-less boot keeps the seed (0).
+      consumes: [{ contract: 'context_pressure', as: 'context_pressure' }],
       // Context-budget reservation (§9.2 ①): install() counts this toward the dashboard
       // reserve Σ ≤ R, and the Renderer clips each memory block to it (§9.2 ②). The
       // recalled builder self-bounds its fenced output to the SAME value (§9.4 #3).
@@ -1064,7 +1244,10 @@ export class MemoryApp {
         user: this.seedProjection.user,
         pinned: [],
         recalled: [],
+        index: [],
         config: this.seedConfig,
+        // P1#1 consumed pressure: seed 0 so a provider-less boot renders no nudge.
+        context_pressure: 0,
       },
       state_schema: STATE_SCHEMA,
       builders: [
@@ -1072,6 +1255,10 @@ export class MemoryApp {
         () => NotesBlockBuilder,
         () => UserBlockBuilder,
         () => RecalledBlockBuilder,
+        // P1.2 Delta 2: always-on MEMORY.md index, stable segment.
+        () => IndexBlockBuilder,
+        // P1#1 distillation nudge — renders only when context_pressure ≥ the soft water.
+        () => PressureNudgeBuilder,
       ],
       commands: [
         () => rememberCommand(app),

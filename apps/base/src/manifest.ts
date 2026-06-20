@@ -127,6 +127,18 @@ const LOG_FILE = 'log.jsonl' as const;
 /** §3.1 / §12.2: each jsonl line MUST be ≤ 64KB (a longer record is rejected, not torn). */
 const MAX_LINE_BYTES = 64 * 1024;
 
+/**
+ * Standalone default for the elastic byte budget `E` (P1#1) — the logical budget the
+ * byte-bounded window + `context_pressure` ratio are measured against. The production
+ * wiring (launch.ts) OVERRIDES this with `budget.E_hard` (config.ts §9.2), so the budget
+ * is byte-identical to the Renderer's elastic-stream clip; this default only applies to a
+ * standalone / test construction that injects nothing. Soft water = 0.7·E, hard cap =
+ * 0.95·E — both < E, so in steady state the Renderer's physical clip never fires (only a
+ * single pathological row > E ever reaches it). Roughly tracks computeContextBudget()'s
+ * E_hard so standalone behavior is sane.
+ */
+const DEFAULT_ELASTIC_BUDGET_BYTES = 108 * 1024;
+
 // ============================================================================
 // The two telemetry payloads `base.record` consumes (§2.1 / §3.3)
 // ============================================================================
@@ -168,6 +180,16 @@ export type ActionRow =
       args_text?: string;
       /** Result body, after the `→` (filled at command_detail=3, success only). */
       result_text?: string;
+      /**
+       * BYTE weight of this row (P1#1): the UTF-8 byte length of the row's rendered text +
+       * 1 (the `\n` join separator), the SAME unit the Renderer clips on (`clipBytes`/
+       * `E_hard`). The field is named `tok` for symmetry with token budgets, but its
+       * semantics are RENDERED UTF-8 BYTES, not provider tokens. STAMPED at record time
+       * (the effectful sink path), never re-derived in `build` (INV #16) and never via a
+       * per-provider `estimateTokens` (§9.4 red line). Drives the byte-bounded window +
+       * fold-grace in `pushBounded`; it is bookkeeping only and is NEVER rendered.
+       */
+      tok: number;
     }
   | {
       seq: number;
@@ -177,6 +199,8 @@ export type ActionRow =
       sender?: string;
       preview: string;
       content?: string; // filled at input_detail=3
+      /** BYTE weight of this row (rendered UTF-8 bytes + 1). See the command variant. */
+      tok: number;
     };
 
 /**
@@ -188,6 +212,16 @@ export interface BaseState {
   recent: ActionRow[];
   config: BaseConfig;
   compacted_seq: number;
+  /**
+   * Fold-grace latch (P1#1, §E): when the byte-bounded window crosses the SOFT water
+   * (Σtok ≥ 0.7·E) but not the HARD cap (< 0.95·E), `record` raises this instead of
+   * evicting — giving the agent ≥1 turn to distil durable facts before the oldest rows
+   * scroll out. Crossing the hard cap forces eviction and clears it. It is a BASE-internal
+   * defer signal only — the distillation nudge is rendered by `memory` (which reads the
+   * `context_pressure` contract), NOT here: `base` stays purely mechanical and never names
+   * `memory.remember`. Seeded false; bounded boolean (INV #14).
+   */
+  grace_pending: boolean;
   /**
    * The set of enabled tool names (the `enabled` subset gate, merged from the former
    * `tools` app). A string ARRAY not a Set — a Set is a class instance, rejected by INV
@@ -286,10 +320,11 @@ function clampConfig(cfg: BaseConfig): BaseConfig {
  */
 const STATE_SCHEMA: JsonSchema = {
   type: 'object',
-  required: ['recent', 'config', 'compacted_seq', 'enabled'],
+  required: ['recent', 'config', 'compacted_seq', 'enabled', 'grace_pending'],
   properties: {
     recent: { type: 'array' },
     compacted_seq: { type: 'number' },
+    grace_pending: { type: 'boolean' },
     enabled: { type: 'array', items: { type: 'string' } },
     config: {
       type: 'object',
@@ -700,12 +735,13 @@ function fnv1a(s: string): string {
  * levels (the failure signal is never lost — only successful result bodies drop below 3).
  */
 function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: BaseConfig): ActionRow {
-  const row: ActionRow = {
+  const row: Extract<ActionRow, { kind: 'command' }> = {
     seq,
     kind: 'command',
     ts,
     verb: e.name,
     ok: e.ok,
+    tok: 0, // filled below from the rendered byte length (record-path stamp, never build)
   };
   if (!e.ok && e.error !== undefined) row.error = e.error;
   if (e.ref !== undefined) row.ref = e.ref;
@@ -718,6 +754,11 @@ function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: B
   if (config.command_detail >= 3 && e.ok && e.result !== undefined) {
     row.result_text = canonicalJson(e.result);
   }
+  // BYTE weight (P1#1): the row's rendered UTF-8 byte length + 1 (the `\n` join used by
+  // renderRecent). Measured HERE on the record path (effectful, deterministic — no clock/
+  // random), in the SAME unit the Renderer clips on. `renderCommandRow` ignores `tok`, so
+  // computing it against the placeholder-0 row is exact. NOT a per-provider estimate.
+  row.tok = Buffer.byteLength(renderCommandRow(row), 'utf8') + 1;
   return row;
 }
 
@@ -727,41 +768,78 @@ function buildCommandRow(seq: number, ts: string, e: CommandEventLike, config: B
  * full body stays in `messages:recent` — no dup at the default); L3 = + full content.
  */
 function buildInputRow(seq: number, ts: string, d: InputDescriptorLike, config: BaseConfig): ActionRow {
-  const row: ActionRow = {
+  const row: Extract<ActionRow, { kind: 'input' }> = {
     seq,
     kind: 'input',
     ts,
     source: d.source,
     preview: config.input_detail >= 2 ? truncate(d.preview, config.input_char_limit) : '',
+    tok: 0, // filled below from the rendered byte length (record-path stamp, never build)
   };
   if (d.sender !== undefined) row.sender = d.sender;
   if (config.input_detail >= 3 && d.content !== undefined) row.content = d.content;
+  // BYTE weight (P1#1): rendered UTF-8 bytes + 1, stamped on the record path. See
+  // buildCommandRow — same unit as the Renderer's clip; renderInputRow ignores `tok`.
+  row.tok = Buffer.byteLength(renderInputRow(row), 'utf8') + 1;
   return row;
 }
 
 /**
- * Append `row` to the window and keep only the most-recent `window_size` (drop oldest).
- * Returns the bounded next window plus the highest seq that scrolled OUT (or null if
- * none did) so the caller can advance `compacted_seq` (§7 scroll-out + INV #5: the
- * scrolled-out rows are retained in the jsonl, never deleted).
+ * Append `row` to the window and bound it by BYTES (Σtok) with fold-grace (P1#1, §E),
+ * with `window_size` retained as a COUNT hard upper bound (set_config兜底). The byte
+ * budget `E` is the primary eviction driver; soft water = 0.7·E, hard cap = 0.95·E:
+ *   - Σtok ≥ 0.95·E (hard) → evict the OLDEST rows until Σtok ≤ 0.7·E; `grace_pending`
+ *     cleared. A single pathological row > E is KEPT (we never evict the just-pushed
+ *     newest row) — the Renderer's physical clip caps it to E_hard.
+ *   - 0.7·E ≤ Σtok < 0.95·E (soft) → DEFER eviction and raise `grace_pending` (the
+ *     distillation window: the oldest rows stay visible ≥1 turn).
+ *   - Σtok < 0.7·E → no pressure; `grace_pending` false.
+ * The count cap (`window_size`) is applied FIRST and always (the stricter-of-two兜底); its
+ * drops, plus any byte-cap drops, are folded into `scrolledOutMaxSeq` so the caller advances
+ * `compacted_seq` (§7 scroll-out + INV #5: scrolled-out rows are retained in the jsonl,
+ * never deleted). Returns the bounded next window, the highest seq that scrolled out (null
+ * if none), and the `grace_pending` latch.
  */
 function pushBounded(
   recent: readonly ActionRow[],
   row: ActionRow,
+  E: number,
   window_size: number,
-): { next: ActionRow[]; scrolledOutMaxSeq: number | null } {
+): { next: ActionRow[]; scrolledOutMaxSeq: number | null; grace_pending: boolean } {
   if (window_size <= 0) {
     // Nothing renders, but the row still scrolled out of a zero-size window.
-    return { next: [], scrolledOutMaxSeq: row.seq };
+    return { next: [], scrolledOutMaxSeq: row.seq, grace_pending: false };
   }
-  const grown = [...recent, row];
-  if (grown.length <= window_size) return { next: grown, scrolledOutMaxSeq: null };
-  const dropCount = grown.length - window_size;
-  const dropped = grown.slice(0, dropCount);
-  const kept = grown.slice(dropCount);
-  // Rows are pushed in seq order, so the last dropped row carries the max scrolled-out seq.
-  const last = dropped[dropped.length - 1];
-  return { next: kept, scrolledOutMaxSeq: last ? last.seq : null };
+
+  const soft = 0.7 * E;
+  const hard = 0.95 * E;
+  const grown: ActionRow[] = [...recent, row];
+  let droppedMaxSeq: number | null = null;
+
+  // Drop the oldest row, folding its seq into the running scrolled-out high-water. Rows are
+  // pushed in seq order, so successive drops only ever raise the max.
+  const dropOldest = (): void => {
+    const d = grown.shift();
+    if (d !== undefined)
+      droppedMaxSeq = droppedMaxSeq === null ? d.seq : Math.max(droppedMaxSeq, d.seq);
+  };
+
+  // (1) COUNT hard cap (window_size) — applied first and always (the count兜底).
+  while (grown.length > window_size) dropOldest();
+
+  // (2) BYTE budget with fold-grace (§E).
+  const sumTok = (): number => grown.reduce((acc, r) => acc + r.tok, 0);
+  let grace_pending = false;
+  const total = sumTok();
+  if (total >= hard) {
+    // Evict to the soft water, but never drop the just-pushed newest row (keep ≥1) — a
+    // single row > E remains in the window and is physically clipped by the Renderer.
+    while (grown.length > 1 && sumTok() > soft) dropOldest();
+  } else if (total >= soft) {
+    grace_pending = true;
+  }
+
+  return { next: grown, scrolledOutMaxSeq: droppedMaxSeq, grace_pending };
 }
 
 // ============================================================================
@@ -788,7 +866,11 @@ function asRecord(args: unknown): Record<string, unknown> | null {
  * `ctx.config` is NOT used for the window/detail — those live in `state.config` (so
  * they are schema-validated and user-retunable at runtime, the tools precedent).
  */
-function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): CommandManifest<BaseState> {
+function recordCommand(
+  store: ActionLogStore,
+  nextSeqRef: { value: number },
+  elasticBudgetBytes: number,
+): CommandManifest<BaseState> {
   return {
     name: 'record',
     description: 'Append one action/input to the ledger (app/runtime only).',
@@ -851,13 +933,20 @@ function recordCommand(store: ActionLogStore, nextSeqRef: { value: number }): Co
 
       // (1) durable append FIRST (the full audit log lives in the store).
       store.append(logRecord);
-      // (2) update the bounded projection window + advance compacted_seq on scroll-out.
+      // (2) update the byte-bounded projection window (fold-grace + count兜底), advance
+      //     compacted_seq on scroll-out, and latch grace_pending (P1#1, §E).
       ctx.set_state((s) => {
-        const { next, scrolledOutMaxSeq } = pushBounded(s.recent, row, s.config.window_size);
+        const { next, scrolledOutMaxSeq, grace_pending } = pushBounded(
+          s.recent,
+          row,
+          elasticBudgetBytes,
+          s.config.window_size,
+        );
         return {
           ...s,
           recent: next,
           compacted_seq: scrolledOutMaxSeq === null ? s.compacted_seq : scrolledOutMaxSeq,
+          grace_pending,
         };
       });
 
@@ -944,6 +1033,38 @@ function endTurnCommand(): CommandManifest<BaseState> {
       // tells the runtime this is a SILENT end (report as ended_by:'yield' + record in
       // base:recent), not a reply (which would surface as a chat bubble instead).
       return { ok: true, end_turn: true, end_turn_kind: 'yield' };
+    },
+  };
+}
+
+/**
+ * base.pressure() — the `context_pressure` contract's `via` (P1#1). `readonly:true` +
+ * `result_schema:{type:'number'}` (matches the contract output_schema, R-1).
+ * `allowed_invokers:['app','user']` so it never enters the agent tool catalog (DR-F) —
+ * the agent reads the distillation nudge that `memory` renders from this ratio, not the
+ * scalar itself. Returns the SCALAR `ratio = Σtok(state.recent) / E` (the rendered-byte
+ * pressure of the elastic window against its budget), in `[0,∞)`. `E` is the construct-time
+ * injected elastic byte budget (a closure constant, not state). Produces no ops (pure read).
+ */
+function pressureCommand(elasticBudgetBytes: number): CommandManifest<BaseState> {
+  return {
+    name: 'pressure',
+    description:
+      'Return the context-pressure ratio Σ(rendered bytes)/E (a scalar number). Contract via; app/user only.',
+    readonly: true,
+    allowed_invokers: ['app', 'user'],
+    result_schema: { type: 'number' },
+    capabilities: [],
+    args_schema: { type: 'object', properties: {} },
+    async invoke(
+      _args: unknown,
+      ctx: AppContext<BaseState>,
+      _invoker: InvokerContext,
+    ): Promise<CommandResult> {
+      const recent = ctx.state.recent;
+      const total = recent.reduce((acc, r) => acc + (typeof r.tok === 'number' ? r.tok : 0), 0);
+      const ratio = elasticBudgetBytes > 0 ? total / elasticBudgetBytes : 0;
+      return { ok: true, data: ratio };
     },
   };
 }
@@ -1127,6 +1248,16 @@ export interface BaseAppOptions {
    * storage_dir explicitly so the fence is independent of the process cwd.
    */
   allowedRoots?: string[];
+  /**
+   * The elastic byte budget `E` (P1#1): the logical budget the byte-bounded window +
+   * `context_pressure` ratio are measured against. WIRING-INJECTED (launch.ts passes
+   * `budget.E_hard` so the window's budget is byte-identical to the Renderer's elastic-
+   * stream clip); NOT user-tunable (no set_config knob — a runtime-movable E would let a
+   * restart silently shift the partition, §9.4 #7, and bypass the install-time Σ). Omitted
+   * → DEFAULT_ELASTIC_BUDGET_BYTES (standalone / test default). Tests inject a small E to
+   * exercise byte eviction without pathologically large rows.
+   */
+  elasticBudgetBytes?: number;
 }
 
 export class BaseApp {
@@ -1138,6 +1269,8 @@ export class BaseApp {
   private readonly nextSeqRef: { value: number };
   /** The root_dir realpath fence guarding every file tool (P0.3). */
   private readonly fence: RootFence;
+  /** The elastic byte budget `E` (P1#1): byte-window eviction + pressure ratio denominator. */
+  private readonly elasticBudgetBytes: number;
 
   constructor(baseDir: string, opts?: BaseAppOptions) {
     // Data must always have an explicit home — no silent cwd-relative fallback (B-plan
@@ -1153,6 +1286,15 @@ export class BaseApp {
         ? opts.allowedRoots
         : [process.cwd()];
     this.fence = new RootFence(allowedRoots);
+    // Elastic byte budget E (P1#1): wiring-injected (launch passes budget.E_hard); the
+    // standalone default applies only when nothing is injected. A non-finite / non-positive
+    // injection falls back to the default (the byte window must have a real denominator).
+    this.elasticBudgetBytes =
+      opts?.elasticBudgetBytes !== undefined &&
+      Number.isFinite(opts.elasticBudgetBytes) &&
+      opts.elasticBudgetBytes > 0
+        ? opts.elasticBudgetBytes
+        : DEFAULT_ELASTIC_BUDGET_BYTES;
     const dir = join(baseDir, BASE_APP_ID);
     mkdirSync(dir, { recursive: true });
     this.store = new ActionLogStore(join(dir, LOG_FILE));
@@ -1186,24 +1328,32 @@ export class BaseApp {
     const store = this.store;
     const nextSeqRef = this.nextSeqRef;
     const fence = this.fence;
+    const elasticBudgetBytes = this.elasticBudgetBytes;
     const initial_state: BaseState = {
       recent: [],
       config: this.config,
       compacted_seq: -1,
+      grace_pending: false,
       enabled: [...this.enabled],
     };
     const manifest: AppManifest<BaseState> = {
       id: BASE_APP_ID,
       version: '1.0.0',
       depends_on: [],
+      // P1#1: base PROVIDES the `context_pressure` contract via the readonly `pressure`
+      // command (scalar ratio Σ rendered bytes / E). `memory` consumes it to render the
+      // distillation nudge — identity-free (§3.2): base never names memory.
+      provides: [{ contract: 'context_pressure', via: 'pressure' }],
       tree_namespace: TREE_NAMESPACE,
       initial_state,
       state_schema: STATE_SCHEMA,
       builders: [() => recentActionsBuilder()],
       commands: [
-        () => recordCommand(store, nextSeqRef),
+        () => recordCommand(store, nextSeqRef, elasticBudgetBytes),
         () => showCommand(store),
         () => setConfigCommand(),
+        // The context_pressure contract `via` (P1#1): scalar ratio, app/user only.
+        () => pressureCommand(elasticBudgetBytes),
         // The bare YIELD: end the turn without replying (group silence / scheduled-wake
         // housekeeping). Hybrid — messages.reply stays sugar for "reply + end_turn".
         () => endTurnCommand(),

@@ -30,6 +30,7 @@ import {
   NOTES_BLOCK,
   USER_BLOCK,
   RECALLED_BLOCK,
+  INDEX_BLOCK,
   MEMORY_RENDER_CEILING_BYTES,
   type MemoryEntry,
   type MemoryState,
@@ -103,6 +104,7 @@ function wireApp(dir: string) {
       placeholder(NOTES_BLOCK),
       placeholder(USER_BLOCK),
       placeholder(RECALLED_BLOCK),
+      placeholder(INDEX_BLOCK),
     ],
   });
   const ops = Operations.with_default_policy({ tree, registry: reg });
@@ -281,11 +283,13 @@ describe('JsonlMemoryStore — char limit enforcement', () => {
 
 describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
   const baseState: MemoryState = {
-    notes: [{ id: 'm1', target: 'notes', content: 'test note', provenance: { origin: 'agent', verified: false } }],
-    user: [{ id: 'm2', target: 'user', content: 'user prefers dark', provenance: { origin: 'user', verified: true } }],
-    pinned: [{ id: 'm3', target: 'notes', content: 'pinned item', provenance: { origin: 'user', verified: true } }],
-    recalled: [{ id: 'm4', target: 'notes', content: 'recall hit', provenance: { origin: 'agent', verified: false } }],
+    notes: [{ id: 'm1', target: 'notes', type: 'feedback', content: 'test note', provenance: { origin: 'agent', verified: false } }],
+    user: [{ id: 'm2', target: 'user', type: 'user', content: 'user prefers dark', provenance: { origin: 'user', verified: true } }],
+    pinned: [{ id: 'm3', target: 'notes', type: 'feedback', content: 'pinned item', provenance: { origin: 'user', verified: true } }],
+    recalled: [{ id: 'm4', target: 'notes', type: 'feedback', content: 'recall hit', provenance: { origin: 'agent', verified: false } }],
+    index: [{ name: 'test note', type: 'feedback' as const, description: 'a test memory entry' }],
     config: { notes_char_limit: 2200, user_char_limit: 1375, recall_limit: 8, archivist_enabled: false },
+    context_pressure: 0,
   };
 
   it('NotesBlockBuilder renders same state byte-identically twice', async () => {
@@ -386,7 +390,7 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
       const hugeState: MemoryState = {
         ...baseState,
         recalled: [
-          { id: 'big', target: 'notes', content: flood, provenance: { origin: 'agent', verified: false } },
+          { id: 'big', target: 'notes', type: 'feedback', content: flood, provenance: { origin: 'agent', verified: false } },
         ],
       };
       const block = await builder!.build(stubBuildContext(), stubAppContext(hugeState));
@@ -414,17 +418,17 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
       const app = new MemoryApp({ dir });
       reg.install(app.manifest());
       const flood = 'x'.repeat(60_000);
-      const hugeState: MemoryState = {
+      const hugeState2: MemoryState = {
         ...baseState,
         recalled: [
-          { id: 'big', target: 'notes', content: flood, provenance: { origin: 'agent', verified: false } },
+          { id: 'big', target: 'notes', type: 'feedback', content: flood, provenance: { origin: 'agent', verified: false } },
         ],
       };
-      const recalledBuilder = reg.resolve_builder(RECALLED_BLOCK)!;
-      const block = (await recalledBuilder.build(stubBuildContext(), stubAppContext(hugeState)))!;
 
       // A throwaway registry whose memory:recalled owner just re-emits the snapshot block,
       // so the Renderer's clip is the only transform under test.
+      const recalledBuilder = reg.resolve_builder(RECALLED_BLOCK)!;
+      const block = (await recalledBuilder.build(stubBuildContext(), stubAppContext(hugeState2)))!;
       const reg2 = new AppRegistry();
       reg2.install({
         id: 'memory',
@@ -487,24 +491,24 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
     }
   });
 
-  it('缺陷1: the real memory app charges the reserve PER-BLOCK (4 blocks × ceiling), not 1×', () => {
+  it('缺陷1: the real memory app charges the reserve PER-BLOCK (6 blocks × ceiling), not 1×', () => {
     // Concrete coverage of the per-block charge against the REAL memory manifest (not a
-    // synthetic N-block stub): memory renders 4 blocks (pinned/notes/user/recalled), so its
-    // reserve charge is 4 × MEMORY_RENDER_CEILING_BYTES. A reserve sized for only 1× rejects
-    // it; a reserve sized for 4× admits it. (If a future `memory:index` block is added, the
-    // charge tracks the real builder count automatically — no constant to bump.)
+    // synthetic N-block stub): memory renders 6 blocks (pinned/notes/user/recalled/index + the
+    // P1#1 pressure nudge), so its reserve charge is 6 × MEMORY_RENDER_CEILING_BYTES. A
+    // reserve sized for only 1× rejects it; a reserve sized for 6× admits it. (The charge
+    // tracks the real builder count automatically — no constant to bump per new block.)
     const dir = tempDir();
     try {
-      const fourBlockCharge = 4 * MEMORY_RENDER_CEILING_BYTES;
+      const sixBlockCharge = 6 * MEMORY_RENDER_CEILING_BYTES;
 
-      // R one byte short of the 4-block charge → install REJECTED (proves it charges 4×, not 1×).
+      // R one byte short of the 6-block charge → install REJECTED (proves it charges 6×, not 1×).
       const tight = new AppRegistry();
-      tight.render_reserve_bytes = fourBlockCharge - 1;
+      tight.render_reserve_bytes = sixBlockCharge - 1;
       expect(() => tight.install(new MemoryApp({ dir }).manifest())).toThrow(AppRenderReserveError);
 
-      // R exactly the 4-block charge → admitted.
+      // R exactly the 6-block charge → admitted.
       const ok = new AppRegistry();
-      ok.render_reserve_bytes = fourBlockCharge;
+      ok.render_reserve_bytes = sixBlockCharge;
       expect(() => ok.install(new MemoryApp({ dir }).manifest())).not.toThrow();
       expect(ok.get('memory')).not.toBeNull();
 
@@ -541,7 +545,7 @@ describe('memory builders — byte-identical rendering (INV #1 / #16)', () => {
     try {
       const app = new MemoryApp({ dir });
       reg.install(app.manifest());
-      for (const name of [PINNED_BLOCK, NOTES_BLOCK, USER_BLOCK, RECALLED_BLOCK]) {
+      for (const name of [PINNED_BLOCK, NOTES_BLOCK, USER_BLOCK, RECALLED_BLOCK, INDEX_BLOCK]) {
         const b = reg.resolve_builder(name);
         expect(b?.owner).toBe('system');
       }
@@ -624,7 +628,7 @@ describe('memory e2e — recall → memory:recalled with provenance fence', () =
     expect((res.data as { count: number }).count).toBe(0);
 
     const text = await renderText(renderer, tree);
-    expect(text).not.toContain(MEMORY_CONTEXT_OPEN);
+    expect(text.match(/<memory-context>/g)?.length).toBe(2);
   });
 });
 
@@ -825,9 +829,11 @@ describe('memory restart restore (D1 §5.2)', () => {
     const state = reloaded.manifest().initial_state as MemoryState;
     expect(state.notes.map((e) => e.content)).toEqual(['a durable note']);
     expect(state.user.map((e) => e.content)).toEqual(['prefers dark mode']);
-    // Provenance survives the round-trip (agent note unverified, user entry verified).
+    // Provenance survives the round-trip (agent note unverified, user entry also unverified
+    // because MemdirStore reads back fail-closed-untrusted — everything from disk is
+    // {origin:'agent', verified:false} regardless of what was written, per P1.2 addendum).
     expect(state.notes[0]!.provenance).toEqual({ origin: 'agent', verified: false });
-    expect(state.user[0]!.provenance).toEqual({ origin: 'user', verified: true });
+    expect(state.user[0]!.provenance).toEqual({ origin: 'agent', verified: false });
     // pinned/recalled have no durable backing → boot empty (unchanged).
     expect(state.pinned).toEqual([]);
     expect(state.recalled).toEqual([]);
@@ -881,21 +887,20 @@ describe('memory restart restore (D1 §5.2)', () => {
     expect(state.user).toEqual([]);
   });
 
-  it('a crash-torn store degrades gracefully (drops the torn tail, never throws)', () => {
+  it('a crash-torn MemdirStore dir degrades gracefully (unreadable .md file skipped, never throws)', () => {
     mkdirSync(dir, { recursive: true });
-    // Two clean note records + a torn trailing line (no newline). The store's startup
-    // tail-truncate drops the torn line; restore reads the two clean notes, never throws.
+    // Write one valid .md file + one truncated garbage file. The store's parseFile skips
+    // unreadable files; restore reads the valid one, never throws.
     writeFileSync(
-      join(dir, 'notes.jsonl'),
-      '{"op":"memory","id":"mem.1","content":"kept","tags":["notes"],"provenance":{"origin":"agent","verified":false}}\n' +
-        '{"op":"memory","id":"mem.2","content":"also","tags":["notes"],"provenance":{"origin":"agent","verified":false}}\n' +
-        '{"op":"memory","id":"mem.3","content":"to',
+      join(dir, 'feedback-kept.md'),
+      '---\nid: mem.kept\ntype: feedback\nname: kept\ndescription: kept entry\nscope: private\n---\n\nkept',
     );
+    writeFileSync(join(dir, 'feedback-torn.md'), '---\nid: mem.torn\ntype: bad'); // truncated frontmatter
     let app: MemoryApp | undefined;
     expect(() => {
       app = new MemoryApp({ dir });
     }).not.toThrow();
     const state = app!.manifest().initial_state as MemoryState;
-    expect(state.notes.map((e) => e.content)).toEqual(['kept', 'also']);
+    expect(state.notes.map((e) => e.content)).toEqual(['kept']);
   });
 });

@@ -286,3 +286,22 @@ export const TASK_COUNT: ContractDef = {
   cardinality: 'many',
   combine: 'sum',
 };
+
+/**
+ * CONTEXT_PRESSURE — the elastic working-window pressure ratio (P1#1). A SINGLE provider
+ * (`base`, the action/observation ledger) reports the scalar `ratio = Σ rendered bytes / E`
+ * of its byte-bounded window against the elastic budget `E`; `cardinality:'one'` +
+ * `combine:'first'` takes that one value verbatim (NOT summed — pressure is an intensive
+ * ratio, not an additive count). A consumer (`memory`) folds it into `state.context_pressure`
+ * and renders a distillation nudge as the ratio approaches 1, with zero coupling to base's
+ * identity (§3.2). Output is `{type:'number'}` in `[0,∞)` (it can exceed 1 — a single
+ * pathological row > E — which the Renderer's physical clip, not this ratio, bounds).
+ */
+export const CONTEXT_PRESSURE: ContractDef = {
+  name: 'context_pressure',
+  version: '1',
+  input_schema: {},
+  output_schema: { type: 'number' },
+  cardinality: 'one',
+  combine: 'first',
+};

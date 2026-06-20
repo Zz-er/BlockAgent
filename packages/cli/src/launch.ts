@@ -28,7 +28,7 @@ import { AppRegistry, type AppTrustLevel } from '@block-agent/core/app/registry.
 import { ChildProcessHost, type HostDeps } from '@block-agent/core/app/child_process_host.js';
 import { forkChildApp } from '@block-agent/core/app/child/fork.js';
 import { run_in_chain } from '@block-agent/core/core/taint.js';
-import { MESSAGE_COUNT, TASK_COUNT } from '@block-agent/core/app/contracts.js';
+import { MESSAGE_COUNT, TASK_COUNT, CONTEXT_PRESSURE } from '@block-agent/core/app/contracts.js';
 import { AgentRuntime, type ToolCatalog } from '@block-agent/core/runtime/agent_runtime.js';
 import { AnthropicProvider } from '@block-agent/core/provider/anthropic.js';
 import { OpenAiCompatibleProvider } from '@block-agent/core/provider/openai_compat.js';
@@ -52,6 +52,8 @@ import { FocusApp } from '@block-agent/app-focus/manifest.js';
 import { ImProxyApp } from '@block-agent/app-im_proxy/manifest.js';
 import { OaProxyApp, ORG_DIRECTORY } from '@block-agent/app-oa_proxy/manifest.js';
 import { TaskProxyApp } from '@block-agent/app-task_proxy/manifest.js';
+
+import { SkillApp } from '@block-agent/app-skill/manifest.js';
 
 import type { BlockName } from '@block-agent/core/core/types.js';
 import type { ModelProvider } from '@block-agent/core/provider/types.js';
@@ -186,6 +188,11 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   //     dropped. App-defined contracts (none built-in beyond these two) would register here too.
   registry.registerContract(MESSAGE_COUNT);
   registry.registerContract(TASK_COUNT);
+  // context_pressure (P1#1): provided by `base` (the elastic action ledger), consumed by
+  // `memory` (the distillation nudge). Registered here (before install) like the two counts
+  // so the consumer's bind resolves; with no provider the consume-refresh keeps memory's
+  // seed (0) and the nudge stays hidden (graceful, never throws).
+  registry.registerContract(CONTEXT_PRESSURE);
   // org_directory (Phase C): provided by oa_proxy, consumed by im_proxy + task_proxy. Registered
   // UNCONDITIONALLY (like the two above) so a consumer resolves the name even if oa_proxy is off
   // — with no provider the consume-refresh yields an empty directory and each proxy falls back to
@@ -193,7 +200,10 @@ export async function launch(config: LauncherConfig): Promise<LaunchedAgent> {
   registry.registerContract(ORG_DIRECTORY);
 
   const base = appsBaseDir(config);
-  const { messages } = installEnabledApps(config, registry, base);
+  // P1#1: hand the elastic byte budget `E` (= budget.E_hard, the same value the Renderer
+  // clips the `base` stream to) into installEnabledApps so the BaseApp's byte-bounded
+  // window + context_pressure ratio share the Renderer's denominator (one source of truth).
+  const { messages } = installEnabledApps(config, registry, base, budget.E_hard);
 
   // 2b) turn_log — the persistent per-turn telemetry ledger (D1 §4). A presence-only app
   //     (no agent commands, no render builders — two-cadence rule §2.5): it exists so the
@@ -536,6 +546,7 @@ function installEnabledApps(
   config: LauncherConfig,
   registry: AppRegistry,
   base: string,
+  elasticBudgetBytes: number,
 ): { messages: MessagesApp | null } {
   let messages: MessagesApp | null = null;
 
@@ -549,12 +560,6 @@ function installEnabledApps(
   // The former `tools` app was merged into `base` (display AND execution): its 4 tool
   // commands now install as `base.read_file` / `base.grep` / `base.bash` /
   // `base.http_request`. No separate tools install — the base app (below) provides them.
-  // Built-in memory (core; zero dependency). State-driven projection, so
-  // seedProjectionBlocks covers its `memory:*` blocks. Char limits / recall limit are
-  // seeded into the app's config (file seed + launcher overrides).
-  if (config.apps.memory.enabled) {
-    registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
-  }
   // base (built-in; core, zero dependency; formerly `actions`). The unified action/
   // observation ledger (§3): a bounded `base:recent` projection + a full off-tree jsonl
   // audit under `<appsBase>/base/`, PLUS the agent's built-in tool commands (read_file /
@@ -571,9 +576,26 @@ function installEnabledApps(
   // pass the resolved root here, or the fence would wrongly admit cwd files and wrongly
   // refuse files inside root_dir. storage_dir is always set post-loadConfig (= root at
   // minimum); the `?? cwd` is dead-fallback (kept for the legacy no-root path).
+  //
+  // P1#1: base PROVIDES the `context_pressure` contract (via its readonly `pressure`
+  // command) and is the elastic byte-bounded ledger. It installs BEFORE memory (below) so
+  // the provider is present when memory (the consumer) installs — avoiding a spurious
+  // "no provider yet" install warning (consume-refresh derives the table fresh each turn,
+  // so the binding works regardless, but the order keeps install clean, §D). The elastic
+  // byte budget `E` (= budget.E_hard) is injected so the window's eviction + pressure
+  // ratio use the Renderer's own clip denominator.
   if (config.apps.base.enabled) {
     const fenceRoot = config.storage_dir ?? process.cwd();
-    registry.install(new BaseApp(base, { allowedRoots: [fenceRoot] }).manifest());
+    registry.install(
+      new BaseApp(base, { allowedRoots: [fenceRoot], elasticBudgetBytes }).manifest(),
+    );
+  }
+  // Built-in memory (core; zero dependency). State-driven projection, so
+  // seedProjectionBlocks covers its `memory:*` blocks. Char limits / recall limit are
+  // seeded into the app's config (file seed + launcher overrides). Installed AFTER base
+  // (above) so its `context_pressure` consume binds to base, the provider (P1#1, §D).
+  if (config.apps.memory.enabled) {
+    registry.install(new MemoryApp({ dir: join(base, 'memory'), configBase: base }).manifest());
   }
   // memory_letta (external Letta backend; default-disabled). Its SDK lives ONLY in
   // @block-agent/app-memory_letta — core never imports it (DR-M4). base_url comes from
@@ -592,6 +614,17 @@ function installEnabledApps(
   // contract (manifest `provides`, via `count`) — registered above so the bind resolves.
   if (config.apps.task.enabled) {
     registry.install(new TaskApp({ dir: join(base, 'task'), configBase: base }).manifest());
+  }
+  // skill (§2): progressive-disclosure skill mechanism. Trusted in-process, zero-dependency.
+  // Index + active blocks are bounded per §9.2; skillsDir is constructor-injected (mirrors
+  // the MemoryApp / TaskApp pattern). Default-ON like memory/task.
+  // Installed AFTER base (so base.read_file is available for v2 file-fenced skill reads)
+  // and BEFORE stats (which consumes no skill contract, so order is stylistic).
+  if (config.apps.skill.enabled) {
+    const skillCfg = config.apps.skill;
+    registry.install(
+      new SkillApp({ skillsDir: join(base, 'skills') }).manifest(),
+    );
   }
   // stats (built-in; core, default-disabled). A pure CONSUMER (no store): its manifest
   // `consumes` message_count + task_count; the runtime's consume-refresh pass folds the
