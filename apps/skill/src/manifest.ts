@@ -115,8 +115,12 @@ export interface SkillIndexEntry {
   name: string;
   /** One-line summary (from frontmatter `description`). */
   description: string;
-  /** When the agent should invoke this skill (from frontmatter `whenToUse`, optional). */
-  whenToUse: string | undefined;
+  /**
+   * When the agent should invoke this skill (from frontmatter `whenToUse`). OPTIONAL key:
+   * absent (not `undefined`-valued) when the frontmatter omits it — App state forbids
+   * `undefined` values (assertJsonSerializable), so the key must be omitted, not set to undefined.
+   */
+  whenToUse?: string;
   /** Physical file path relative to skillsDir — source stamp (trusted code assigns). */
   file_path: string;
 }
@@ -295,6 +299,8 @@ function buildSkillIndex(skillsDir: string): SkillIndexEntry[] {
     entries.push({
       name: parsed.name,
       description: parsed.description,
+      // OMIT `whenToUse` when absent — App state forbids `undefined` values
+      // (assertJsonSerializable), and `whenToUse?` is an optional key.
       ...(parsed.whenToUse !== undefined ? { whenToUse: parsed.whenToUse } : {}),
       file_path: relPath,
     });
@@ -423,14 +429,26 @@ const SkillIndexBuilder: BuilderManifest = {
 
 /**
  * SkillActiveBuilder — owner of `skill:active`. Renders the bodies of currently-open
- * skills in the VOLATILE segment. Metered: total rendered bytes ≤ config.active_byte_ceiling
- * (each body is clipped proportionally when the sum exceeds the cap), and entries ≤
- * config.active_count_cap (LRU eviction happens at invoke time, not here).
+ * skills in the VOLATILE segment. Entries ≤ config.active_count_cap (LRU eviction happens
+ * at invoke time, not here).
  *
  * Pure: reads state.open only (INV #16). Returns null when no skills are open.
  *
- * Fenced: skill body text comes from SKILL.md files — agent-readable, potentially
- * agent-authored (v2) — so we wrap each skill body in the shared provenance fence.
+ * Fenced + SELF-BOUND (skill-memory-wiki §9.4 #3): skill body text comes from SKILL.md
+ * files — agent-readable, potentially agent-authored (v2). All open skills are concatenated
+ * into ONE body and wrapped in a SINGLE provenance fence bounded to
+ * `min(config.active_byte_ceiling, SKILL_RENDER_CEILING_BYTES)`, so the WHOLE block is
+ * ≤ the manifest render ceiling BY CONSTRUCTION. This matters: the Renderer applies a
+ * uniform per-block `clipBytes(text, SKILL_RENDER_CEILING_BYTES)`; were the block over the
+ * ceiling (e.g. N fenced sub-blocks joined, the old shape), that blind clip would sever a
+ * `</memory-context>` close token mid-content and pierce INV #21. A single self-bounded fence
+ * makes the Renderer clip a no-op fast-path that can NEVER cut the fence (mirrors memory's
+ * `renderFenced`). When the concatenation exceeds the budget the tail (by sorted name) is
+ * clipped inside the fence — bounded + deterministic.
+ *
+ * Per-skill injection scan stays: a body flagged by `scanMemoryContent` is replaced with a
+ * neutral `[blocked]` placeholder BEFORE concatenation (the outer fence also neutralizes any
+ * embedded fence tokens, but the scan keeps known injection/exfil bodies out entirely).
  * The $ARGUMENTS substitution happens at invoke time (in the command handler), not here.
  */
 const SkillActiveBuilder: BuilderManifest = {
@@ -448,34 +466,29 @@ const SkillActiveBuilder: BuilderManifest = {
     const entries = Object.entries(state.open);
     if (entries.length === 0) return null;
 
-    const ceilling = state.config.active_byte_ceiling;
-
     // Sort by name for deterministic rendering (INV #16).
     entries.sort((a, b) => a[0].localeCompare(b[0]));
 
-    // Build per-skill blocks, each fenced individually.
-    const blocks: string[] = [];
+    // Concatenate every open skill into ONE body (per-skill injection scan → [blocked]).
+    const sections: string[] = [];
     for (const [name, entry] of entries) {
-      const scanned = scanMemoryContent(entry.body);
-      if (!scanned.ok) {
-        // Body carries injection/exfil payload → render a blocked placeholder.
-        blocks.push(`## Skill: ${name}\n[blocked: ${scanned.reason}]`);
-        continue;
-      }
       const heading = `## Skill: ${name}`;
-      const fullBody = `${heading}\n${entry.body}`;
-      const fenced = fenceRecalledContentBounded(fullBody, ceilling);
-      if (fenced.length > 0) blocks.push(fenced);
+      const scanned = scanMemoryContent(entry.body);
+      sections.push(scanned.ok ? `${heading}\n${entry.body}` : `${heading}\n[blocked: ${scanned.reason}]`);
     }
 
-    if (blocks.length === 0) return null;
+    // Single fence, self-bounded to the manifest render ceiling (never above it, so the
+    // Renderer's uniform per-block clip fast-paths and can't sever the fence). The user-tunable
+    // config may LOWER the budget but never RAISE it past the static SKILL_RENDER_CEILING_BYTES.
+    const ceiling = Math.min(state.config.active_byte_ceiling, SKILL_RENDER_CEILING_BYTES);
+    const fenced = fenceRecalledContentBounded(sections.join('\n\n'), ceiling);
+    if (fenced.length === 0) return null;
 
-    const content = blocks.join('\n\n');
     return {
       id: ACTIVE_BLOCK,
       name: ACTIVE_BLOCK,
       children: [],
-      content_text: content,
+      content_text: fenced,
       content_blob: null,
     };
   },

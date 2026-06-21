@@ -56,28 +56,19 @@ function writeSkillFile(baseDir: string, filename: string, content: string): voi
 
 /** A deterministic throwaway BuildContext (builders read app_ctx only). */
 function stubBuildContext(): BuildContext {
-  const snapshot: BlockSnapshot = {
+  const snapshot = {
     root: { id: 'r', name: 'root:root' as BlockName, children: [], content_text: null, content_blob: null },
     hash: 'stub',
-    segments: [],
-  };
+    get: () => null,
+  } as unknown as BlockSnapshot;
   return {
     snapshot,
-    tree_namespace: '/skill',
-    app_ctx: undefined,
-    read_block: async () => null,
-    read_blocks: async () => [],
+    read: () => null,
+    deterministic_clock: () => 0,
+    deterministic_random: () => 0,
+    content_addressed_id: (c: string) => `id:${c}`,
+    config: {},
   };
-}
-
-/** Inject the AppContext into a stub BuildContext. */
-function withAppCtx(bc: BuildContext, app_ctx: AppContext | undefined): BuildContext {
-  return { ...bc, app_ctx };
-}
-
-/** Build a minimal tree with a single app installed. */
-function setupTree(): BlockTree {
-  return new BlockTree();
 }
 
 /** Install registry + tree + ops + renderer with the skill app. */
@@ -111,7 +102,7 @@ describe('SkillIndexBuilder', () => {
     try {
       const app = new SkillApp({ skillsDir: join(dir, 'skills') });
       const manifest = app.manifest();
-      const builder = manifest.builders[0]!();
+      const builder = manifest.builders[0]!(manifest.initial_state);
       // Build with no app_ctx — but the seed state should have empty index.
       const block = await builder.build(stubBuildContext(), {
         state: manifest.initial_state,
@@ -141,7 +132,7 @@ describe('SkillIndexBuilder', () => {
 
       const app = new SkillApp({ skillsDir: join(dir, 'skills') });
       const manifest = app.manifest();
-      const builder = manifest.builders[0]!();
+      const builder = manifest.builders[0]!(manifest.initial_state);
       const block = await builder.build(stubBuildContext(), {
         state: manifest.initial_state,
         invoke_command: async () => ({ ok: true }),
@@ -221,9 +212,9 @@ describe('SkillActiveBuilder', () => {
     try {
       const app = new SkillApp({ skillsDir: join(dir, 'skills') });
       const manifest = app.manifest();
-      const builder = manifest.builders[1]!(); // active builder
+      const builder = manifest.builders[1]!(manifest.initial_state); // active builder
       const block = await builder.build(stubBuildContext(), {
-        state: { ...manifest.initial_state, open: {} },
+        state: { ...(manifest.initial_state as SkillState), open: {} },
         invoke_command: async () => ({ ok: true }),
         read_block: async () => null,
         read_blocks: async () => [],
@@ -252,7 +243,7 @@ describe('SkillActiveBuilder', () => {
 
     const app = new SkillApp({ skillsDir: join(tempSkillDir(), 'skills') });
     const manifest = app.manifest();
-    const builder = manifest.builders[1]!();
+    const builder = manifest.builders[1]!(manifest.initial_state);
     const block = await builder.build(stubBuildContext(), {
       state,
       invoke_command: async () => ({ ok: true }),
@@ -285,7 +276,7 @@ describe('SkillActiveBuilder', () => {
 
     const app = new SkillApp({ skillsDir: join(tempSkillDir(), 'skills') });
     const manifest = app.manifest();
-    const builder = manifest.builders[1]!();
+    const builder = manifest.builders[1]!(manifest.initial_state);
     const block = await builder.build(stubBuildContext(), {
       state,
       invoke_command: async () => ({ ok: true }),
@@ -298,6 +289,43 @@ describe('SkillActiveBuilder', () => {
     expect(block).not.toBeNull();
     // Should render a blocked placeholder, not the injected content.
     expect(block!.content_text).toContain('[blocked');
+  });
+
+  it('self-bounds skill:active ≤ render ceiling with a balanced fence (multiple large skills)', async () => {
+    // Two large bodies: the OLD shape (per-skill fence + join) would exceed
+    // SKILL_RENDER_CEILING_BYTES, and the Renderer's blind per-block clip would then sever
+    // a `</memory-context>` close token mid-content (INV #21 escape, §9.4 #3). The single
+    // self-bounded fence keeps the WHOLE block ≤ ceiling with exactly one OPEN/CLOSE pair.
+    const big = 'x'.repeat(6000);
+    const state: SkillState = {
+      index: [],
+      open: {
+        'skill-a': { name: 'skill-a', body: `# A\n${big}`, loaded_at: 1 },
+        'skill-b': { name: 'skill-b', body: `# B\n${big}`, loaded_at: 2 },
+      },
+      config: { active_byte_ceiling: 8192, active_count_cap: 3 },
+      load_counter: 2,
+    };
+
+    const app = new SkillApp({ skillsDir: join(tempSkillDir(), 'skills') });
+    const manifest = app.manifest();
+    const builder = manifest.builders[1]!(manifest.initial_state);
+    const block = await builder.build(stubBuildContext(), {
+      state,
+      invoke_command: async () => ({ ok: true }),
+      read_block: async () => null,
+      read_blocks: async () => [],
+      write_cell: async () => {},
+      app_id: 'skill',
+    } as unknown as AppContext);
+
+    expect(block).not.toBeNull();
+    const text = block!.content_text!;
+    // Whole block ≤ the static manifest render ceiling → the Renderer's uniform clip is a no-op.
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(SKILL_RENDER_CEILING_BYTES);
+    // Balanced fence: opens with OPEN and ends with CLOSE — never a truncated/severed token.
+    expect(text.startsWith(MEMORY_CONTEXT_OPEN)).toBe(true);
+    expect(text.endsWith(MEMORY_CONTEXT_CLOSE)).toBe(true);
   });
 });
 

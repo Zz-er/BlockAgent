@@ -27,6 +27,7 @@ export function mockConfig(overrides: Partial<LauncherConfig> = {}): LauncherCon
       memory_letta: { enabled: false },
       task: { enabled: true },
       stats: { enabled: false },
+      skill: { enabled: false },
       im_proxy: { enabled: false },
       oa_proxy: { enabled: false },
       task_proxy: { enabled: false },
