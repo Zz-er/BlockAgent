@@ -29,6 +29,7 @@ import {
   MessagesApp,
   RECENT_BLOCK,
   SUMMARY_BLOCK,
+  SUMMARY_MAX_BYTES,
   type HistoryMessage,
   type MessagesAppOptions,
   type MessagesState,
@@ -339,6 +340,27 @@ describe('automatic incremental compaction', () => {
     expect(block!.name).toBe(SUMMARY_BLOCK);
     expect(block!.content_text).toContain('Conversation summary');
     expect(block!.content_text).toContain('folded');
+  });
+
+  it('caps the rolling summary to SUMMARY_MAX_BYTES, keeping the newest folds (§9.4 #4)', async () => {
+    // display_count 1 + tiny budget → every ingest folds the prior message into the summary,
+    // so the rolling summary would grow well past SUMMARY_MAX_BYTES without the second-layer cap.
+    writeConfig(dir, { max_history_tokens: 10, compression_threshold: 0.1, display_count: 1 });
+    const { app, registry } = installApp({ estimate_tokens: charTokens });
+
+    const N = 80;
+    for (let i = 1; i <= N; i += 1) {
+      app.ingest({ id: `u${i}`, content: `MARK${i}-${'x'.repeat(200)}` });
+    }
+
+    const peek = await registry.route('messages.peek', { count: 1 }, { invoker: 'agent' });
+    const summary = (peek.data as { summary: string }).summary;
+
+    // Bounded by the byte cap (would be ~8 KB+ without it → INV #14 breach).
+    expect(Buffer.byteLength(summary, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES);
+    // Rolled: the most recent fold survives at the tail; the oldest rolled off the front.
+    expect(summary).toContain(`MARK${N - 1}-`); // a recent fold is retained
+    expect(summary).not.toContain('MARK1-'); // the oldest fold dropped (front trimmed)
   });
 });
 

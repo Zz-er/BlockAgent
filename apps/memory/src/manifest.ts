@@ -109,6 +109,16 @@ const INDEX_DISPLAY_COUNT = 30;
  */
 export const MEMORY_RENDER_CEILING_BYTES = 4 * 1024;
 
+/**
+ * Hard char cap on the `pinned` projection array (skill-memory-wiki §9.4 #4). `pin` appends
+ * without bound otherwise (unlike notes/user, which use `pushBoundedChars`), so App state would
+ * grow without limit (INV #14) and the STABLE-tier `memory:pinned` block — at the prompt-cache
+ * head — would churn its prefix on every pin. Bound it like notes/user, dropping the OLDEST pin
+ * (FIFO) on overflow. A module constant (not a user knob): pinned is a small curated safety
+ * window, and the render side is already self-bounded by `renderFenced` ≤ the render ceiling.
+ */
+export const PINNED_CHAR_LIMIT = 1500;
+
 /** §12.2: each JSONL line MUST be ≤ 64KB. */
 const MAX_LINE_BYTES = 64 * 1024;
 
@@ -904,7 +914,8 @@ function pinCommand(app: MemoryApp): CommandManifest<MemoryState> {
         const ms = s as MemoryState;
         // Idempotent: don't add if already pinned.
         if (ms.pinned.some((e) => e.id === id)) return ms;
-        return { ...ms, pinned: [...ms.pinned, entry] };
+        // §9.4 #4: bound the pinned array (FIFO drop oldest) so state + the stable block stay bounded.
+        return { ...ms, pinned: pushBoundedChars([...ms.pinned, entry], PINNED_CHAR_LIMIT) };
       });
       return { ok: true, data: { pinned: id } };
     },

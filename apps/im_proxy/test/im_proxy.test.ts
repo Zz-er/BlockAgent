@@ -310,6 +310,29 @@ describe('ConversationsBlockBuilder', () => {
     expect(block!.content_text).toContain('张三');
   });
 
+  it('slices the conversation list to max_conversations with a "还有 X 条" tail (§9.4 #4)', async () => {
+    const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
+    const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);
+    const conversations = Array.from({ length: 10 }, (_, i) => ({
+      id: `c${i}`,
+      kind: 'dm' as const,
+      members: [],
+      recent: [],
+      unread: 0,
+      consumed_seq: 0,
+    }));
+    const ctx = makeCtx(
+      app,
+      makeState({ conversations, config: { window: 20, max_conversations: 3, coalesce_ms: 200 } }),
+    );
+    const block = await builder.build(FAKE_BUILD_CTX, ctx);
+    const text = block!.content_text!;
+    // Only `max_conversations` rows render (each row carries " unread"), plus the count tail.
+    const rowCount = text.split('\n').filter((l) => l.includes(' unread')).length;
+    expect(rowCount).toBe(3);
+    expect(text).toContain('还有 7 条');
+  });
+
   it('has owner system (INV #4) + slow_changing tier', () => {
     const app = new ImProxyApp({ client: new FakeImClient(), dir: defaultDir });
     const builder = getBuilder(app.manifest(), CONVERSATIONS_BLOCK);

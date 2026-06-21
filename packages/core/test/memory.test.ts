@@ -32,6 +32,7 @@ import {
   RECALLED_BLOCK,
   INDEX_BLOCK,
   MEMORY_RENDER_CEILING_BYTES,
+  PINNED_CHAR_LIMIT,
   type MemoryEntry,
   type MemoryState,
 } from '@block-agent/app-memory/manifest.js';
@@ -754,6 +755,29 @@ describe('memory e2e — pin / unpin', () => {
 
     const pinState = (appReg.get_app_context('memory') as AppContext<MemoryState>).state as MemoryState;
     expect(pinState.pinned.some((e: MemoryEntry) => e.id === noteId)).toBe(true);
+  });
+
+  it('caps the pinned array to PINNED_CHAR_LIMIT, dropping the oldest (§9.4 #4)', async () => {
+    const { ops, reg } = wireApp(dir);
+    const ids: string[] = [];
+    const N = 15;
+    for (let i = 1; i <= N; i += 1) {
+      const r = await ops.invoke_command(
+        'memory.remember',
+        { target: 'notes', content: `PIN${i}-${'y'.repeat(200)}` },
+        USER,
+      );
+      ids.push((r.data as { id: string }).id);
+    }
+    for (const id of ids) await ops.invoke_command('memory.pin', { id }, USER);
+
+    const pinned = (reg.get_app_context('memory') as AppContext<MemoryState>).state.pinned;
+    const totalChars = pinned.reduce((s, e) => s + e.content.length, 0);
+    // Bounded by the FIFO char cap (would be ~3 KB across 15 pins → INV #14 breach without it).
+    expect(totalChars).toBeLessThanOrEqual(PINNED_CHAR_LIMIT);
+    // FIFO: the newest pin is retained; the oldest dropped off the front.
+    expect(pinned.some((e) => e.content.startsWith(`PIN${N}-`))).toBe(true);
+    expect(pinned.some((e) => e.content.startsWith('PIN1-'))).toBe(false);
   });
 });
 

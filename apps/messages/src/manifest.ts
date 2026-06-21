@@ -122,6 +122,34 @@ function oneLine(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
 }
 
+/**
+ * Second-layer byte cap on the rolling `messages:summary` string (skill-memory-wiki §9.4 #4).
+ * The pluggable summarizer APPENDS to the prior summary, so without this the summary string —
+ * and thus App state (INV #14) — grows without bound, and the slow_changing block churns. We
+ * cap it here in the trusted compaction path (NOT in the pluggable summarizer, so ANY summarizer
+ * is bounded structurally). Keeps the NEWEST tail (most-recent folded history), dropping the
+ * oldest from the front behind a marker. `SUMMARY_MAX_BYTES ≤ DEFAULT_DASHBOARD_CEILING` (4096)
+ * minus the rendered header, so the Renderer's head-keeping per-block clip never fires — which
+ * would otherwise drop the NEWEST tail. Pure + deterministic (INV #1): a function of the text only.
+ */
+export const SUMMARY_MAX_BYTES = 4000;
+const SUMMARY_TRIM_MARKER = '…[older summary trimmed]\n';
+function capSummaryBytes(summary: string): string {
+  if (Buffer.byteLength(summary, 'utf8') <= SUMMARY_MAX_BYTES) return summary;
+  const budget = SUMMARY_MAX_BYTES - Buffer.byteLength(SUMMARY_TRIM_MARKER, 'utf8');
+  // Keep the LAST `budget` bytes on a codepoint boundary (drop the oldest notes from the front).
+  const chars = [...summary];
+  let used = 0;
+  let i = chars.length;
+  while (i > 0) {
+    const w = Buffer.byteLength(chars[i - 1]!, 'utf8');
+    if (used + w > budget) break;
+    used += w;
+    i -= 1;
+  }
+  return SUMMARY_TRIM_MARKER + chars.slice(i).join('');
+}
+
 // ============================================================================
 // Config (file-seeded; user-only `set_config` to retune at runtime)
 // ============================================================================
@@ -267,7 +295,9 @@ function compactIfNeeded(
   const kept = state.recent.slice(foldCount);
   return {
     ...state,
-    summary: summarize(folded, state.summary),
+    // Second-layer byte cap (§9.4 #4): bound the rolling summary structurally, regardless of
+    // which (pluggable) summarizer produced it — keeps state bounded (INV #14).
+    summary: capSummaryBytes(summarize(folded, state.summary)),
     recent: kept,
   };
 }

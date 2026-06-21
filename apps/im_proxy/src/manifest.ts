@@ -430,9 +430,16 @@ const ConversationsBlockBuilder: BuilderManifest = {
   },
 };
 
-/** Deterministic text projection of the conversation list. */
+/**
+ * Deterministic text projection of the conversation list. Sliced to `config.max_conversations`
+ * with a "还有 X 条" tail (skill-memory-wiki §9.4 #4): the panel is a bounded dashboard, so the
+ * builder caps the rendered rows structurally (top-N) rather than leaning on the Renderer's blind
+ * byte-clip — which would cut a row mid-line. Mirrors `memory:index` / the shared top-N + tail.
+ */
 function renderConversations(state: ImProxyState): string {
-  const lines = state.conversations.map((c) => {
+  const max = state.config.max_conversations;
+  const shown = state.conversations.slice(0, max);
+  const lines = shown.map((c) => {
     const focusMark = c.id === state.focus ? '  <- focus' : '';
     const label =
       c.kind === 'group'
@@ -441,6 +448,8 @@ function renderConversations(state: ImProxyState): string {
     const bullet = c.id === state.focus ? '*' : ' ';
     return `${bullet} ${label} — ${c.unread} unread${focusMark}`;
   });
+  const remaining = state.conversations.length - shown.length;
+  if (remaining > 0) lines.push(`还有 ${remaining} 条`);
   return ['# Conversations', ...lines].join('\n');
 }
 
