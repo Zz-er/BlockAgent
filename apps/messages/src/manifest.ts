@@ -151,6 +151,40 @@ function capSummaryBytes(summary: string): string {
 }
 
 // ============================================================================
+// P1.5 — agent-facing history navigation (messages.history)
+// ============================================================================
+
+/**
+ * Bounds for `messages.history` (P1.5). The agent may now READ out-of-window history,
+ * so the page must be bounded BEFORE it flows back as a command result — the base ledger
+ * records `canonicalJson(result)` verbatim into the unfenced `base:recent`, so the cap
+ * that matters is on the SERIALIZED result bytes, not the raw body sum (red-team P1-3).
+ * Constants, never config: a `['user']`-gated runtime bump would be a budget escape
+ * (same discipline as `SUMMARY_MAX_BYTES` / §9.4 #7).
+ */
+export const HISTORY_DEFAULT_LIMIT = 20;
+export const HISTORY_MAX_ROWS = 50;
+const HISTORY_MAX_BODY_BYTES = 2_000;
+const HISTORY_MAX_RESULT_BYTES = 12_000;
+const HISTORY_CLIP_MARKER = '…[clipped]';
+
+/** Head-keep clip of a single body to `maxBytes` on a codepoint boundary (deterministic). */
+function clipBody(body: string, maxBytes: number): string {
+  if (Buffer.byteLength(body, 'utf8') <= maxBytes) return body;
+  const budget = maxBytes - Buffer.byteLength(HISTORY_CLIP_MARKER, 'utf8');
+  const chars = [...body];
+  let used = 0;
+  let i = 0;
+  while (i < chars.length) {
+    const w = Buffer.byteLength(chars[i]!, 'utf8');
+    if (used + w > budget) break;
+    used += w;
+    i += 1;
+  }
+  return chars.slice(0, i).join('') + HISTORY_CLIP_MARKER;
+}
+
+// ============================================================================
 // Config (file-seeded; user-only `set_config` to retune at runtime)
 // ============================================================================
 
@@ -599,6 +633,78 @@ function peekCommand(): CommandManifest<MessagesState> {
 }
 
 /**
+ * history({ before?, limit?, role? }) — P1.5 agent-facing history navigation. Read older
+ * messages that have scrolled out of the visible window (`messages:recent` + `summary`) by
+ * walking the durable jsonl log backward. This is the FIRST read surface the agent may call
+ * (`allowed_invokers` includes `'agent'`): unlike `peek`/`list` (kept user/app-only because
+ * the agent already reads bodies from the `messages:recent` block, DR-F), out-of-window
+ * history is in NO block, so this is not redundant. First-party content (this agent's own
+ * user↔agent log, already rendered unfenced in `messages:recent`), so NO fence is needed —
+ * the laundering concern (foreign content into the unfenced `base:recent`) does not apply.
+ *
+ * Cursor = the ordinal index into the append-only durable log (monotonic + stable across
+ * turns: `readHistory` never reorders/dedupes, `ack` touches only the projection, compaction
+ * never rewrites jsonl). `before` excludes ordinals `>= before`; a page is the most-recent
+ * `limit` below it (no overlap/gap walking back). Bounded: ≤ `HISTORY_MAX_ROWS`, each body
+ * clipped to `HISTORY_MAX_BODY_BYTES`, and the whole page trimmed (oldest-in-page first) so
+ * the SERIALIZED result stays ≤ `HISTORY_MAX_RESULT_BYTES` — what the base ledger weighs.
+ */
+function historyCommand(app: MessagesApp): CommandManifest<MessagesState> {
+  return {
+    name: 'history',
+    description:
+      'Read older conversation messages that scrolled out of the visible window. Returns a page oldest→newest; pass `before` (the `cursor` from a prior page) to page further back. Read-only.',
+    readonly: true,
+    allowed_invokers: ['user', 'agent', 'app'],
+    args_schema: {
+      type: 'object',
+      properties: {
+        before: {
+          type: 'number',
+          description: 'Return messages with cursor < this (from a prior page). Omit for the most-recent page.',
+        },
+        limit: { type: 'number', description: `Max messages (default ${HISTORY_DEFAULT_LIMIT}, capped at ${HISTORY_MAX_ROWS}).` },
+        role: { type: 'string', enum: ['user', 'agent'], description: 'Optional role filter.' },
+      },
+    },
+    result_schema: {
+      type: 'object',
+      required: ['items', 'count', 'has_more'],
+      properties: {
+        items: { type: 'array' },
+        count: { type: 'number' },
+        cursor: { type: 'number' },
+        has_more: { type: 'boolean' },
+      },
+    },
+    invoke: async (args, _ctx): Promise<CommandResult> => {
+      const a = (typeof args === 'object' && args !== null ? args : {}) as {
+        before?: unknown;
+        limit?: unknown;
+        role?: unknown;
+      };
+      const limit = Math.min(readPositiveInt(a.limit) ?? HISTORY_DEFAULT_LIMIT, HISTORY_MAX_ROWS);
+      const before = readPositiveInt(a.before);
+      const all = app.store.readHistory();
+      const indexed = all.map((m, idx) => ({ idx, role: m.role, id: m.id, body: m.content }));
+      const roleFilter = a.role === 'user' || a.role === 'agent' ? a.role : null;
+      const pool = roleFilter === null ? indexed : indexed.filter((m) => m.role === roleFilter);
+      const below = before === null ? pool : pool.filter((m) => m.idx < before);
+      // Most-recent `limit` below the cursor (agent pages backward; just-older is most relevant).
+      let page = below.slice(-limit).map((m) => ({ ...m, body: clipBody(m.body, HISTORY_MAX_BODY_BYTES) }));
+      // Enforce the SERIALIZED total cap (red-team P1-3): drop the OLDEST in-page until the
+      // serialized result fits, so the `base:recent` row this becomes is bounded.
+      while (page.length > 0 && Buffer.byteLength(JSON.stringify(page), 'utf8') > HISTORY_MAX_RESULT_BYTES) {
+        page = page.slice(1);
+      }
+      const has_more = below.length > page.length;
+      const cursor = page.length > 0 ? page[0]!.idx : (before ?? 0);
+      return { ok: true, data: { items: page, count: page.length, cursor, has_more } };
+    },
+  };
+}
+
+/**
  * ack({ id }) — drop a message from the RECENT projection by id (it leaves the rendered
  * window but stays in the durable jsonl history). Adapted to the history model: ack
  * means "I've handled this; stop showing it verbatim". The summary is untouched.
@@ -1003,6 +1109,7 @@ export class MessagesApp {
         () => peekCommand(),
         () => listCommand(),
         () => countCommand(),
+        () => historyCommand(app),
         () => ackCommand(),
         () => setConfigCommand(),
       ],

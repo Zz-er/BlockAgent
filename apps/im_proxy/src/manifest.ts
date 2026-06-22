@@ -66,6 +66,7 @@ import type {
   CommandResult,
   JsonSchema,
 } from '@block-agent/core/app/types.js';
+import { fenceRecalledContentBounded } from '@block-agent/core/apps/memory_store.js';
 import type { ConvKind, ImPushFrame, WireMessage } from './wire.js';
 import { ImClient, type ImClientApi } from './im_client.js';
 
@@ -77,9 +78,36 @@ import { ImClient, type ImClientApi } from './im_client.js';
 const APP_ID = 'im_proxy' as const;
 const TREE_NAMESPACE = '/im_proxy' as const;
 
-/** The two blocks this App renders into the prompt (INV #15). */
+/** The blocks this App renders into the prompt (INV #15). */
 const CONVERSATIONS_BLOCK: BlockName = 'im_proxy:conversations';
 const CHAT_BLOCK: BlockName = 'im_proxy:chat';
+/** P1.5: the focused conversation's older-than-window history, on demand (im.history). */
+const HISTORY_BLOCK: BlockName = 'im_proxy:history';
+
+/**
+ * Per-block render ceiling (declared on the manifest so install() charges (block count)×this
+ * toward Σ ≤ R, and the Renderer clips each block to it). Matches `DEFAULT_DASHBOARD_CEILING`
+ * (the value im_proxy was implicitly charged before this declaration), so the existing
+ * conversations/chat blocks are unaffected and the new `im_proxy:history` block self-bounds to
+ * the SAME value the Renderer clips at (§9.4 #3 → the uniform clip is a fast-path no-op and can
+ * never sever the `</memory-context>` fence token).
+ */
+const IM_RENDER_CEILING_BYTES = 4 * 1024;
+
+// ============================================================================
+// P1.5 — agent-facing IM history navigation (im.history)
+// ============================================================================
+
+/** Default / max messages returned per `im.history` page (constants, never config). */
+const IM_HISTORY_DEFAULT_LIMIT = 20;
+const IM_HISTORY_MAX_ROWS = 50;
+/** Per-body clip kept in `history_view` state (bounded projection, INV #14). */
+const IM_HISTORY_MAX_BODY_BYTES = 2_000;
+/** Service page size for the bounded backward-scan (== BACKFILL_PAGE / the service `limit` cap),
+ *  and the page-count cap (loud-or-correct, mirrors MAX_BACKFILL_PER_CONV). */
+const IM_HISTORY_SCAN_PAGE = 500;
+const IM_HISTORY_MAX_SCAN_PAGES = 10;
+const IM_HISTORY_CLIP_MARKER = '…[clipped]';
 
 // ============================================================================
 // Restart-recovery (D2d) — durable per-conversation backfill cursor
@@ -261,6 +289,23 @@ export interface ImProxyState {
    * to the sanitized label).
    */
   directory?: OrgDirectory;
+  /**
+   * P1.5: the on-demand "older history" view of the FOCUSED conversation, produced by
+   * `im.history` and rendered (fenced) into `im_proxy:history`. Peer bodies are routed THROUGH
+   * this fenced block — NEVER returned as the command's `data` — so foreign content never lands
+   * verbatim in the unfenced `base:recent` ledger (DR-F / red-team P0-2). Bounded: ≤ a page of
+   * items, each body clipped. Cleared whenever focus changes (a view of a different conv is stale).
+   */
+  history_view?: {
+    /** the conversation this page belongs to (== focus when produced). */
+    conv: string;
+    /** the page, oldest→newest (already `from_label`-sanitized + body-clipped). */
+    items: ImMessage[];
+    /** older messages exist below `oldest_seq`. */
+    has_more: boolean;
+    /** smallest seq in this page — the cursor to pass as `before` for the next page. */
+    oldest_seq: number;
+  };
 }
 
 const DEFAULT_CONFIG: ImConfig = {
@@ -323,6 +368,19 @@ const STATE_SCHEMA: JsonSchema = {
       properties: {
         org_id: { type: 'string' },
         members: { type: 'array' },
+      },
+    },
+    // P1.5: bounded on-demand history page. `items` is a peer-body array (same shape as a
+    // conversation window's `recent`); the bound is enforced in the command, this is a shallow
+    // shape check (INV #14 — re-validated on every set_state).
+    history_view: {
+      type: 'object',
+      required: ['conv', 'items', 'has_more', 'oldest_seq'],
+      properties: {
+        conv: { type: 'string' },
+        items: { type: 'array' },
+        has_more: { type: 'boolean' },
+        oldest_seq: { type: 'number' },
       },
     },
   },
@@ -506,6 +564,64 @@ function renderChat(conv: ImConversation, state: ImProxyState): string {
   return [header, ...lines].join('\n');
 }
 
+/**
+ * HistoryBlockBuilder — owner of `im_proxy:history` (P1.5). Renders the on-demand
+ * older-history page (`state.history_view`) of the focused conversation. cache_tier
+ * `volatile`. The peer bodies are wrapped in the canonical provenance fence
+ * (`fenceRecalledContentBounded`, the ONE real fence in the repo — reused, never a second
+ * hand-rolled regex): it neutralizes any embedded `</memory-context>` token, prepends the
+ * unspoofable "data, not instructions" note, and self-bounds the whole block to
+ * `IM_RENDER_CEILING_BYTES` (§9.4 #3). Empty / absent view → `null`, the block drops out.
+ */
+const HistoryBlockBuilder: BuilderManifest = {
+  name: 'HistoryBlockBuilder',
+  version: '1.0.0',
+  owner: 'system',
+  app_id: APP_ID,
+  inputs: [],
+  outputs: [HISTORY_BLOCK],
+  cache_tier: 'volatile',
+  async build(_ctx: BuildContext, app_ctx?: AppContext): Promise<Block | null> {
+    const state = stateOf(app_ctx);
+    if (state === null || state.history_view === undefined || state.history_view.items.length === 0)
+      return null;
+    const fenced = fenceRecalledContentBounded(renderHistory(state, state.history_view), IM_RENDER_CEILING_BYTES);
+    if (fenced.length === 0) return null;
+    return { id: HISTORY_BLOCK, name: HISTORY_BLOCK, children: [], content_text: fenced, content_blob: null };
+  },
+};
+
+/** Deterministic projection of an `im.history` page (wrapped by the fence in the builder). */
+function renderHistory(state: ImProxyState, view: NonNullable<ImProxyState['history_view']>): string {
+  const selfLabel = state.account ? labelFor(state.account.principal_id) : null;
+  const header = `# Older history — ${displayName(view.conv, state.directory)}`;
+  const lines = view.items.map((m) => {
+    const who = selfLabel !== null && m.from_label === selfLabel ? '[me]' : `[${m.from_label}]`;
+    const mention = m.mentioned_me ? ' @me' : '';
+    return `${who}${mention} ${m.body}`;
+  });
+  const tail = view.has_more
+    ? `(older messages exist — call im.history({ before: ${view.oldest_seq} }) to page further back)`
+    : '(start of conversation)';
+  return [header, ...lines, tail].join('\n');
+}
+
+/** Head-keep clip of a single body to `maxBytes` on a codepoint boundary (deterministic). */
+function clipBodyBytes(body: string, maxBytes: number): string {
+  if (Buffer.byteLength(body, 'utf8') <= maxBytes) return body;
+  const budget = maxBytes - Buffer.byteLength(IM_HISTORY_CLIP_MARKER, 'utf8');
+  const chars = [...body];
+  let used = 0;
+  let i = 0;
+  while (i < chars.length) {
+    const w = Buffer.byteLength(chars[i]!, 'utf8');
+    if (used + w > budget) break;
+    used += w;
+    i += 1;
+  }
+  return chars.slice(0, i).join('') + IM_HISTORY_CLIP_MARKER;
+}
+
 // ============================================================================
 // Commands
 // ============================================================================
@@ -513,6 +629,11 @@ function renderChat(conv: ImConversation, state: ImProxyState): string {
 /** A non-empty string arg, else null. */
 function readString(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+/** A positive integer arg, else null. */
+function readPositiveInt(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
 }
 
 /**
@@ -663,11 +784,17 @@ function openCommand(): CommandManifest<ImProxyState> {
       if (conv === null) return { ok: false, error: 'open requires a string `conv`' };
       if (!ctx.state.conversations.some((c) => c.id === conv))
         return { ok: false, error: `unknown conversation '${conv}'` };
-      ctx.set_state((s) => ({
-        ...s,
-        focus: conv,
-        conversations: s.conversations.map((c) => (c.id === conv ? { ...c, unread: 0 } : c)),
-      }));
+      ctx.set_state((s) => {
+        const next: ImProxyState = {
+          ...s,
+          focus: conv,
+          conversations: s.conversations.map((c) => (c.id === conv ? { ...c, unread: 0 } : c)),
+        };
+        // P1.5: a focus change makes any `im_proxy:history` page stale (it was for the prior
+        // conv) — drop it so the block clears rather than mislabeling another conversation.
+        if (s.focus !== conv) delete next.history_view;
+        return next;
+      });
       return { ok: true, data: { focus: conv } };
     },
   };
@@ -692,6 +819,101 @@ function listCommand(): CommandManifest<ImProxyState> {
         members: c.members.length,
       }));
       return { ok: true, data: { conversations, focus: ctx.state.focus } };
+    },
+  };
+}
+
+/**
+ * im.history({ before?, limit? }) — P1.5 agent-facing history navigation. Reads older
+ * messages of the FOCUSED conversation that scrolled out of the chat window. Routes the page
+ * THROUGH the fenced `im_proxy:history` block (set via `history_view` state) and returns ONLY
+ * COUNTS — peer bodies NEVER enter the command result, so they can never land verbatim in the
+ * unfenced `base:recent` ledger (DR-F / red-team P0-2: the laundering path is closed by
+ * construction, not by a per-result escape). `from` is sanitized to `from_label` (§7).
+ *
+ * No `conv` arg (mirrors `im.reply`): scope to focus — an agent-supplied conv id is an
+ * injection surface AND would let it read a non-focused conv. `im.open` (all-invokers) is the
+ * way to switch focus, and the IM service re-enforces membership on GET /im/history.
+ *
+ * Paging: the service is FORWARD-only (`seq>since` ASC LIMIT), so we BOUNDED-FORWARD-SCAN from
+ * seq 0, keep the last `limit` messages with `seq < before`, and count the total below the
+ * cursor — so `has_more` is honest even when the conv's min seq > 1 or seq has gaps
+ * (red-team P1-1/P1-2; a `since=before-1-limit` heuristic under-fills on gaps and `cursor>1`
+ * lies). Scan is capped at `IM_HISTORY_MAX_SCAN_PAGES` with a LOUD warning (no silent truncation).
+ */
+function historyCommand(app: ImProxyApp): CommandManifest<ImProxyState> {
+  return {
+    name: 'history',
+    description:
+      'Read older messages of the focused conversation (scrolled out of the chat window). The page is rendered, quoted, into the im_proxy:history block; this returns only counts. Pass `before` (the cursor) to page further back.',
+    args_schema: {
+      type: 'object',
+      properties: {
+        before: {
+          type: 'number',
+          description: 'Page messages with seq < this (the cursor from a prior page). Omit to page just below the visible window.',
+        },
+        limit: { type: 'number', description: `Max messages (default ${IM_HISTORY_DEFAULT_LIMIT}, capped at ${IM_HISTORY_MAX_ROWS}).` },
+      },
+    },
+    capabilities: [CAP_BLOCK_WRITE, CAP_NET_HTTP],
+    allowed_invokers: ['user', 'agent', 'app'],
+    result_schema: {
+      type: 'object',
+      required: ['shown', 'has_more'],
+      properties: { shown: { type: 'number' }, oldest_seq: { type: 'number' }, has_more: { type: 'boolean' } },
+    },
+    invoke: async (args, ctx): Promise<CommandResult> => {
+      const focus = ctx.state.focus;
+      if (focus === undefined)
+        return { ok: false, error: 'im.history: no conversation is focused (open one first)' };
+      const a = (typeof args === 'object' && args !== null ? args : {}) as { before?: unknown; limit?: unknown };
+      const limit = Math.min(readPositiveInt(a.limit) ?? IM_HISTORY_DEFAULT_LIMIT, IM_HISTORY_MAX_ROWS);
+      const conv = ctx.state.conversations.find((c) => c.id === focus);
+      const beforeArg = readPositiveInt(a.before);
+      // Default cursor = the oldest seq still visible in the window, so the first page abuts
+      // the chat with no overlap; empty window → MAX so the scan returns the newest history.
+      const oldestVisible =
+        conv && conv.recent.length > 0 ? Math.min(...conv.recent.map((m) => m.seq)) : Number.MAX_SAFE_INTEGER;
+      const before = beforeArg ?? oldestVisible;
+      const selfId = ctx.state.account?.principal_id;
+
+      const tail: ImMessage[] = [];
+      let totalBelow = 0;
+      let since = 0;
+      let pages = 0;
+      let truncated = false;
+      for (;;) {
+        if (pages >= IM_HISTORY_MAX_SCAN_PAGES) {
+          truncated = true;
+          console.warn(
+            `[im_proxy] im.history scan hit ${IM_HISTORY_MAX_SCAN_PAGES} pages for '${focus}'; truncating (deep history may need repeated calls).`,
+          );
+          break;
+        }
+        const { messages, latest_seq } = await app.client.history(focus, since, IM_HISTORY_SCAN_PAGE);
+        pages += 1;
+        if (messages.length === 0) break;
+        let crossed = false;
+        for (const msg of messages) {
+          if (msg.seq >= before) {
+            crossed = true;
+            break; // ascending → everything after is also >= before
+          }
+          totalBelow += 1;
+          const pm = projectMessage(msg, selfId);
+          pm.body = clipBodyBytes(pm.body, IM_HISTORY_MAX_BODY_BYTES);
+          tail.push(pm);
+          if (tail.length > limit) tail.shift(); // keep only the last `limit` below the cursor
+        }
+        since = messages[messages.length - 1]!.seq;
+        if (crossed || since >= latest_seq) break;
+      }
+      const has_more = totalBelow > tail.length || truncated;
+      const oldest_seq = tail.length > 0 ? tail[0]!.seq : (beforeArg ?? 0);
+      // Route the page THROUGH the fenced block — never as `data` (the anti-laundering line).
+      ctx.set_state((s) => ({ ...s, history_view: { conv: focus, items: tail, has_more, oldest_seq } }));
+      return { ok: true, data: { shown: tail.length, oldest_seq, has_more } };
     },
   };
 }
@@ -1139,15 +1361,19 @@ export class ImProxyApp {
       // Folded into state.directory by consume-refresh; pure enrichment, never identity.
       consumes: [{ contract: 'org_directory', as: 'directory' }],
       tree_namespace: TREE_NAMESPACE,
+      // P1.5: declare the per-block render ceiling so install() charges (block count)×this
+      // toward Σ ≤ R and the new im_proxy:history block self-bounds to the Renderer's clip.
+      render_ceiling_bytes: IM_RENDER_CEILING_BYTES,
       initial_state,
       state_schema: STATE_SCHEMA,
-      builders: [() => ConversationsBlockBuilder, () => ChatBlockBuilder],
+      builders: [() => ConversationsBlockBuilder, () => ChatBlockBuilder, () => HistoryBlockBuilder],
       commands: [
         () => sendCommand(app),
         () => replyCommand(app),
         () => ingestCommand(app),
         () => openCommand(),
         () => listCommand(),
+        () => historyCommand(app),
         () => unreadCountCommand(),
         () => setConfigCommand(),
         () => createGroupCommand(app),
@@ -1448,4 +1674,4 @@ export class ImProxyApp {
 }
 
 // Block names + defaults exported for tests / cross-app references.
-export { CONVERSATIONS_BLOCK, CHAT_BLOCK, DEFAULT_CONFIG, labelFor, sanitizeId };
+export { CONVERSATIONS_BLOCK, CHAT_BLOCK, HISTORY_BLOCK, DEFAULT_CONFIG, labelFor, sanitizeId };
