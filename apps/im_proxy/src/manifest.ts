@@ -504,7 +504,7 @@ function renderConversations(state: ImProxyState): string {
         ? `[group] ${displayName(c.id, state.directory)} (${c.members.length})`
         : `[dm] ${conversationPeerName(c, state)}`;
     const bullet = c.id === state.focus ? '*' : ' ';
-    return `${bullet} ${label} — ${c.unread} unread${focusMark}`;
+    return `${bullet} ${label} (${c.id}) — ${c.unread} unread${focusMark}`;
   });
   const remaining = state.conversations.length - shown.length;
   if (remaining > 0) lines.push(`还有 ${remaining} 条`);
@@ -776,7 +776,7 @@ function openCommand(): CommandManifest<ImProxyState> {
     args_schema: {
       type: 'object',
       required: ['conv'],
-      properties: { conv: { type: 'string', description: 'The conversation id to focus.' } },
+      properties: { conv: { type: 'string', description: 'The conversation id to focus (the UUID shown in parentheses in the Conversations block).' } },
     },
     capabilities: [CAP_BLOCK_WRITE],
     invoke: async (args, ctx): Promise<CommandResult> => {
