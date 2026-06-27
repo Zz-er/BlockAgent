@@ -82,6 +82,8 @@ npm start -- --dry-run
 
 After starting, you will be in an interactive terminal: typing directly sends a message to the agent; starting with `/` is a command (`/help` to see all, `/apps` to see Blocks). The two methods can be mixed, with the priority being: flags > config file > .env > defaults. To switch to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / Bailian), just change the provider and base_url.
 
+![image-20260627161758520](.\doc\img\image-20260627161758520.png)
+
 ## Web Conversation (Browser, Optional)
 
 Besides the terminal, you can also chat with the agent in a browser. It is split into two layers: a headless backend `block-agent-serve` (which exposes the same agent via WebSocket), and a Vite + React web frontend (the chat interface). The recognition rules for `.env` and `block-agent.config.json` are **exactly the same** as for `npm start` (it's the same loading logic), so the DeepSeek/key configured above can be reused directly here.
@@ -103,6 +105,8 @@ A few points to note:
 - **Must use `--port 4317`**—the web frontend connects to `ws://localhost:4317` by default. If you want to change the port, set `VITE_WS_URL` when running the web command, e.g.: `VITE_WS_URL=ws://localhost:7345 npm run web`.
 - Use the root script `npm run serve`, **do not** use `npm run serve -w @block-agent/server`—the latter will change the working directory to the package directory, and it won't be able to find the `.env` and config files in the repository root.
 - Localhost loopback only: The backend unconditionally stamps all input with the "user" identity, which is only safe on `localhost`. Do not bind to `0.0.0.0` before authentication is added.
+
+![image-20260627162103861](.\doc\img\image-20260627162103861.png)
 
 ## Working Directory (root_dir, Optional)
 
