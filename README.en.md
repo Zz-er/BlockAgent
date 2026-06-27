@@ -1,78 +1,64 @@
 # block-agent
 
-**English** · [简体中文](./README.md)
+**English** · [Simplified Chinese](./README.md)
 
 [![CI](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/Zz-er/BlockAgent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-> Capability = f(weights, context). You can't change the weights; the context is entirely yours. block-agent takes that one controllable variable — context — and makes it a structure of independently-evolvable building blocks: **you iterate an agent by recomposing its context, not by rewriting its architecture.**
+> Assemble the LLM's context like building blocks
 
-## Overview
+## Introduction
 
-What an agent can do comes down to two things: the trained weights, and the context you feed it each turn. The weights are fixed — out of your hands; the context is fully malleable — yours to shape. **There is exactly one place to do the work.** That work now has a name: **context engineering** — filling the context window with the right information for the next step. Most practice treats it as prompt-assembly craft, so context ends up a hand-assembled string: add a piece, change a line, and it ripples everywhere, hardening over time into a black box no one dares touch. block-agent treats it as a **runtime problem**: context is a structured, bounded, composable system, run by a runtime — made of independently-evolvable **building blocks**.
+An LLM's capabilities are determined by two things: its **trained weights** and the **input context**. To enhance an LLM's capabilities, the trained weights are fixed, but we can modify the context provided to it. According to internal research from Anthropic, good context management can increase an agent's capability by up to 29% and reduce token consumption by up to 84%. Currently, common agent projects, like Claude Code, typically structure their context into several modules: system prompts, tool information, and multi-turn message history, often with compression applied to the message history. block-agent treats context construction as a **runtime problem**: the context is a structured, bounded, and composable system managed by the runtime, broken down into independently evolving **Blocks**. Here, a "Block" is literal: like building blocks, they are pieced together, and each block can be replaced and evolved independently.
 
-### Context is the model's interface
+The differences between the various popular agent projects today lie in their architecture and context. In theory, by developing blocks related to Claude Code, one could assemble a block-agent version of Claude Code. Similarly, by developing blocks for Hermes, a block-agent version of Hermes could be created.
 
-APIs were designed for programs; GUIs for humans. For a model, the interface is the **context** — everything the agent perceives of the world arrives in what you feed it each turn. An interface deserves to be designed, yet most agents' context never was: it's an append-only transcript of calls — every tool invocation appends another result, every action re-fetches the whole state all over again (browser agents re-snapshotting the entire page after each step are the extreme case), near-identical copies pile up side by side, and the signal slowly drowns in the stale. That disease now has a name too: **context rot**. Deleting stale tool results after the fact is one cure; block-agent takes the earlier step — **never writing them in to begin with**.
+### Context is the Interface for the Model
 
-What it hands the agent is not a transcript but a **stateful screen**. Each block presents its state as one slice of the screen; when the state changes, that slice updates in place; each turn, the whole screen is re-rendered from current state. Tool results live in a bounded window — as new ones arrive, the oldest leave the view (the full history sits in an on-disk log; nothing is lost); conversation history folds into two slices, a summary plus the recent messages verbatim. What the agent sees is always **the world as it is now**, never a pile of past responses. And if the context changes every turn yet the prompt cache still hits, that's what deterministic rendering buys: the same state always renders the same bytes, blocks are laid out stable → slow-changing → volatile, and the stable prefix sits firmly in cache — **mutable state and cacheable context are not a trade-off here.**
+APIs are for programs, GUIs are for humans. When it comes to models, their interface is the **context**—the agent's entire perception of the world comes from the content fed in each turn. Interfaces deserve to be designed, yet the context of most agents has never been designed: it's an ever-growing transcript of calls—appending a result for every tool call, re-fetching a full representation for every action (the most extreme example being a browser agent re-capturing the entire page snapshot at every step). Several nearly identical pieces of content are piled up, and effective information is gradually drowned out by outdated information. This problem now has a name: **context rot**. Deleting outdated tool results afterward is one solution; block-agent postpones the handling of these issues, allowing users to independently optimize various context modules during use.
 
-### The interface is built from blocks
+The block-agent project proposes not just simple fixed text, but a **BlockApp** with a state machine where blocks can pass information to each other: a Block, coupled with the logic to operate it. The conversation history is a Block, tools are a Block, memory is a Block, and the agent's identity is also a Block. Adding a new capability to the agent is equivalent to adding a new Block; changing an implementation is equivalent to swapping one Block for another—all without touching its core.
 
-A screen can't be one undivided slab — that's the hand-assembled-string road all over again. block-agent cuts it into slices, each owned by an independent little program. That program is a **BlockApp** — "Block" meant literally: a **building block**. Conversation history is one block; tools are one; memory is one; the agent's own identity is one. Adding a capability means snapping in a new block; swapping an implementation means swapping one block for another — neither touches the core.
+When writing a Block, you describe four things: **State** (what it holds, how it changes with operations), **Presentation** (how the state becomes the interface slice the agent sees), **Operations** (which actions are exposed externally; users, the agent, other Blocks, and external systems all use the same set), and **Contract** (declaring what it depends on and what it provides; other Blocks connect based on this, without depending on who it is).
 
-To write a block, you describe four things: **state** (what it holds, and how that changes under operations), **presentation** (how that state becomes the slice of the interface the agent sees), **operations** (what it exposes — the user, the agent, other blocks, and external systems all use the same set), and **contracts** (what it declares it needs and provides; other blocks connect through that, not through who it is).
+### Built-in Blocks
 
-Put together, this is what we mean by an **AI-native application**: a BlockApp is not a human-facing program with an API wrapped around it, but an application written for the AI from the start — its interface is its slice of the context, its buttons are the operations it exposes. Giving the agent a capability means installing an application for it, not handing it a stack of API docs. Blocks **bind to contracts, never to names**: one says "I provide a message count," another says "I need a message count" — neither has to know who the other is, and replacing the provider leaves the consumer untouched. And there is **no privileged kernel block** — the built-in blocks and the ones you write take the same shape, the same entry, the same constraints, so the runtime grows block by block instead of stiffening as it grows.
-
-### Safety and self-extension
-
-Every slice of the screen is backed by state; if anyone could casually rewrite that state, the rest is worthless. So **every write converges on a single gate**: for the agent to do anything, it must go through one constrained operation — plain text isn't an action; it's rejected and fed back as a correction. The user, the agent, and the blocks all use the same set of operations; the differences in privilege are decided by one unified authorization gate, and nobody has a back door. Add two deliberate asymmetries: the agent cannot rewrite its own identity constraints, and it cannot install or remove blocks. That is the floor against prompt injection — and these bounds are part of the structure itself, not patches applied after an incident.
-
-The bounds are laid down first so the next step can be taken safely. The agent already reshapes its own context every day: it writes memories, logs tasks, adjusts what it will see next turn — the early form of self-evolution. Since adding a capability is just adding a block, the end of this road is an agent that produces blocks and extends itself. The hard part was never "letting it write" — it's "letting it write within bounds." The runtime prepares for this with a unified host model: trusted blocks run in-process; untrusted ones — third-party, or produced by the agent itself — are placed in a child-process sandbox, and a block declaring capabilities beyond its ceiling is rejected at install time. **Safe self-extension is solved as a structural problem, not gambled on as an alignment problem.**
-
-### Built-in blocks
-
-| Block | Role |
+| Block | Function |
 |---|---|
-| agent_identity | the agent's identity and constraints; the agent can't rewrite itself |
-| messages | conversation history with automatic compaction |
-| tools | a set of built-in tools |
-| memory | local memory |
-| memory_letta | external semantic memory (same interface as memory, interchangeable) |
-| task | a task list; writable by the agent or by an external system |
-| stats | cross-block statistics (an example of contract-based cooperation) |
+| agent_identity | The agent's identity and constraints; the agent cannot modify itself |
+| messages | Conversation history with automatic compression |
+| tools | A set of built-in tools |
+| memory | Local memory |
+| memory_letta | External semantic memory (interchangeable with 'memory' as it shares the same interface) |
+| task | Task list; can be written to by the agent or external systems |
+| stats | Cross-Block statistics (an example of contract-based collaboration) |
 
-### Status
-
-In place: the core loop, the built-in blocks, the interactive terminal, block discovery and (un)installation (including hot-uninstall), contract-based cooperation between blocks (declared interfaces + a pre-render pull by contract), external semantic-memory integration (verified against a live Letta / DashScope), and the unified trusted/sandboxed host model (the cross-process sandbox carrier has landed and is wired into boot, with end-to-end fork tests; no sandboxed block ships with the release yet). Tests green: core 471 · cli 88 · memory_letta 44.
-
-## Quick start (DeepSeek as an example)
+## Quick Start (with DeepSeek as an example)
 
 ```bash
 npm install
 ```
 
-The API key is read only from the environment — never written to a config file, never committed. There are two equivalent ways to start; take either.
+The API key is only read from environment variables, never written into configuration files or stored in a database. There are two equivalent ways to start; choose either one.
 
-**Option 1: command-line flags** — handiest for a quick run or switching models on the fly. Set the key in your shell and start:
+**Method 1: Command-line flags**—This is the most convenient for temporary runs or quick model changes. Set the key in your shell and start directly:
 
 ```bash
-export OPENAI_API_KEY=sk-your-key   # openai-compat providers (incl. DeepSeek / DashScope) all read this variable
+export OPENAI_API_KEY=sk-your-key   # openai-compat providers (including DeepSeek / Bailian) all read this variable
 npm start -- --provider openai-compat --model deepseek-chat --base-url https://api.deepseek.com
 ```
 
-**Option 2: `.env` + a config file** — put both the key and the model in files, and starting is just `npm start`.
+**Method 2: `.env` + configuration file**—Write both the key and the model into files, then you only need `npm start` to launch.
 
-① Drop the API key — create a gitignored `.env` at the repo root; it's loaded automatically at startup (and overrides shell variables of the same name):
+① Place the API key—create a gitignored `.env` file in the repository root. It will be loaded automatically on startup (and will override shell environment variables with the same name):
 
 ```bash
-# .env (repo root, ignored by .gitignore)
-# Note: openai-compat providers (incl. DeepSeek / DashScope) all read OPENAI_API_KEY
+# .env (in the repository root, ignored by .gitignore)
+# Note: openai-compat providers (including DeepSeek / Bailian) all read OPENAI_API_KEY
 OPENAI_API_KEY=sk-your-key
 ```
 
-② Pick DeepSeek — create `block-agent.config.json` at the repo root (also gitignored):
+② Select DeepSeek—create a `block-agent.config.json` file in the repository root (also ignored by gitignore):
 
 ```json
 {
@@ -90,60 +76,60 @@ OPENAI_API_KEY=sk-your-key
 ```bash
 npm start
 
-# No key, just want to see it run (offline, no network):
+# If you want to see it run without a key (offline, no network):
 npm start -- --dry-run
 ```
 
-You land in an interactive terminal: type to message the agent; lines starting with `/` are commands (`/help` for the full list, `/apps` for the blocks). The two ways mix freely; precedence is flags > config file > env > defaults. Switching to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / DashScope) is just a change of provider and base_url.
+After starting, you will be in an interactive terminal: typing directly sends a message to the agent; starting with `/` is a command (`/help` to see all, `/apps` to see Blocks). The two methods can be mixed, with the priority being: flags > config file > .env > defaults. To switch to Anthropic or any OpenAI-compatible endpoint (Ollama / vLLM / Bailian), just change the provider and base_url.
 
-## Web chat (browser, optional)
+## Web Conversation (Browser, Optional)
 
-Besides the terminal, you can talk to the agent in a browser. It comes in two layers: a headless backend, `block-agent-serve` (it fronts the same agent over WebSocket), and a Vite + React web frontend (the chat UI). `.env` and `block-agent.config.json` are recognized **exactly as by `npm start`** (the same loader), so the DeepSeek/key you set above is reused as-is here.
+Besides the terminal, you can also chat with the agent in a browser. It is split into two layers: a headless backend `block-agent-serve` (which exposes the same agent via WebSocket), and a Vite + React web frontend (the chat interface). The recognition rules for `.env` and `block-agent.config.json` are **exactly the same** as for `npm start` (it's the same loading logic), so the DeepSeek/key configured above can be reused directly here.
 
-Open two terminals, **both from the repo root**:
+Open two terminals and run the commands **from the repository root directory**:
 
 ```bash
-# Terminal 1 — start the backend (port 4317 must match the web default)
+# Terminal 1 — Start the backend (port 4317 must match the web's default)
 npm run serve -- --name web --port 4317
-# "listening on ws://127.0.0.1:4317" means it's up (it loaded .env + block-agent.config.json)
+# When you see "listening on ws://127.0.0.1:4317", it's ready (has loaded .env + block-agent.config.json)
 
-# Terminal 2 — start the web frontend
+# Terminal 2 — Start the web frontend
 npm run web
-# Vite prints a URL like http://localhost:5173 — open it to chat
+# Vite will print an address like http://localhost:5173, open it in your browser to start chatting
 ```
 
-A few notes:
+A few points to note:
 
-- **Use `--port 4317`** — the web frontend connects to `ws://localhost:4317` by default. To use another port, set `VITE_WS_URL` when starting the web, e.g. `VITE_WS_URL=ws://localhost:7345 npm run web`.
-- Use the root script `npm run serve`, **not** `npm run serve -w @block-agent/server` — the latter runs in the package directory and won't find the repo-root `.env` / config file.
-- Loopback only: the backend stamps input as the `user` invoker unconditionally, which is only safe on `localhost`. Don't bind `0.0.0.0` until an auth layer is in place.
+- **Must use `--port 4317`**—the web frontend connects to `ws://localhost:4317` by default. If you want to change the port, set `VITE_WS_URL` when running the web command, e.g.: `VITE_WS_URL=ws://localhost:7345 npm run web`.
+- Use the root script `npm run serve`, **do not** use `npm run serve -w @block-agent/server`—the latter will change the working directory to the package directory, and it won't be able to find the `.env` and config files in the repository root.
+- Localhost loopback only: The backend unconditionally stamps all input with the "user" identity, which is only safe on `localhost`. Do not bind to `0.0.0.0` before authentication is added.
 
-## Working directory (root_dir, optional)
+## Working Directory (root_dir, Optional)
 
-By default `.env`, `block-agent.config.json`, and all BlockApp data (`.block-agent/apps/<id>/`) live in the directory you launch from (the current working directory, cwd). **With no new flags the behavior is byte-for-byte identical to before** — existing users need to change nothing.
+By default, `.env`, `block-agent.config.json`, and all BlockApp data (`.block-agent/apps/<id>/`) are located in the directory where you start the process (the current working directory, cwd). **When no new parameters are passed, the behavior is byte-for-byte identical to before**—existing users do not need to make any changes.
 
-If you want to pin a process's entire state to an explicit root directory (a container volume, several agents on one machine, or just decoupling data from cwd), use `--root-dir`:
+If you want to pin all the state of an agent process to a specific root directory (for container volumes, multiple agents on one machine, or decoupling data from cwd), use `--root-dir`:
 
 ```bash
 npm start -- --root-dir /srv/agent-a
-# equivalent: BLOCK_AGENT_ROOT_DIR=/srv/agent-a npm start
+# Equivalent: BLOCK_AGENT_ROOT_DIR=/srv/agent-a npm start
 ```
 
-From then on that process's `.env`, config file, and app data all live under `/srv/agent-a`. Two processes pointed at different `--root-dir`s are fully isolated; a second process pointed at the **same** root is refused at startup (and prints the holder's pid) so two processes can't interleave writes and corrupt the data.
+After this, the process's `.env`, configuration file, and app data will all be under `/srv/agent-a`. Two processes pointing to different `--root-dir`s will not interfere with each other. A second process pointing to the **same** root will be refused to start (and the PID of the process holding the lock will be printed) to prevent data corruption from interleaved writes.
 
-A few notes:
+Key points:
 
-- **`BLOCK_AGENT_ROOT_DIR` must be a real shell/container environment variable** (ambient env) — it **cannot live in `.env`**, because the root has to be decided *before* `.env` is loaded (the `.env` itself lives inside the root). Putting it in `.env` has no effect. This inverts the usual "file overrides env" intuition and is the most common footgun.
-- **The root must already exist**: `--root-dir` pointing at a non-existent directory **fails fast and exits** (so a typo'd path can't silently create empty state = the agent's amnesia). To create it on purpose, add `--create-root` (e.g. a container's first boot with an empty root volume). The `.block-agent/apps` subtree below it is still created lazily.
-- **Old data is not migrated when you point at a brand-new root.** If you used to run in cwd and now explicitly switch to a new root, the old `.block-agent` / `.env` / config are not moved automatically — `mv` them yourself when needed (e.g. `mv ./.block-agent ./.env ./block-agent.config.json /srv/agent-a/`).
-- The old `--storage-dir` / `BLOCK_AGENT_STORAGE_DIR` remain as **deprecated** aliases: when no `--root-dir` is given they can still redirect app data within the root; once `--root-dir` is given explicitly, the root wins.
-- `--config <path>` is not re-homed by the root: an absolute path is used as-is, a relative path still resolves against cwd (it's the file you explicitly pointed at).
+- **`BLOCK_AGENT_ROOT_DIR` must be a true shell/container environment variable** (ambient env), and **cannot be written into `.env`**—because the root must be determined *before* `.env` is loaded (since `.env` itself lives inside the root). Putting it in `.env` will have no effect, which is contrary to the usual intuition that "files override env" and is a common pitfall.
+- **The root must already exist**: Pointing `--root-dir` to a non-existent directory will **cause an immediate error and exit** (to prevent silent creation of an empty directory, which would mean agent amnesia, if the path is mistyped). If you really need to create it, add `--create-root` (e.g., for the first launch of a container where the root volume is empty but valid). The `.block-agent/apps` directory underneath it will be created automatically as needed.
+- **Pointing to a brand new root will not automatically move old data**. If you were previously running in the cwd and now explicitly switch to a new root, the old `.block-agent` / `.env` / configuration will not be migrated automatically—you'll need to manually `mv` them if needed (e.g., `mv ./.block-agent ./.env ./block-agent.config.json /srv/agent-a/`).
+- The old `--storage-dir` / `BLOCK_AGENT_STORAGE_DIR` is kept as a **deprecated** alias: if `--root-dir` is not explicitly given, it can still redirect app data within the root; once `--root-dir` is explicitly given, the root takes precedence.
+- `--config <path>` is not affected by root redirection: absolute paths are used as is, and relative paths are still resolved relative to the cwd (the file you are pointing to).
 
-## Tutorial & docs
+## Tutorials and Documentation
 
-To build a block of your own, start with the [BlockApp development guide](./doc/blockapp-development.md) — it begins from the project's directory layout (where `apps/` lives, which files make up a block), then walks you file by file through writing your first working block. Full usage & development docs are in [`doc/`](./doc/README.md).
+If you want to build a Block yourself, start with the [BlockApp Development Guide](./doc/blockapp-development.md)—it starts by explaining the project's directory structure, tells you where `apps/` is, what files a Block is composed of, and then guides you file by file to write your first usable Block. For complete usage and development documentation, see [`doc/`](./doc/README.md).
 
-Code layout: `packages/core` (the core runtime, zero runtime dependencies) · `packages/cli` (the interactive terminal) · `apps/*` (built-in BlockApps, including `apps/memory_letta` for dependency-isolated external-memory integration). Stack: Node 24 · TypeScript · vitest.
+Code Structure: `packages/core` (core runtime, zero runtime dependencies) · `packages/cli` (interactive terminal) · `apps/*` (built-in BlockApps, including `apps/memory_letta` for external memory integration and dependency isolation). Tech Stack: Node 24 · TypeScript · vitest.
 
 ## License
 
