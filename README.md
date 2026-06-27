@@ -84,7 +84,7 @@ npm start -- --dry-run
 
 
 
-![image-20260627161758520](.\doc\img\image-20260627161758520.png)
+![image-20260627161758520](./doc/img/image-20260627161758520.png)
 
 ## Web 端对话（浏览器，可选）
 
@@ -110,7 +110,7 @@ npm run web
 
 
 
-![image-20260627162103861](.\doc\img\image-20260627162103861.png)
+![image-20260627162103861](./doc/img/image-20260627162103861.png)
 
 ## 工作目录（root_dir，可选）
 
